@@ -46,14 +46,16 @@ The interview, script generation, and the full prompter (scroll, camera,
 recording) are free forever. Saving scripts to a personal library costs
 $0.95/month, or is free for life with an access code.
 
-- Worker endpoints: `POST /api/checkout` (Stripe Checkout, recurring),
-  `POST /api/webhook` (Stripe events, signature-verified), `GET /api/me`,
-  `POST /api/redeem` (access code), `GET/POST/DELETE /api/scripts`
-  (library CRUD, unlocked identities only).
+- Worker endpoints: `POST /api/checkout` (Lemon Squeezy hosted checkout,
+  recurring), `POST /api/webhook` (Lemon Squeezy events, X-Signature
+  verified), `GET /api/me`, `POST /api/redeem` (access code),
+  `GET/POST/DELETE /api/scripts` (library CRUD, unlocked identities only).
 - Storage: Cloudflare KV namespace `clickprompt-data`. Access codes are
-  stored as SHA-256 hashes only; subscriptions are keyed by Stripe
-  customer id and written by the verified webhook.
-- Secrets the worker expects: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
-  `STRIPE_PRICE_ID` (the $0.95/mo recurring price).
+  stored as SHA-256 hashes only; subscriptions are keyed by an opaque
+  `sub:<hex>` token passed as checkout `custom_data` and written by the
+  verified webhook.
+- Secrets the worker expects: `LEMONSQUEEZY_API_KEY`,
+  `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID`,
+  `LEMONSQUEEZY_VARIANT_ID` (the $0.95/mo subscription variant).
 - The frontend keeps one opaque unlock token in `localStorage`
-  (`clickprompt_token`): `code:CLICK-XXXX-XXXX` or a Stripe `cus_...` id.
+  (`clickprompt_token`): `code:CLICK-XXXX-XXXX` or `sub:<hex>`.
