@@ -100,20 +100,28 @@
       }
 
       async function refreshUnlock() {
-        // Returning from Stripe Checkout lands here with ?session_id=...
+        // Returning from Lemon Squeezy checkout lands here with
+        // ?checkout=done. The unlock token was stored before redirecting;
+        // the webhook may take a few seconds, so poll briefly.
         var params = new URLSearchParams(window.location.search);
-        var sessionId = params.get("session_id");
-        if (sessionId) {
-          try {
-            var s = await apiGet("/api/me?session_id=" + encodeURIComponent(sessionId));
-            if (s && s.unlocked && s.token) {
-              setToken(s.token);
-              unlockState = { unlocked: true, via: s.via || "subscription" };
-            }
-          } catch (e) { /* fall through to token check */ }
-          params.delete("session_id");
+        if (params.get("checkout") === "done") {
+          params.delete("checkout");
           var cleanUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
           window.history.replaceState({}, "", cleanUrl);
+          var attempts = 0;
+          var poll = async function () {
+            attempts++;
+            try {
+              var s = await apiGet("/api/me?token=" + encodeURIComponent(getToken()));
+              if (s && s.unlocked) {
+                unlockState = { unlocked: true, via: s.via || "subscription" };
+                updateUnlockUI();
+                return;
+              }
+            } catch (e) { /* keep polling */ }
+            if (attempts < 15) setTimeout(poll, 2000);
+          };
+          poll();
         }
         if (!unlockState.unlocked) {
           try {
@@ -154,7 +162,10 @@
         paywallStatus.textContent = "Opening secure checkout…";
         try {
           var data = await apiPost("/api/checkout", { origin: window.location.origin });
-          if (data._ok && data.url) {
+          if (data._ok && data.url && data.token) {
+            // Store the unlock token BEFORE leaving: the webhook matches it
+            // back via checkout custom data, and /api/me polls it on return.
+            setToken(data.token);
             window.location.href = data.url;
             return;
           }

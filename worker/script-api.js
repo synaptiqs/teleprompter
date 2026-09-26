@@ -7,18 +7,20 @@
  *   POST /api/generate-script   { name, role, audience, point, lengthSeconds }
  *                               -> { script } via Workers AI (Llama 3.3 70b)
  *
- * Paywalled: script SAVING is $0.95/month, or free forever with an
- * access code. Everything else stays free.
+ * Paywalled: script SAVING is $0.95/month via Lemon Squeezy, or free
+ * forever with an access code. Everything else stays free.
  *
- *   POST /api/checkout          { origin } -> { url }  (Stripe Checkout,
- *                               $0.95/mo recurring; needs STRIPE_SECRET_KEY
- *                               and STRIPE_PRICE_ID secrets)
- *   POST /api/webhook           Stripe webhook events (verified with
- *                               STRIPE_WEBHOOK_SECRET); keeps subscription
- *                               state in KV keyed by Stripe customer id.
+ *   POST /api/checkout          { origin } -> { url, token } (Lemon Squeezy
+ *                               hosted checkout for the $0.95/mo variant;
+ *                               needs LEMONSQUEEZY_API_KEY,
+ *                               LEMONSQUEEZY_STORE_ID, LEMONSQUEEZY_VARIANT_ID)
+ *   POST /api/webhook           Lemon Squeezy webhook events, verified with
+ *                               LEMONSQUEEZY_WEBHOOK_SECRET (HMAC-SHA256 of
+ *                               the raw body in the X-Signature header).
+ *                               Keeps subscription state in KV keyed by the
+ *                               opaque unlock token passed as custom_data.
  *   GET  /api/me?token=...     -> { unlocked, via } where via is
- *                               "subscription" | "code" | null. Also accepts
- *                               ?session_id=... right after Stripe redirect.
+ *                               "subscription" | "code" | null.
  *   POST /api/redeem            { code } -> { unlocked, token }.
  *                               A redeemed code unlocks saving for life.
  *   GET    /api/scripts?token=  List saved scripts for this identity.
@@ -26,20 +28,25 @@
  *   DELETE /api/scripts?id=&token=  Delete one saved script.
  *
  * Identity: the frontend stores one opaque token in localStorage:
- *   "code:CLICK-XXXX-XXXX" for code users, or "cus_..." (Stripe customer
- *   id) for subscribers. The Worker never trusts the client claim alone:
- *   codes are validated against hashed KV records, subscriptions against
- *   KV state written by the verified Stripe webhook.
+ *   "code:CLICK-XXXX-XXXX" for code users, or "sub:<hex>" for subscribers
+ *   (generated at checkout, matched back via checkout custom_data on the
+ *   subscription_created webhook). The Worker never trusts the client claim
+ *   alone: codes are validated against hashed KV records, subscriptions
+ *   against KV state written by the verified webhook.
  *
  * KV layout (namespace bound as KV):
  *   code:<sha256(code)>   -> { redeemed: bool, redeemed_at: number|null }
- *   sub:<customerId>      -> { status: "active"|"trialing"|"past_due"|
- *                                        "canceled"|"incomplete", updated_at }
+ *   sub:<hex>             -> { status, ls_subscription_id, updated_at }
+ *   lssub:<lsSubId>       -> <hex>  (reverse map for later webhook events,
+ *                              which may not carry custom_data)
+ *   evt:<event_id>        -> { at }  (webhook idempotency; LS signs no
+ *                              timestamp, so replays are deduped by id)
  *   scripts:<sha256(token)> -> [ { id, title, body, updatedAt } ]
  *
- * Secrets (set via the Workers API; placeholders until Tyler's Stripe
- * key arrives):
- *   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, STRIPE_PRICE_ID
+ * Secrets (set via the Workers API; placeholders until Tyler's Lemon
+ * Squeezy credentials arrive):
+ *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
+ *   LEMONSQUEEZY_STORE_ID, LEMONSQUEEZY_VARIANT_ID
  *
  * Bindings: AI (Workers AI), KV (this namespace).
  */
@@ -48,8 +55,8 @@
 var WORDS_PER_SECOND = 2.4;
 var MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
-// Subscription states that count as "paid up".
-var GOOD_STATUSES = { active: 1, trialing: 1 };
+// Lemon Squeezy subscription statuses that count as "paid up".
+var GOOD_STATUSES = { active: 1, on_trial: 1 };
 
 function json(data, status, cors) {
   return new Response(JSON.stringify(data), {
@@ -83,6 +90,12 @@ async function sha256Hex(text) {
   return bytesToHex(new Uint8Array(digest));
 }
 
+function randomHex(nBytes) {
+  var a = new Uint8Array(nBytes);
+  crypto.getRandomValues(a);
+  return bytesToHex(a);
+}
+
 function timingSafeEqual(a, b) {
   if (a.length !== b.length) return false;
   var out = 0;
@@ -90,19 +103,12 @@ function timingSafeEqual(a, b) {
   return out === 0;
 }
 
-// Verify a Stripe webhook signature: header looks like
-// "t=1492774577,v1=5257a869...,v0=...". Returns true/false.
-async function verifyStripeSignature(rawBody, header, secret) {
+// Verify a Lemon Squeezy webhook signature: the X-Signature header carries
+// the hex HMAC-SHA256 of the raw request body, keyed with the webhook
+// signing secret. LS signs no timestamp, so replay protection is handled
+// by event-id dedup in handleWebhook.
+async function verifyLemonSignature(rawBody, header, secret) {
   if (!header || !secret) return false;
-  var parts = {};
-  header.split(",").forEach(function (kv) {
-    var i = kv.indexOf("=");
-    if (i > 0) parts[kv.slice(0, i).trim()] = kv.slice(i + 1).trim();
-  });
-  if (!parts.t || !parts.v1) return false;
-  // Reject replays older than 5 minutes.
-  var ts = parseInt(parts.t, 10);
-  if (!ts || Math.abs(Date.now() / 1000 - ts) > 300) return false;
   var key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
@@ -113,47 +119,36 @@ async function verifyStripeSignature(rawBody, header, secret) {
   var sig = await crypto.subtle.sign(
     "HMAC",
     key,
-    new TextEncoder().encode(parts.t + "." + rawBody)
+    new TextEncoder().encode(rawBody)
   );
-  return timingSafeEqual(bytesToHex(new Uint8Array(sig)), parts.v1);
+  return timingSafeEqual(
+    bytesToHex(new Uint8Array(sig)),
+    String(header).trim().toLowerCase()
+  );
 }
 
-// ---- Stripe REST (raw fetch; no SDK in Workers) ----
+// ---- Lemon Squeezy REST (raw fetch; no SDK in Workers) ----
 
-function stripeAuth(secretKey) {
-  // Stripe uses HTTP Basic with the secret key as username.
-  return "Basic " + btoa(secretKey + ":");
-}
-
-async function stripePost(secretKey, path, params) {
-  var body = Object.keys(params)
-    .map(function (k) {
-      return encodeURIComponent(k) + "=" + encodeURIComponent(params[k]);
-    })
-    .join("&");
-  var res = await fetch("https://api.stripe.com" + path, {
+async function lemonPost(apiKey, path, payload) {
+  var res = await fetch("https://api.lemonsqueezy.com" + path, {
     method: "POST",
     headers: {
-      Authorization: stripeAuth(secretKey),
-      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: "Bearer " + apiKey,
+      Accept: "application/vnd.api+json",
+      "Content-Type": "application/vnd.api+json",
     },
-    body: body,
+    body: JSON.stringify(payload),
   });
   var data = await res.json().catch(function () { return {}; });
   if (!res.ok) {
-    var err = new Error((data.error && data.error.message) || "stripe error");
-    err.stripe = data.error;
+    var detail =
+      (data.errors && data.errors[0] && data.errors[0].detail) ||
+      "lemon squeezy error";
+    var err = new Error(detail);
+    err.status = res.status;
+    err.payload = data;
     throw err;
   }
-  return data;
-}
-
-async function stripeGet(secretKey, path) {
-  var res = await fetch("https://api.stripe.com" + path, {
-    headers: { Authorization: stripeAuth(secretKey) },
-  });
-  var data = await res.json().catch(function () { return {}; });
-  if (!res.ok) throw new Error("stripe error");
   return data;
 }
 
@@ -170,14 +165,14 @@ async function codeIsRedeemed(env, code) {
   return !!(rec && rec.redeemed);
 }
 
-async function subscriptionIsGood(env, customerId) {
-  if (!env.KV || !customerId) return false;
-  var rec = await env.KV.get("sub:" + customerId, "json");
+async function subscriptionIsGood(env, hex) {
+  if (!env.KV || !hex) return false;
+  var rec = await env.KV.get("sub:" + hex, "json");
   return !!(rec && GOOD_STATUSES[rec.status]);
 }
 
 // Resolve the caller's unlock state from their token.
-// Token is either "code:CLICK-XXXX-XXXX" or a Stripe "cus_..." id.
+// Token is either "code:CLICK-XXXX-XXXX" or "sub:<hex>".
 async function resolveUnlock(env, token) {
   token = clean(token, 64);
   if (!token) return { unlocked: false, via: null };
@@ -186,8 +181,10 @@ async function resolveUnlock(env, token) {
     if (await codeIsRedeemed(env, code)) return { unlocked: true, via: "code" };
     return { unlocked: false, via: null };
   }
-  if (token.indexOf("cus_") === 0) {
-    if (await subscriptionIsGood(env, token))
+  if (token.indexOf("sub:") === 0) {
+    var hex = token.slice(4);
+    if (!/^[0-9a-f]{32}$/.test(hex)) return { unlocked: false, via: null };
+    if (await subscriptionIsGood(env, hex))
       return { unlocked: true, via: "subscription" };
     return { unlocked: false, via: null };
   }
@@ -195,7 +192,7 @@ async function resolveUnlock(env, token) {
 }
 
 function scriptsKey(token) {
-  // Hash the identity so raw codes / customer ids aren't KV keys.
+  // Hash the identity so raw codes / tokens aren't KV keys.
   return sha256Hex("scripts:" + token).then(function (h) {
     return "scripts:" + h;
   });
@@ -212,9 +209,7 @@ async function writeScripts(env, token, list) {
 }
 
 function makeId() {
-  var a = new Uint8Array(12);
-  crypto.getRandomValues(a);
-  return bytesToHex(a);
+  return randomHex(12);
 }
 
 // ---- script generation (free, unchanged) ----
@@ -293,9 +288,15 @@ async function handleGenerate(request, env, cors) {
 // ---- paywall endpoints ----
 
 async function handleCheckout(request, env, cors) {
-  // Creates a Stripe Checkout Session for the $0.95/mo subscription and
-  // returns the hosted URL the frontend redirects to.
-  if (!env.STRIPE_SECRET_KEY || !env.STRIPE_PRICE_ID) {
+  // Creates a Lemon Squeezy checkout for the $0.95/mo subscription variant
+  // and returns the hosted URL plus the opaque unlock token. The frontend
+  // stores the token BEFORE redirecting; the subscription_created webhook
+  // matches it back via checkout custom_data.
+  if (
+    !env.LEMONSQUEEZY_API_KEY ||
+    !env.LEMONSQUEEZY_STORE_ID ||
+    !env.LEMONSQUEEZY_VARIANT_ID
+  ) {
     return json({ error: "Checkout is not configured yet." }, 503, cors);
   }
   var body = {};
@@ -307,29 +308,55 @@ async function handleCheckout(request, env, cors) {
   var origin = clean(body.origin, 120) || "https://clickprompt.app";
   if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
 
+  var token = "sub:" + randomHex(16);
+  var storeId = String(env.LEMONSQUEEZY_STORE_ID).trim();
+  var variantId = String(env.LEMONSQUEEZY_VARIANT_ID).trim();
+
   try {
-    var session = await stripePost(env.STRIPE_SECRET_KEY, "/v1/checkout/sessions", {
-      mode: "subscription",
-      "line_items[0][price]": env.STRIPE_PRICE_ID,
-      "line_items[0][quantity]": "1",
-      success_url: origin + "/?session_id={CHECKOUT_SESSION_ID}",
-      cancel_url: origin + "/",
+    var data = await lemonPost(env.LEMONSQUEEZY_API_KEY, "/v1/checkouts", {
+      data: {
+        type: "checkouts",
+        attributes: {
+          product_options: {
+            redirect_url: origin + "/?checkout=done",
+            enabled_variants: [variantId],
+            receipt_thank_you_note:
+              "Your ClickPrompt script saving is unlocked.",
+          },
+          checkout_data: {
+            custom: { unlock_token: token },
+          },
+        },
+        relationships: {
+          store: { data: { type: "stores", id: storeId } },
+          variant: { data: { type: "variants", id: variantId } },
+        },
+      },
     });
-    return json({ url: session.url }, 200, cors);
+    var attrs =
+      (data && data.data && data.data.attributes) || {};
+    if (!attrs.url) {
+      return json({ error: "Could not start checkout. Try again." }, 502, cors);
+    }
+    return json({ url: attrs.url, token: token }, 200, cors);
   } catch (e) {
-    return json({ error: "Could not start checkout. Try again." }, 502, cors);
+    return json(
+      { error: "Could not start checkout. " + (e.message || "Try again.") },
+      502,
+      cors
+    );
   }
 }
 
 async function handleWebhook(request, env, cors) {
-  // Stripe posts events here. Signature-verified; updates KV subscription
-  // state keyed by Stripe customer id.
-  if (!env.STRIPE_WEBHOOK_SECRET) {
+  // Lemon Squeezy posts events here. Signature-verified; updates KV
+  // subscription state keyed by the opaque unlock token.
+  if (!env.LEMONSQUEEZY_WEBHOOK_SECRET) {
     return json({ error: "Webhook is not configured yet." }, 503, cors);
   }
   var raw = await request.text();
-  var sig = request.headers.get("stripe-signature");
-  if (!(await verifyStripeSignature(raw, sig, env.STRIPE_WEBHOOK_SECRET))) {
+  var sig = request.headers.get("X-Signature");
+  if (!(await verifyLemonSignature(raw, sig, env.LEMONSQUEEZY_WEBHOOK_SECRET))) {
     return json({ error: "Bad signature." }, 401, cors);
   }
 
@@ -342,100 +369,68 @@ async function handleWebhook(request, env, cors) {
 
   if (!env.KV) return json({ error: "KV is not configured." }, 500, cors);
 
-  var type = event.type || "";
-  var obj = (event.data && event.data.object) || {};
+  var meta = event.meta || {};
+  var eventName = meta.event_name || "";
+  var eventId = String(meta.event_id || "");
 
-  if (type === "checkout.session.completed") {
-    // The customer id may not be on the session until the subscription
-    // exists; fetch the subscription to be sure.
-    var customerId = obj.customer || null;
-    var subStatus = "active";
-    try {
-      if (obj.subscription && env.STRIPE_SECRET_KEY) {
-        var sub = await stripeGet(
-          env.STRIPE_SECRET_KEY,
-          "/v1/subscriptions/" + obj.subscription
-        );
-        customerId = sub.customer || customerId;
-        subStatus = sub.status || subStatus;
-      }
-    } catch (e) {
-      /* fall through with what we have */
+  // Idempotency: LS retries deliveries and signs no timestamp, so dedup
+  // on the event id. Duplicates are acknowledged, not reprocessed.
+  if (eventId) {
+    var seen = await env.KV.get("evt:" + eventId);
+    if (seen) return json({ received: true, duplicate: true }, 200, cors);
+  }
+
+  var data = event.data || {};
+  var attrs = data.attributes || {};
+  var custom = meta.custom_data || {};
+
+  if (data.type === "subscriptions" && eventName.indexOf("subscription_") === 0) {
+    var lsSubId = String(data.id || "");
+    var hex = null;
+
+    // subscription_created carries our checkout custom_data; later events
+    // may not, so keep a reverse map from the LS subscription id.
+    var customToken = custom.unlock_token;
+    if (
+      typeof customToken === "string" &&
+      customToken.indexOf("sub:") === 0 &&
+      /^[0-9a-f]{32}$/.test(customToken.slice(4))
+    ) {
+      hex = customToken.slice(4);
+      if (lsSubId) await env.KV.put("lssub:" + lsSubId, hex);
+    } else if (lsSubId) {
+      hex = await env.KV.get("lssub:" + lsSubId);
     }
-    if (customerId) {
+
+    if (hex) {
+      // A cancelled flag means locked even if the status string lags.
+      var effectiveStatus =
+        attrs.cancelled === true ? "cancelled" : attrs.status || "unknown";
       await env.KV.put(
-        "sub:" + customerId,
-        JSON.stringify({ status: subStatus, updated_at: Date.now() })
-      );
-    }
-  } else if (
-    type === "customer.subscription.updated" ||
-    type === "customer.subscription.deleted"
-  ) {
-    var cid = obj.customer || null;
-    if (cid) {
-      await env.KV.put(
-        "sub:" + cid,
+        "sub:" + hex,
         JSON.stringify({
-          status: type === "customer.subscription.deleted" ? "canceled" : obj.status || "unknown",
+          status: effectiveStatus,
+          ls_subscription_id: lsSubId || null,
           updated_at: Date.now(),
         })
       );
     }
   }
   // All other event types are acknowledged and ignored.
+
+  if (eventId) {
+    await env.KV.put(
+      "evt:" + eventId,
+      JSON.stringify({ at: Date.now() })
+    );
+  }
   return json({ received: true }, 200, cors);
 }
 
 async function handleMe(request, env, cors) {
-  // GET /api/me?token=...  -> { unlocked, via }
-  // GET /api/me?session_id=... -> resolves the Stripe session right after
-  // redirect, returns { unlocked, via, token } with the customer token the
-  // frontend should store.
+  // GET /api/me?token=... -> { unlocked, via }
   var url = new URL(request.url);
   var token = url.searchParams.get("token");
-  var sessionId = url.searchParams.get("session_id");
-
-  if (sessionId) {
-    if (!env.STRIPE_SECRET_KEY) {
-      return json({ unlocked: false, via: null, reason: "not_configured" }, 200, cors);
-    }
-    try {
-      var session = await stripeGet(
-        env.STRIPE_SECRET_KEY,
-        "/v1/checkout/sessions/" + encodeURIComponent(sessionId)
-      );
-      var customerId = session.customer || null;
-      // Prefer the live subscription state straight from Stripe: the
-      // webhook may not have landed yet when the buyer is redirected back.
-      var subId = session.subscription || null;
-      if (subId) {
-        try {
-          var live = await stripeGet(
-            env.STRIPE_SECRET_KEY,
-            "/v1/subscriptions/" + encodeURIComponent(subId)
-          );
-          customerId = live.customer || customerId;
-          if (customerId && GOOD_STATUSES[live.status]) {
-            await env.KV.put(
-              "sub:" + customerId,
-              JSON.stringify({ status: live.status, updated_at: Date.now() })
-            );
-            return json({ unlocked: true, via: "subscription", token: customerId }, 200, cors);
-          }
-        } catch (e) {
-          /* fall through to the KV check */
-        }
-      }
-      if (customerId && (await subscriptionIsGood(env, customerId))) {
-        return json({ unlocked: true, via: "subscription", token: customerId }, 200, cors);
-      }
-      return json({ unlocked: false, via: null }, 200, cors);
-    } catch (e) {
-      return json({ unlocked: false, via: null }, 200, cors);
-    }
-  }
-
   var state = await resolveUnlock(env, token);
   return json(state, 200, cors);
 }
