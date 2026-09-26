@@ -58,6 +58,14 @@
             <textarea id="scriptInput" spellcheck="true" aria-label="Editable teleprompter script" placeholder="Your generated script appears here, or just write your own."></textarea>
           </div>
           <div class="script-meta"><span id="wordCount">0 words</span><span id="readTime">about 0:00</span></div>
+          <div class="script-actions">
+            <button class="secondary" id="saveScript" type="button">Save script</button>
+            <span class="save-status" id="saveStatus" role="status" aria-live="polite"></span>
+          </div>
+          <div class="library" id="library" hidden>
+            <h3 class="section-title">Saved scripts</h3>
+            <ul class="library-list" id="libraryList"></ul>
+          </div>
         </div>
 
         <div>
@@ -172,6 +180,24 @@
         <button class="secondary" id="newTake" type="button">Record another</button>
       </div>
       <p class="download-status" id="downloadStatus" role="status" aria-live="polite"></p>
+    </div>
+  </dialog>
+
+  <dialog id="paywallDialog">
+    <div class="paywall">
+      <h2>Save your scripts</h2>
+      <p>Keep every script you write and pull it up anytime, on any device.</p>
+      <p class="price"><strong>$0.95/month</strong> &middot; unlimited saved scripts &middot; cancel anytime</p>
+      <button class="primary" id="subscribeButton" type="button">Subscribe &mdash; $0.95/mo</button>
+      <p class="paywall-status" id="paywallStatus" role="status" aria-live="polite"></p>
+      <div class="code-row">
+        <label for="codeInput">Have an access code?</label>
+        <div class="code-input-row">
+          <input id="codeInput" type="text" autocomplete="off" autocapitalize="characters" placeholder="CLICK-XXXX-XXXX" />
+          <button class="secondary" id="redeemButton" type="button">Redeem</button>
+        </div>
+      </div>
+      <button class="text-button" id="paywallClose" type="button">Not now</button>
     </div>
   </dialog>
 

@@ -55,6 +55,253 @@
       var openPrompter = document.getElementById("openPrompter");
       var changeScript = document.getElementById("changeScript");
 
+      // ---- Paywall: script saving ($0.95/mo or access code) ----
+      // Everything else (interview, generation, prompter) stays free.
+      var API_BASE = "https://teleprompter-script-api.synaptiqs.workers.dev";
+      var TOKEN_KEY = "clickprompt_token";
+      var saveScriptButton = document.getElementById("saveScript");
+      var saveStatus = document.getElementById("saveStatus");
+      var library = document.getElementById("library");
+      var libraryList = document.getElementById("libraryList");
+      var paywallDialog = document.getElementById("paywallDialog");
+      var subscribeButton = document.getElementById("subscribeButton");
+      var paywallStatus = document.getElementById("paywallStatus");
+      var codeInput = document.getElementById("codeInput");
+      var redeemButton = document.getElementById("redeemButton");
+      var paywallClose = document.getElementById("paywallClose");
+      var unlockState = { unlocked: false, via: null };
+
+      function getToken() {
+        try { return localStorage.getItem(TOKEN_KEY) || ""; }
+        catch (e) { return ""; }
+      }
+
+      function setToken(token) {
+        try {
+          if (token) localStorage.setItem(TOKEN_KEY, token);
+          else localStorage.removeItem(TOKEN_KEY);
+        } catch (e) { /* private mode: saving just won't persist */ }
+      }
+
+      async function apiGet(path) {
+        var res = await fetch(API_BASE + path);
+        return res.json();
+      }
+
+      async function apiPost(path, body) {
+        var res = await fetch(API_BASE + path, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body)
+        });
+        var data = await res.json().catch(function () { return {}; });
+        data._ok = res.ok;
+        return data;
+      }
+
+      async function refreshUnlock() {
+        // Returning from Stripe Checkout lands here with ?session_id=...
+        var params = new URLSearchParams(window.location.search);
+        var sessionId = params.get("session_id");
+        if (sessionId) {
+          try {
+            var s = await apiGet("/api/me?session_id=" + encodeURIComponent(sessionId));
+            if (s && s.unlocked && s.token) {
+              setToken(s.token);
+              unlockState = { unlocked: true, via: s.via || "subscription" };
+            }
+          } catch (e) { /* fall through to token check */ }
+          params.delete("session_id");
+          var cleanUrl = window.location.pathname + (params.toString() ? "?" + params.toString() : "");
+          window.history.replaceState({}, "", cleanUrl);
+        }
+        if (!unlockState.unlocked) {
+          try {
+            var m = await apiGet("/api/me?token=" + encodeURIComponent(getToken()));
+            if (m && m.unlocked) unlockState = { unlocked: true, via: m.via || null };
+            else { unlockState = { unlocked: false, via: null }; setToken(""); }
+          } catch (e) { unlockState = { unlocked: false, via: null }; }
+        }
+        updateUnlockUI();
+      }
+
+      function updateUnlockUI() {
+        if (unlockState.unlocked) {
+          library.hidden = false;
+          saveStatus.textContent = unlockState.via === "code"
+            ? "Saving unlocked with your access code."
+            : "Saving unlocked — subscription active.";
+          loadLibrary();
+        } else {
+          library.hidden = true;
+          libraryList.innerHTML = "";
+          saveStatus.textContent = "";
+        }
+      }
+
+      function openPaywall() {
+        paywallStatus.textContent = "";
+        codeInput.value = "";
+        if (typeof paywallDialog.showModal === "function") paywallDialog.showModal();
+      }
+
+      function closePaywall() {
+        if (paywallDialog.open) paywallDialog.close();
+      }
+
+      async function startCheckout() {
+        subscribeButton.disabled = true;
+        paywallStatus.textContent = "Opening secure checkout…";
+        try {
+          var data = await apiPost("/api/checkout", { origin: window.location.origin });
+          if (data._ok && data.url) {
+            window.location.href = data.url;
+            return;
+          }
+          paywallStatus.textContent = data.error || "Checkout isn't available right now. Try again later.";
+        } catch (e) {
+          paywallStatus.textContent = "Couldn't reach the checkout. Check your connection and try again.";
+        } finally {
+          subscribeButton.disabled = false;
+        }
+      }
+
+      async function redeemCode() {
+        var code = codeInput.value.trim();
+        if (!code) {
+          paywallStatus.textContent = "Enter your access code first.";
+          codeInput.focus();
+          return;
+        }
+        redeemButton.disabled = true;
+        paywallStatus.textContent = "Checking your code…";
+        try {
+          var data = await apiPost("/api/redeem", { code: code });
+          if (data._ok && data.unlocked) {
+            setToken(data.token);
+            unlockState = { unlocked: true, via: "code" };
+            updateUnlockUI();
+            closePaywall();
+            saveStatus.textContent = "Code accepted — saving is unlocked.";
+            return;
+          }
+          paywallStatus.textContent = data.error || "That code didn't work.";
+        } catch (e) {
+          paywallStatus.textContent = "Couldn't reach the server. Check your connection and try again.";
+        } finally {
+          redeemButton.disabled = false;
+        }
+      }
+
+      function defaultScriptTitle() {
+        var text = scriptInput.value.trim();
+        var first = text.split("\n")[0] || "";
+        first = first.replace(/^[^a-zA-Z0-9]+/, "").slice(0, 48).trim();
+        if (!first) first = "Untitled script";
+        var d = new Date();
+        return first + " — " + (d.getMonth() + 1) + "/" + d.getDate();
+      }
+
+      async function saveCurrentScript() {
+        var text = scriptInput.value.trim();
+        if (!text) {
+          saveStatus.textContent = "Write or generate a script first.";
+          return;
+        }
+        if (!unlockState.unlocked) {
+          openPaywall();
+          return;
+        }
+        saveScriptButton.disabled = true;
+        saveStatus.textContent = "Saving…";
+        try {
+          var data = await apiPost("/api/scripts", {
+            token: getToken(),
+            title: defaultScriptTitle(),
+            body: text
+          });
+          if (data._ok) {
+            saveStatus.textContent = "Saved.";
+            renderLibrary(data.scripts || []);
+          } else if (data.unlocked === false) {
+            // Subscription lapsed or code revoked: drop back to the paywall.
+            setToken("");
+            unlockState = { unlocked: false, via: null };
+            updateUnlockUI();
+            openPaywall();
+          } else {
+            saveStatus.textContent = data.error || "Couldn't save. Try again.";
+          }
+        } catch (e) {
+          saveStatus.textContent = "Couldn't reach the server. Try again.";
+        } finally {
+          saveScriptButton.disabled = false;
+        }
+      }
+
+      function renderLibrary(scripts) {
+        libraryList.innerHTML = "";
+        if (!scripts.length) {
+          var empty = document.createElement("li");
+          empty.className = "library-empty";
+          empty.textContent = "Nothing saved yet. Your scripts will live here.";
+          libraryList.appendChild(empty);
+          return;
+        }
+        scripts.forEach(function (s) {
+          var li = document.createElement("li");
+          li.className = "library-item";
+          var name = document.createElement("button");
+          name.type = "button";
+          name.className = "library-load";
+          name.textContent = s.title || "Untitled script";
+          name.title = "Load into editor";
+          name.addEventListener("click", function () {
+            scriptInput.value = s.body || "";
+            setPromptOffset(0);
+            setScrollState(false);
+            updateScript();
+            saveStatus.textContent = "Loaded “" + (s.title || "script") + "”.";
+            scriptInput.focus();
+          });
+          var del = document.createElement("button");
+          del.type = "button";
+          del.className = "library-delete";
+          del.textContent = "Delete";
+          del.setAttribute("aria-label", "Delete " + (s.title || "script"));
+          del.addEventListener("click", function () { deleteScript(s.id); });
+          li.appendChild(name);
+          li.appendChild(del);
+          libraryList.appendChild(li);
+        });
+      }
+
+      async function loadLibrary() {
+        if (!unlockState.unlocked) return;
+        try {
+          var data = await apiGet("/api/scripts?token=" + encodeURIComponent(getToken()));
+          if (data && Array.isArray(data.scripts)) renderLibrary(data.scripts);
+          else if (data && data.unlocked === false) {
+            setToken("");
+            unlockState = { unlocked: false, via: null };
+            updateUnlockUI();
+          }
+        } catch (e) { /* library just stays as-is on network failure */ }
+      }
+
+      async function deleteScript(id) {
+        if (!id || !unlockState.unlocked) return;
+        try {
+          var res = await fetch(
+            API_BASE + "/api/scripts?id=" + encodeURIComponent(id) +
+            "&token=" + encodeURIComponent(getToken()),
+            { method: "DELETE" }
+          );
+          var data = await res.json().catch(function () { return {}; });
+          if (res.ok && Array.isArray(data.scripts)) renderLibrary(data.scripts);
+        } catch (e) { /* leave the list as-is */ }
+      }
+
 
       var stream = null;
       var recordingStream = null;
@@ -714,6 +961,13 @@
       scriptInput.addEventListener("input", updateScript);
       speed.addEventListener("input", updateRangeLabels);
       fontSize.addEventListener("input", updateRangeLabels);
+      saveScriptButton.addEventListener("click", saveCurrentScript);
+      subscribeButton.addEventListener("click", startCheckout);
+      redeemButton.addEventListener("click", redeemCode);
+      paywallClose.addEventListener("click", closePaywall);
+      codeInput.addEventListener("keydown", function (e) {
+        if (e.key === "Enter") redeemCode();
+      });
 
       countdownToggle.addEventListener("click", function () { togglePressed(countdownToggle); });
       mirrorToggle.addEventListener("click", function () {
@@ -767,4 +1021,5 @@
       scriptInput.value = "";
       updateScript();
       updateRangeLabels();
+      refreshUnlock();
     }());
