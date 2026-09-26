@@ -39,3 +39,21 @@ The frontend calls the deployed worker URL, set once in `app.js` as
   project on `*.pages.dev`).
 - API: Cloudflare Worker `teleprompter-script-api` with the Workers AI
   binding. Source of truth is `worker/script-api.js` in this repo.
+
+## Paywall: script saving
+
+The interview, script generation, and the full prompter (scroll, camera,
+recording) are free forever. Saving scripts to a personal library costs
+$0.95/month, or is free for life with an access code.
+
+- Worker endpoints: `POST /api/checkout` (Stripe Checkout, recurring),
+  `POST /api/webhook` (Stripe events, signature-verified), `GET /api/me`,
+  `POST /api/redeem` (access code), `GET/POST/DELETE /api/scripts`
+  (library CRUD, unlocked identities only).
+- Storage: Cloudflare KV namespace `clickprompt-data`. Access codes are
+  stored as SHA-256 hashes only; subscriptions are keyed by Stripe
+  customer id and written by the verified webhook.
+- Secrets the worker expects: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
+  `STRIPE_PRICE_ID` (the $0.95/mo recurring price).
+- The frontend keeps one opaque unlock token in `localStorage`
+  (`clickprompt_token`): `code:CLICK-XXXX-XXXX` or a Stripe `cus_...` id.
