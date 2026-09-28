@@ -33,6 +33,21 @@ Content-Type: application/json
 The frontend calls the deployed worker URL, set once in `app.js` as
 `SCRIPT_API_URL`.
 
+## MCP connector endpoint (Meta Muse directory)
+
+The same worker also serves a stateless MCP endpoint for AI-agent
+connectors (submitted to Meta's Muse connector directory as "Existing MCP"):
+
+```
+POST /mcp   JSON-RPC 2.0 — methods: initialize, tools/list, tools/call
+```
+
+Tools: `generate_script`, `start_checkout`, `check_unlock_status`,
+`redeem_access_code`, `list_scripts`, `save_script`, `delete_script`.
+No auth needed for `generate_script`; the paid-tier tools use the same
+opaque identity tokens as the REST API. Full machine-readable spec:
+`openapi.yaml` (REST) + tool schemas via `tools/list`.
+
 ## Deploy
 
 - Frontend: Cloudflare Pages, served from this repo's root (`teleprompter`

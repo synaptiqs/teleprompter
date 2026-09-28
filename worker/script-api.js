@@ -7,6 +7,13 @@
  *   POST /api/generate-script   { name, role, audience, point, lengthSeconds }
  *                               -> { script } via Workers AI (Llama 3.3 70b)
  *
+ * MCP connector endpoint (for Meta's Muse connector directory):
+ *   POST /mcp                   JSON-RPC 2.0, stateless streamable HTTP.
+ *                               Methods: initialize, tools/list, tools/call.
+ *                               Tools: generate_script, check_unlock_status,
+ *                               redeem_access_code, start_checkout,
+ *                               list_scripts, save_script, delete_script.
+ *
  * Paywalled: script SAVING is $0.95/month via Lemon Squeezy, or free
  * forever with an access code. Everything else stays free.
  *
@@ -212,7 +219,20 @@ function makeId() {
   return randomHex(12);
 }
 
-// ---- script generation (free, unchanged) ----
+// ---------------------------------------------------------------------------
+// Core operations (shared by the REST handlers and the MCP tools below).
+// Each do* function either returns its result object or throws an ApiError
+// with { status, message }. REST handlers translate these into HTTP
+// responses; MCP tools translate them into isError tool results.
+// ---------------------------------------------------------------------------
+
+function ApiError(status, message) {
+  var e = new Error(message);
+  e.status = status;
+  return e;
+}
+
+// ---- script generation (free) ----
 
 function buildPrompt(a) {
   var targetWords = Math.round(a.lengthSeconds * WORDS_PER_SECOND);
@@ -242,32 +262,28 @@ function buildPrompt(a) {
   );
 }
 
-async function handleGenerate(request, env, cors) {
-  var body;
-  try {
-    body = await request.json();
-  } catch (e) {
-    return json({ error: "Request body must be JSON." }, 400, cors);
-  }
-
-  var answers = {
+function parseAnswers(input) {
+  var body = input || {};
+  return {
     name: clean(body.name, 80),
     role: clean(body.role, 200),
     audience: clean(body.audience, 200),
     point: clean(body.point, 500),
     lengthSeconds: Math.min(300, Math.max(15, Number(body.lengthSeconds) || 60)),
   };
+}
 
+async function doGenerate(env, input) {
+  var answers = parseAnswers(input);
   if (!answers.point) {
-    return json({ error: "The one point (question 4) is required." }, 400, cors);
+    throw ApiError(400, "The one point (question 4) is required.");
   }
-
   if (!env.AI) {
-    return json({ error: "AI binding is not configured on this Worker." }, 500, cors);
+    throw ApiError(500, "AI binding is not configured on this Worker.");
   }
-
+  var result;
   try {
-    var result = await env.AI.run(MODEL, {
+    result = await env.AI.run(MODEL, {
       messages: [
         {
           role: "system",
@@ -277,35 +293,25 @@ async function handleGenerate(request, env, cors) {
         { role: "user", content: buildPrompt(answers) },
       ],
     });
-    var script = clean(result && result.response, 4000);
-    if (!script) throw new Error("empty model response");
-    return json({ script: script }, 200, cors);
   } catch (e) {
-    return json({ error: "Script generation failed. Try again." }, 502, cors);
+    throw ApiError(502, "Script generation failed. Try again.");
   }
+  var script = clean(result && result.response, 4000);
+  if (!script) throw ApiError(502, "Script generation failed. Try again.");
+  return { script: script };
 }
 
-// ---- paywall endpoints ----
+// ---- paywall operations ----
 
-async function handleCheckout(request, env, cors) {
-  // Creates a Lemon Squeezy checkout for the $0.95/mo subscription variant
-  // and returns the hosted URL plus the opaque unlock token. The frontend
-  // stores the token BEFORE redirecting; the subscription_created webhook
-  // matches it back via checkout custom_data.
+async function doCheckout(env, origin) {
   if (
     !env.LEMONSQUEEZY_API_KEY ||
     !env.LEMONSQUEEZY_STORE_ID ||
     !env.LEMONSQUEEZY_VARIANT_ID
   ) {
-    return json({ error: "Checkout is not configured yet." }, 503, cors);
+    throw ApiError(503, "Checkout is not configured yet.");
   }
-  var body = {};
-  try {
-    body = await request.json();
-  } catch (e) {
-    body = {};
-  }
-  var origin = clean(body.origin, 120) || "https://clickprompt.app";
+  origin = clean(origin, 120) || "https://clickprompt.app";
   if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
 
   var token = "sub:" + randomHex(16);
@@ -333,18 +339,121 @@ async function handleCheckout(request, env, cors) {
         },
       },
     });
-    var attrs =
-      (data && data.data && data.data.attributes) || {};
-    if (!attrs.url) {
-      return json({ error: "Could not start checkout. Try again." }, 502, cors);
-    }
-    return json({ url: attrs.url, token: token }, 200, cors);
   } catch (e) {
-    return json(
-      { error: "Could not start checkout. " + (e.message || "Try again.") },
-      502,
-      cors
+    throw ApiError(502, "Could not start checkout. " + (e.message || "Try again."));
+  }
+  var attrs = (data && data.data && data.data.attributes) || {};
+  if (!attrs.url) {
+    throw ApiError(502, "Could not start checkout. Try again.");
+  }
+  return { url: attrs.url, token: token };
+}
+
+async function doMe(env, token) {
+  return resolveUnlock(env, token);
+}
+
+async function doRedeem(env, code) {
+  if (!env.KV) throw ApiError(500, "KV is not configured.");
+  code = normalizeCode(code);
+  if (!code) throw ApiError(400, "Enter your access code.");
+
+  var hash = await sha256Hex("code:" + code);
+  var key = "code:" + hash;
+  var rec = await env.KV.get(key, "json");
+  if (!rec) throw ApiError(404, "That code isn't recognized.");
+  if (!rec.redeemed) {
+    await env.KV.put(
+      key,
+      JSON.stringify({ redeemed: true, redeemed_at: Date.now() })
     );
+  }
+  // Already-redeemed codes still unlock (each redemption is a device unlock).
+  return { unlocked: true, token: "code:" + code, via: "code" };
+}
+
+async function doScriptsGet(env, token) {
+  if (!env.KV) throw ApiError(500, "KV is not configured.");
+  var st = await resolveUnlock(env, token);
+  if (!st.unlocked) throw ApiError(403, "Saving requires unlock.");
+  return { scripts: await readScripts(env, token) };
+}
+
+async function doScriptsSave(env, token, fields) {
+  if (!env.KV) throw ApiError(500, "KV is not configured.");
+  token = clean(token, 64);
+  var st = await resolveUnlock(env, token);
+  if (!st.unlocked) throw ApiError(403, "Saving requires unlock.");
+  var title = clean(fields.title, 80) || "Untitled script";
+  var scriptBody = clean(fields.body, 20000);
+  if (!scriptBody) throw ApiError(400, "Nothing to save.");
+
+  var list = await readScripts(env, token);
+  var id = clean(fields.id, 32);
+  var now = Date.now();
+  if (id) {
+    var found = false;
+    list = list.map(function (s) {
+      if (s.id === id) {
+        found = true;
+        return { id: id, title: title, body: scriptBody, updatedAt: now };
+      }
+      return s;
+    });
+    if (!found) list.unshift({ id: id, title: title, body: scriptBody, updatedAt: now });
+  } else {
+    list.unshift({ id: makeId(), title: title, body: scriptBody, updatedAt: now });
+  }
+  // Cap the library at 200 scripts per identity.
+  list = list.slice(0, 200);
+  await writeScripts(env, token, list);
+  return { ok: true, scripts: list };
+}
+
+async function doScriptsDelete(env, token, id) {
+  if (!env.KV) throw ApiError(500, "KV is not configured.");
+  var st = await resolveUnlock(env, token);
+  if (!st.unlocked) throw ApiError(403, "Saving requires unlock.");
+  id = clean(id, 32);
+  if (!id) throw ApiError(400, "Missing id.");
+  var list = (await readScripts(env, token)).filter(function (s) {
+    return s.id !== id;
+  });
+  await writeScripts(env, token, list);
+  return { ok: true, scripts: list };
+}
+
+// ---- REST handlers (thin wrappers around the core operations) ----
+
+async function handleGenerate(request, env, cors) {
+  var body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return json({ error: "Request body must be JSON." }, 400, cors);
+  }
+  try {
+    return json(await doGenerate(env, body), 200, cors);
+  } catch (e) {
+    return json({ error: e.message || "Script generation failed." }, e.status || 500, cors);
+  }
+}
+
+async function handleCheckout(request, env, cors) {
+  // Creates a Lemon Squeezy checkout for the $0.95/mo subscription variant
+  // and returns the hosted URL plus the opaque unlock token. The frontend
+  // stores the token BEFORE redirecting; the subscription_created webhook
+  // matches it back via checkout custom_data.
+  var body = {};
+  try {
+    body = await request.json();
+  } catch (e) {
+    body = {};
+  }
+  try {
+    return json(await doCheckout(env, body.origin), 200, cors);
+  } catch (e) {
+    return json({ error: e.message || "Could not start checkout." }, e.status || 500, cors);
   }
 }
 
@@ -431,101 +540,330 @@ async function handleMe(request, env, cors) {
   // GET /api/me?token=... -> { unlocked, via }
   var url = new URL(request.url);
   var token = url.searchParams.get("token");
-  var state = await resolveUnlock(env, token);
-  return json(state, 200, cors);
+  try {
+    return json(await doMe(env, token), 200, cors);
+  } catch (e) {
+    return json({ error: e.message || "Lookup failed." }, e.status || 500, cors);
+  }
 }
 
 async function handleRedeem(request, env, cors) {
   // POST /api/redeem { code } -> { unlocked: true, token } on success.
-  // A redeemed code unlocks script saving for life.
-  if (!env.KV) return json({ error: "KV is not configured." }, 500, cors);
+  // A redeemed code unlocks saving for life.
   var body;
   try {
     body = await request.json();
   } catch (e) {
     return json({ error: "Request body must be JSON." }, 400, cors);
   }
-  var code = normalizeCode(body.code);
-  if (!code) return json({ error: "Enter your access code." }, 400, cors);
-
-  var hash = await sha256Hex("code:" + code);
-  var key = "code:" + hash;
-  var rec = await env.KV.get(key, "json");
-  if (!rec) return json({ error: "That code isn't recognized." }, 404, cors);
-  if (rec.redeemed) {
-    // Already redeemed: still unlock this device (codes are shareable
-    // within reason; each redemption is just a device unlock).
-    return json({ unlocked: true, token: "code:" + code, via: "code" }, 200, cors);
+  try {
+    return json(await doRedeem(env, body.code), 200, cors);
+  } catch (e) {
+    return json({ error: e.message || "Redemption failed." }, e.status || 500, cors);
   }
-  await env.KV.put(
-    key,
-    JSON.stringify({ redeemed: true, redeemed_at: Date.now() })
-  );
-  return json({ unlocked: true, token: "code:" + code, via: "code" }, 200, cors);
 }
 
 async function handleScripts(request, env, cors) {
   // CRUD for saved scripts. Every method requires an unlocked identity.
   // Identity token comes from ?token= or the JSON body.
-  if (!env.KV) return json({ error: "KV is not configured." }, 500, cors);
   var url = new URL(request.url);
   var token = url.searchParams.get("token") || "";
 
-  if (request.method === "GET") {
-    var st = await resolveUnlock(env, token);
-    if (!st.unlocked) return json({ error: "Saving requires unlock.", unlocked: false }, 403, cors);
-    return json({ scripts: await readScripts(env, token) }, 200, cors);
-  }
-
-  if (request.method === "POST") {
-    var body;
-    try {
-      body = await request.json();
-    } catch (e) {
-      return json({ error: "Request body must be JSON." }, 400, cors);
+  try {
+    if (request.method === "GET") {
+      return json(await doScriptsGet(env, token), 200, cors);
     }
-    token = clean(body.token, 64) || token;
-    var st2 = await resolveUnlock(env, token);
-    if (!st2.unlocked) return json({ error: "Saving requires unlock.", unlocked: false }, 403, cors);
-    var title = clean(body.title, 80) || "Untitled script";
-    var scriptBody = clean(body.body, 20000);
-    if (!scriptBody) return json({ error: "Nothing to save." }, 400, cors);
 
-    var list = await readScripts(env, token);
-    var id = clean(body.id, 32);
-    var now = Date.now();
-    if (id) {
-      var found = false;
-      list = list.map(function (s) {
-        if (s.id === id) {
-          found = true;
-          return { id: id, title: title, body: scriptBody, updatedAt: now };
-        }
-        return s;
-      });
-      if (!found) list.unshift({ id: id, title: title, body: scriptBody, updatedAt: now });
-    } else {
-      list.unshift({ id: makeId(), title: title, body: scriptBody, updatedAt: now });
+    if (request.method === "POST") {
+      var body;
+      try {
+        body = await request.json();
+      } catch (e) {
+        return json({ error: "Request body must be JSON." }, 400, cors);
+      }
+      token = clean(body.token, 64) || token;
+      return json(
+        await doScriptsSave(env, token, { id: body.id, title: body.title, body: body.body }),
+        200,
+        cors
+      );
     }
-    // Cap the library at 200 scripts per identity.
-    list = list.slice(0, 200);
-    await writeScripts(env, token, list);
-    return json({ ok: true, scripts: list }, 200, cors);
+
+    if (request.method === "DELETE") {
+      return json(
+        await doScriptsDelete(env, token, url.searchParams.get("id")),
+        200,
+        cors
+      );
+    }
+
+    return json({ error: "Method not allowed." }, 405, cors);
+  } catch (e) {
+    return json({ error: e.message || "Request failed." }, e.status || 500, cors);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MCP connector endpoint
+// ---------------------------------------------------------------------------
+// Stateless JSON-RPC 2.0 over HTTP POST at /mcp (streamable-HTTP style:
+// single request -> single JSON response). No session tracking; every
+// request is independent.
+//
+// This is the surface Meta's Muse connector directory consumes when the
+// connector is submitted as "Existing MCP". Tool names and descriptions
+// are written for agent discovery: what the user asks for, not how the
+// backend works.
+// ---------------------------------------------------------------------------
+
+var MCP_PROTOCOL_VERSION = "2025-06-18";
+var MCP_SERVER_NAME = "clickprompt";
+var MCP_SERVER_VERSION = "1.0.0";
+
+var MCP_INSTRUCTIONS =
+  "ClickPrompt is a camera teleprompter for talking-head video. " +
+  "Use generate_script when the user wants a video script drafted from a " +
+  "short interview (their name, what they do, who the video is for, the one " +
+  "point it must land, target length). Script generation is free and needs " +
+  "no account. Saving scripts to a personal library costs $0.95/month via " +
+  "Lemon Squeezy, or is free for life with an access code the user already " +
+  "owns. To unlock saving: call start_checkout and show the user the " +
+  "returned checkout URL, keep the returned token, then poll " +
+  "check_unlock_status with that token until unlocked. Or call " +
+  "redeem_access_code with the user's code. Library tools (list_scripts, " +
+  "save_script, delete_script) require an unlocked identity token.";
+
+var MCP_TOOLS = [
+  {
+    name: "generate_script",
+    description:
+      "Draft a spoken-word teleprompter script from a 5-question interview. " +
+      "Free, no account needed. Ask the user for: their name/handle, what " +
+      "they do, who the video is for, the single point the video must land " +
+      "(required), and target length in seconds (15-300, default 60). " +
+      "Returns plain-text script ready to read on camera.",
+    inputSchema: {
+      type: "object",
+      required: ["point"],
+      properties: {
+        name: { type: "string", description: "Speaker name or handle." },
+        role: { type: "string", description: "What the speaker does." },
+        audience: { type: "string", description: "Who the video is for." },
+        point: {
+          type: "string",
+          description: "The single point the video must land (required).",
+        },
+        lengthSeconds: {
+          type: "integer",
+          minimum: 15,
+          maximum: 300,
+          default: 60,
+          description: "Target video length in seconds.",
+        },
+      },
+    },
+  },
+  {
+    name: "start_checkout",
+    description:
+      "Start a $0.95/month checkout to unlock script saving. Returns a " +
+      "hosted checkout URL to show the user plus an unlock token. Keep the " +
+      "token and poll check_unlock_status with it after the user pays. " +
+      "The user pays Lemon Squeezy (merchant of record) in their browser.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        origin: {
+          type: "string",
+          description: "Site to return the user to after checkout.",
+        },
+      },
+    },
+  },
+  {
+    name: "check_unlock_status",
+    description:
+      "Check whether an identity token has script saving unlocked. " +
+      "Use after start_checkout to confirm the user's purchase completed.",
+    inputSchema: {
+      type: "object",
+      required: ["token"],
+      properties: {
+        token: {
+          type: "string",
+          description: 'Identity token: "sub:<hex>" from start_checkout or "code:CLICK-XXXX-XXXX".',
+        },
+      },
+    },
+  },
+  {
+    name: "redeem_access_code",
+    description:
+      "Redeem a ClickPrompt access code for lifetime script-saving unlock. " +
+      "Use when the user already owns a code.",
+    inputSchema: {
+      type: "object",
+      required: ["code"],
+      properties: {
+        code: { type: "string", description: "Access code, e.g. CLICK-XXXX-XXXX." },
+      },
+    },
+  },
+  {
+    name: "list_scripts",
+    description: "List the user's saved scripts. Requires an unlocked identity token.",
+    inputSchema: {
+      type: "object",
+      required: ["token"],
+      properties: {
+        token: { type: "string", description: "Unlocked identity token." },
+      },
+    },
+  },
+  {
+    name: "save_script",
+    description:
+      "Save a script to the user's library (creates or updates by id). " +
+      "Requires an unlocked identity token.",
+    inputSchema: {
+      type: "object",
+      required: ["token", "body"],
+      properties: {
+        token: { type: "string", description: "Unlocked identity token." },
+        id: { type: "string", description: "Existing script id to update (omit to create)." },
+        title: { type: "string", description: "Script title." },
+        body: { type: "string", description: "Script text (required)." },
+      },
+    },
+  },
+  {
+    name: "delete_script",
+    description: "Delete one saved script. Requires an unlocked identity token.",
+    inputSchema: {
+      type: "object",
+      required: ["token", "id"],
+      properties: {
+        token: { type: "string", description: "Unlocked identity token." },
+        id: { type: "string", description: "Script id to delete." },
+      },
+    },
+  },
+];
+
+function mcpError(id, code, message) {
+  return {
+    jsonrpc: "2.0",
+    id: id === undefined ? null : id,
+    error: { code: code, message: message },
+  };
+}
+
+function mcpResult(id, result) {
+  return { jsonrpc: "2.0", id: id === undefined ? null : id, result: result };
+}
+
+function mcpToolText(obj) {
+  return { content: [{ type: "text", text: JSON.stringify(obj) }] };
+}
+
+function mcpToolError(message) {
+  return {
+    content: [{ type: "text", text: message }],
+    isError: true,
+  };
+}
+
+async function mcpCallTool(env, name, args) {
+  args = args || {};
+  try {
+    switch (name) {
+      case "generate_script":
+        return mcpToolText(await doGenerate(env, args));
+      case "start_checkout":
+        return mcpToolText(await doCheckout(env, args.origin));
+      case "check_unlock_status":
+        return mcpToolText(await doMe(env, args.token));
+      case "redeem_access_code":
+        return mcpToolText(await doRedeem(env, args.code));
+      case "list_scripts":
+        return mcpToolText(await doScriptsGet(env, args.token));
+      case "save_script":
+        return mcpToolText(
+          await doScriptsSave(env, args.token, {
+            id: args.id,
+            title: args.title,
+            body: args.body,
+          })
+        );
+      case "delete_script":
+        return mcpToolText(await doScriptsDelete(env, args.token, args.id));
+      default:
+        return mcpToolError("Unknown tool: " + name);
+    }
+  } catch (e) {
+    return mcpToolError(e.message || "Tool call failed.");
+  }
+}
+
+async function handleMcp(request, env, cors) {
+  if (request.method !== "POST") {
+    return json(
+      { error: "MCP requires POST with a JSON-RPC 2.0 body." },
+      405,
+      cors
+    );
   }
 
-  if (request.method === "DELETE") {
-    var st3 = await resolveUnlock(env, token);
-    if (!st3.unlocked) return json({ error: "Saving requires unlock.", unlocked: false }, 403, cors);
-    var delId = clean(url.searchParams.get("id"), 32);
-    if (!delId) return json({ error: "Missing id." }, 400, cors);
-    var list2 = (await readScripts(env, token)).filter(function (s) {
-      return s.id !== delId;
-    });
-    await writeScripts(env, token, list2);
-    return json({ ok: true, scripts: list2 }, 200, cors);
+  var msg;
+  try {
+    msg = await request.json();
+  } catch (e) {
+    return json(mcpError(null, -32700, "Parse error."), 200, cors);
   }
 
-  return json({ error: "Method not allowed." }, 405, cors);
+  if (!msg || msg.jsonrpc !== "2.0" || typeof msg.method !== "string") {
+    return json(mcpError(msg && msg.id, -32600, "Invalid Request."), 200, cors);
+  }
+
+  var id = msg.id;
+  var params = msg.params || {};
+
+  // Notifications have no id and get no response.
+  if (id === undefined || id === null) {
+    return new Response(null, { status: 202, headers: cors });
+  }
+
+  switch (msg.method) {
+    case "initialize":
+      return json(
+        mcpResult(id, {
+          protocolVersion: MCP_PROTOCOL_VERSION,
+          capabilities: { tools: {} },
+          serverInfo: { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
+          instructions: MCP_INSTRUCTIONS,
+        }),
+        200,
+        cors
+      );
+
+    case "ping":
+      return json(mcpResult(id, {}), 200, cors);
+
+    case "tools/list":
+      return json(mcpResult(id, { tools: MCP_TOOLS }), 200, cors);
+
+    case "tools/call": {
+      var toolName = params.name;
+      if (!toolName) {
+        return json(mcpError(id, -32602, "Missing tool name."), 200, cors);
+      }
+      var callResult = await mcpCallTool(env, toolName, params.arguments);
+      return json(mcpResult(id, callResult), 200, cors);
+    }
+
+    default:
+      return json(mcpError(id, -32601, "Method not found: " + msg.method), 200, cors);
+  }
 }
 
 // ---- router ----
@@ -545,6 +883,9 @@ export default {
     var url = new URL(request.url);
     var path = url.pathname;
 
+    if (path === "/mcp") {
+      return handleMcp(request, env, cors);
+    }
     if (path === "/api/generate-script" && request.method === "POST") {
       return handleGenerate(request, env, cors);
     }

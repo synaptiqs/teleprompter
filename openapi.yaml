@@ -1,0 +1,297 @@
+openapi: 3.0.3
+info:
+  title: ClickPrompt API
+  version: 1.0.0
+  description: |
+    ClickPrompt (https://clickprompt.app) — a camera teleprompter for
+    talking-head video. An AI agent can use this API to draft a spoken-word
+    video script from five interview answers, unlock script saving for the
+    user via a paid subscription or access code, and manage the user's saved
+    script library.
+
+    Free tier: script generation is free and needs no account or key.
+    Paid tier: saving scripts to a personal library is $0.95/month via
+    Lemon Squeezy, or free for life with an access code. The interview,
+    script generation, and the full prompter stay free forever.
+
+    Agent purchase flow (no new code needed once Lemon Squeezy is configured):
+    1. Agent calls POST /api/checkout -> receives { url, token }.
+    2. Agent presents the hosted checkout URL to the user in conversation.
+    3. User completes the $0.95/mo purchase in their browser; Lemon Squeezy
+       (merchant of record) charges them. A verified webhook grants
+       entitlement keyed by the token.
+    4. Agent polls GET /api/me?token=... until { unlocked: true,
+       via: "subscription" }, then tells the user script saving is unlocked.
+  contact:
+    name: ClickPrompt support
+    url: https://clickprompt.app
+  license:
+    name: Proprietary
+servers:
+  - url: https://teleprompter-script-api.synaptiqs.workers.dev
+    description: Production Cloudflare Worker
+
+paths:
+  /api/generate-script:
+    post:
+      operationId: generateScript
+      summary: Draft a teleprompter script from five interview answers
+      description: |
+        Free, no auth. Posts the five interview answers and returns a
+        plain-text spoken-word script sized to the requested length
+        (~145 wpm). Question 4 (the one point) is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [point]
+              properties:
+                name:
+                  type: string
+                  maxLength: 80
+                  description: Speaker name or handle (used in sign-off).
+                role:
+                  type: string
+                  maxLength: 200
+                  description: What the speaker does.
+                audience:
+                  type: string
+                  maxLength: 200
+                  description: Who the video is for.
+                point:
+                  type: string
+                  maxLength: 500
+                  description: The single point the video must land (required).
+                lengthSeconds:
+                  type: integer
+                  minimum: 15
+                  maximum: 300
+                  default: 60
+                  description: Target video length in seconds.
+      responses:
+        '200':
+          description: Generated script.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [script]
+                properties:
+                  script:
+                    type: string
+                    description: Plain-text script, paragraphs separated by blank lines.
+        '400':
+          description: Missing required field or bad JSON.
+        '502':
+          description: Script generation failed.
+
+  /api/checkout:
+    post:
+      operationId: startCheckout
+      summary: Start a Lemon Squeezy checkout for script-saving unlock
+      description: |
+        Creates a Lemon Squeezy hosted checkout for the $0.95/mo script-saving
+        subscription and returns the checkout URL plus the opaque unlock token.
+        The agent must keep the token: the subscription_created webhook matches
+        it back via checkout custom_data, and the agent polls /api/me with it.
+        The user pays Lemon Squeezy (merchant of record) in their browser.
+        Returns 503 until Lemon Squeezy is configured on the worker.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                origin:
+                  type: string
+                  description: Redirect origin after checkout (defaults to https://clickprompt.app).
+      responses:
+        '200':
+          description: Checkout created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url, token]
+                properties:
+                  url:
+                    type: string
+                    format: uri
+                    description: Lemon Squeezy hosted checkout URL to show the user.
+                  token:
+                    type: string
+                    description: Opaque unlock token (format "sub:<hex>"). Keep it; poll /api/me with it.
+        '502':
+          description: Could not start checkout.
+        '503':
+          description: Checkout not configured yet.
+
+  /api/me:
+    get:
+      operationId: checkUnlock
+      summary: Check whether an identity token has script saving unlocked
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+          description: 'Opaque identity token: "code:CLICK-XXXX-XXXX" or "sub:<hex>".'
+      responses:
+        '200':
+          description: Unlock state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unlocked, via]
+                properties:
+                  unlocked:
+                    type: boolean
+                  via:
+                    type: string
+                    nullable: true
+                    enum: [subscription, code]
+                    description: How unlock was granted, null if locked.
+
+  /api/redeem:
+    post:
+      operationId: redeemCode
+      summary: Redeem an access code for lifetime script-saving unlock
+      description: |
+        Access codes bypass the paywall entirely (free for life). The agent
+        can deliver a code the user already owns; the API validates it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: Access code, e.g. CLICK-XXXX-XXXX.
+      responses:
+        '200':
+          description: Redemption result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [unlocked, token]
+                properties:
+                  unlocked:
+                    type: boolean
+                  token:
+                    type: string
+                    description: Identity token to use for library calls.
+                  via:
+                    type: string
+                    enum: [code]
+        '404':
+          description: Code not recognized.
+
+  /api/scripts:
+    get:
+      operationId: listScripts
+      summary: List saved scripts for an unlocked identity
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Script library.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scripts]
+                properties:
+                  scripts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SavedScript'
+        '403':
+          description: Saving requires unlock.
+    post:
+      operationId: saveScript
+      summary: Save (or update) a script in the user's library
+      description: Requires an unlocked identity. Upserts by id; caps the library at 200 scripts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, body]
+              properties:
+                token:
+                  type: string
+                id:
+                  type: string
+                  description: Existing script id to update (omit to create).
+                title:
+                  type: string
+                  maxLength: 80
+                body:
+                  type: string
+                  maxLength: 20000
+      responses:
+        '200':
+          description: Saved; returns full library.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, scripts]
+                properties:
+                  ok:
+                    type: boolean
+                  scripts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SavedScript'
+        '403':
+          description: Saving requires unlock.
+    delete:
+      operationId: deleteScript
+      summary: Delete one saved script
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted; returns remaining library.
+        '403':
+          description: Saving requires unlock.
+
+components:
+  schemas:
+    SavedScript:
+      type: object
+      required: [id, title, body, updatedAt]
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        body:
+          type: string
+        updatedAt:
+          type: integer
+          format: int64
