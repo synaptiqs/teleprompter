@@ -57,9 +57,11 @@ opaque identity tokens as the REST API. Full machine-readable spec:
 
 ## Paywall: script saving
 
-The interview, script generation, and the full prompter (scroll, camera,
-recording) are free forever. Saving scripts to a personal library costs
-$0.95/month, or is free for life with an access code.
+The interview and the full prompter (scroll, camera,
+recording) are free forever. Script generation is free at 3 scripts/day
+per visitor (subscribers get unlimited). Saving scripts to a personal
+library costs $2.99/month or $34.99 lifetime, or is free for life with an
+access code.
 
 - Worker endpoints: `POST /api/checkout` (Lemon Squeezy hosted checkout,
   recurring), `POST /api/webhook` (Lemon Squeezy events, X-Signature
@@ -71,6 +73,10 @@ $0.95/month, or is free for life with an access code.
   verified webhook.
 - Secrets the worker expects: `LEMONSQUEEZY_API_KEY`,
   `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID`,
-  `LEMONSQUEEZY_VARIANT_ID` (the $0.95/mo subscription variant).
+  `LEMONSQUEEZY_VARIANT_ID` (the $2.99/mo subscription variant),
+  `LEMONSQUEEZY_VARIANT_ID_LIFETIME` (the $34.99 one-time variant),
+  `LEMONSQUEEZY_STORAGE_TIERS` (JSON map of storage add-on variant ID to
+  GB), plus optional `EMAIL_API_KEY`/`EMAIL_FROM` for the cancellation
+  email sequence.
 - The frontend keeps one opaque unlock token in `localStorage`
   (`clickprompt_token`): `code:CLICK-XXXX-XXXX` or `sub:<hex>`.

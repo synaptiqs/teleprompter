@@ -9,15 +9,17 @@ info:
     user via a paid subscription or access code, and manage the user's saved
     script library.
 
-    Free tier: script generation is free and needs no account or key.
-    Paid tier: saving scripts to a personal library is $0.95/month via
-    Lemon Squeezy, or free for life with an access code. The interview,
-    script generation, and the full prompter stay free forever.
+    Free tier: script generation is free at 3 scripts/day per visitor, no
+    account or key needed. Subscribers get unlimited generations.
+    Paid tier: saving scripts to a personal library is $2.99/month or
+    $34.99 lifetime via Lemon Squeezy, or free for life with an access
+    code. The interview, the full prompter, recording, and downloads stay
+    free forever.
 
     Agent purchase flow (no new code needed once Lemon Squeezy is configured):
     1. Agent calls POST /api/checkout -> receives { url, token }.
     2. Agent presents the hosted checkout URL to the user in conversation.
-    3. User completes the $0.95/mo purchase in their browser; Lemon Squeezy
+    3. User completes the purchase in their browser; Lemon Squeezy
        (merchant of record) charges them. A verified webhook grants
        entitlement keyed by the token.
     4. Agent polls GET /api/me?token=... until { unlocked: true,
@@ -40,6 +42,10 @@ paths:
         Free, no auth. Posts the five interview answers and returns a
         plain-text spoken-word script sized to the requested length
         (~145 wpm). Question 4 (the one point) is required.
+        Free tier: 3 generations/day per visitor (code "daily_limit" with
+        429 when hit); subscribers pass their unlock token for unlimited.
+        Response includes `remaining` (free scripts left today, -1 for
+        subscribers).
       requestBody:
         required: true
         content:
@@ -92,8 +98,9 @@ paths:
       operationId: startCheckout
       summary: Start a Lemon Squeezy checkout for script-saving unlock
       description: |
-        Creates a Lemon Squeezy hosted checkout for the $0.95/mo script-saving
-        subscription and returns the checkout URL plus the opaque unlock token.
+        Creates a Lemon Squeezy hosted checkout for the script-saving
+        unlock (monthly $2.99/mo or lifetime $34.99 one-time) and returns
+        the checkout URL plus the opaque unlock token.
         The agent must keep the token: the subscription_created webhook matches
         it back via checkout custom_data, and the agent polls /api/me with it.
         The user pays Lemon Squeezy (merchant of record) in their browser.

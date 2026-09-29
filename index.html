@@ -8,15 +8,21 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500;600&family=IBM+Sans:opsz,wght@14..48,400;500;600;700&display=swap" rel="stylesheet" />
-  <title>Teleprompter</title>
+  <title>ClickPrompt — Free Teleprompter for Recording Videos</title>
+  <meta name="description" content="ClickPrompt is a free teleprompter for recording videos. Answer five quick questions, get a script written for the camera, and read it while you record — right in your browser." />
+  <meta property="og:title" content="ClickPrompt — Free Teleprompter for Recording Videos" />
+  <meta property="og:description" content="A free teleprompter for recording videos: generate a script from five quick questions and read it on camera, right in your browser." />
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://clickprompt.app/" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <main class="app" id="app" data-view="setup">
-    <section class="setup" aria-label="Teleprompter setup">
+    <section class="setup" aria-label="ClickPrompt setup">
       <div class="setup-head">
-        <h1>Teleprompter</h1>
+        <h1>ClickPrompt</h1>
         <p>Answer five quick questions and we'll draft your script. You can edit every word before you record.</p>
+        <button class="text-button tour-replay" id="replayTour" type="button">Take the tour</button>
       </div>
       <div class="setup-body">
         <div>
@@ -49,6 +55,7 @@
           <div class="setup-action">
             <button class="primary" id="generateScript" type="button">Generate script</button>
           </div>
+          <p class="free-cap" id="freeCap" role="status" aria-live="polite">3 free scripts today</p>
           <p class="generate-status" id="generateStatus" role="status" aria-live="polite"></p>
         </div>
 
@@ -65,6 +72,11 @@
           <div class="library" id="library" hidden>
             <h3 class="section-title">Saved scripts</h3>
             <ul class="library-list" id="libraryList"></ul>
+          </div>
+          <div class="library" id="audioLibrary" hidden>
+            <h3 class="section-title">Saved voiceovers</h3>
+            <p class="storage-line" id="storageLine" hidden></p>
+            <ul class="library-list" id="audioLibraryList"></ul>
           </div>
         </div>
 
@@ -108,6 +120,7 @@
         <div class="stage" id="stage">
           <video class="camera-source" id="camera" autoplay muted playsinline></video>
           <canvas class="camera mirrored" id="cameraCanvas" aria-label="Camera preview"></canvas>
+          <canvas class="waveform" id="waveform" aria-label="Microphone level" hidden></canvas>
           <div class="camera-empty" id="cameraEmpty">
             <div>
               <svg viewBox="0 0 64 64" fill="none" aria-hidden="true"><rect x="6" y="15" width="38" height="34" rx="5" stroke="currentColor" stroke-width="3"/><path d="m44 25 12-7v28l-12-7V25Z" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/><circle cx="25" cy="32" r="8" stroke="currentColor" stroke-width="3"/></svg>
@@ -115,6 +128,14 @@
               <p>Camera permission starts the live preview. Nothing records until you press the red button.</p>
               <button class="primary" id="enableCamera" type="button">Enable camera &amp; mic</button>
               <div class="error" id="errorMessage" role="alert"></div>
+            </div>
+          </div>
+          <div class="camera-empty" id="micEmpty" style="display:none">
+            <div>
+              <svg class="mic-icon" viewBox="0 0 64 64" fill="none" aria-hidden="true"><rect x="25" y="6" width="14" height="28" rx="7" stroke="currentColor" stroke-width="3"/><path d="M17 30a15 15 0 0 0 30 0M32 45v11" stroke="currentColor" stroke-width="3" stroke-linecap="round"/></svg>
+              <h2>Record your voiceover</h2>
+              <p>No camera needed. Your script scrolls while you read — just press record and talk.</p>
+              <button class="primary" id="enableMic" type="button">Enable microphone</button>
             </div>
           </div>
 
@@ -151,16 +172,23 @@
             </button>
           </div>
         </div>
-        <p class="hint">The white button controls the script. The button to the right of Record pauses or resumes the video.</p>
+        <p class="hint" id="stageHint">The white button controls the script. The button to the right of Record pauses or resumes the video.</p>
         <div class="prompter-tools">
-          <div class="orientation-tool">
+          <div class="orientation-tool" id="recordModeTool">
+            <span id="recordModeLabel">Recording mode</span>
+            <div class="orientation-switch" role="group" aria-labelledby="recordModeLabel">
+              <button id="videoMode" type="button" aria-pressed="true">Video</button>
+              <button id="audioMode" type="button" aria-pressed="false">Audio only</button>
+            </div>
+          </div>
+          <div class="orientation-tool" id="orientationTool">
             <span id="orientationLabel">Recording frame</span>
             <div class="orientation-switch" role="group" aria-labelledby="orientationLabel">
               <button id="portraitFrame" type="button" aria-pressed="true">Vertical</button>
               <button id="landscapeFrame" type="button" aria-pressed="false">Horizontal</button>
             </div>
           </div>
-          <div class="camera-tool">
+          <div class="camera-tool" id="cameraTool">
             <label for="cameraSelect">Camera</label>
             <select id="cameraSelect" disabled><option>Enable camera to choose</option></select>
           </div>
@@ -170,13 +198,23 @@
     </section>
   </main>
 
+  <footer class="site-footer">
+    <span>ClickPrompt</span>
+    <span class="footer-sep">&middot;</span>
+    <a href="/privacy.html">Privacy</a>
+    <span class="footer-sep">&middot;</span>
+    <a href="/terms.html">Terms</a>
+  </footer>
+
   <dialog id="reviewDialog">
     <div class="review">
-      <h2>Take complete</h2>
-      <p>Review it now, then download the file to keep it.</p>
+      <h2 id="reviewTitle">Take complete</h2>
+      <p id="reviewSubtitle">Review it now, then download the file to keep it.</p>
       <video id="reviewVideo" controls playsinline></video>
+      <audio id="reviewAudio" controls playsinline hidden></audio>
       <div class="review-actions">
         <button class="primary" id="downloadLink" type="button">Download take</button>
+        <button class="secondary" id="saveAudioCloud" type="button" hidden>Save to cloud</button>
         <button class="secondary" id="newTake" type="button">Record another</button>
       </div>
       <p class="download-status" id="downloadStatus" role="status" aria-live="polite"></p>
@@ -186,9 +224,22 @@
   <dialog id="paywallDialog">
     <div class="paywall">
       <h2>Save your scripts</h2>
-      <p>Keep every script you write and pull it up anytime, on any device.</p>
-      <p class="price"><strong>$0.95/month</strong> &middot; unlimited saved scripts &middot; cancel anytime</p>
-      <button class="primary" id="subscribeButton" type="button">Subscribe &mdash; $0.95/mo</button>
+      <p>Keep every script you write and every voiceover you record. Pull them up anytime, on any device.</p>
+      <div class="plan-picker" role="radiogroup" aria-label="Choose a plan">
+        <label class="plan-option">
+          <input type="radio" name="plan" value="monthly" checked />
+          <span class="plan-name">Monthly</span>
+          <span class="plan-price">$2.99/mo</span>
+        </label>
+        <label class="plan-option">
+          <input type="radio" name="plan" value="lifetime" />
+          <span class="plan-name">Lifetime</span>
+          <span class="plan-price">$34.99</span>
+          <span class="plan-note">one-time</span>
+        </label>
+      </div>
+      <p class="price">Unlimited script generations &middot; 100 GB storage &middot; cancel anytime</p>
+      <button class="primary" id="subscribeButton" type="button">Continue &mdash; $2.99/mo</button>
       <p class="paywall-status" id="paywallStatus" role="status" aria-live="polite"></p>
       <div class="code-row">
         <label for="codeInput">Have an access code?</label>
@@ -198,6 +249,28 @@
         </div>
       </div>
       <button class="text-button" id="paywallClose" type="button">Not now</button>
+    </div>
+  </dialog>
+
+  <dialog id="platformDialog">
+    <div class="platform-overlay">
+      <button class="platform-skip" id="platformSkip" type="button" aria-label="Skip">Skip</button>
+      <h2>Where's this video going?</h2>
+      <p>We'll set the right shape, length, and tone for the platform.</p>
+      <div class="platform-grid" id="platformGrid" role="listbox" aria-label="Platforms">
+        <button type="button" class="platform-card" data-platform="youtube" role="option">YouTube</button>
+        <button type="button" class="platform-card" data-platform="tiktok" role="option">TikTok</button>
+        <button type="button" class="platform-card" data-platform="instagram" role="option">Instagram Reels</button>
+        <button type="button" class="platform-card" data-platform="facebook" role="option">Facebook</button>
+        <button type="button" class="platform-card" data-platform="linkedin" role="option">LinkedIn</button>
+        <button type="button" class="platform-card" data-platform="x" role="option">X</button>
+      </div>
+      <div class="platform-other">
+        <label for="platformOther">Somewhere else?</label>
+        <input id="platformOther" type="text" list="platformDatalist" autocomplete="off" placeholder="Type a platform name" />
+        <datalist id="platformDatalist"></datalist>
+      </div>
+      <p class="platform-working" id="platformWorking" role="status" aria-live="polite" hidden></p>
     </div>
   </dialog>
 
