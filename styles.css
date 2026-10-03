@@ -551,6 +551,7 @@
       margin-bottom: 16px;
     }
     .platform-card {
+      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
       padding: 14px 10px;
       border: 1px solid var(--border, #ddd);
       border-radius: 12px;
@@ -558,8 +559,9 @@
       color: var(--text);
       font-size: .95rem; font-weight: 600;
       cursor: pointer;
-      min-height: 52px; /* comfortable touch target */
+      min-height: 76px; /* comfortable touch target */
     }
+    .platform-icon { width: 26px; height: 26px; color: var(--accent); flex: none; }
     .platform-card:hover, .platform-card:focus-visible {
       border-color: var(--accent);
       outline: 2px solid var(--accent);
