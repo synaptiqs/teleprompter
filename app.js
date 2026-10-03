@@ -1875,6 +1875,25 @@
         var step = TOUR_STEPS[tourIndex];
         var last = tourIndex === TOUR_STEPS.length - 1;
         tourTooltip.innerHTML = "";
+        // Q, the ClickPrompt mascot, guides the tour.
+        var guide = document.createElement("div");
+        guide.className = "tour-guide";
+        var avatar = document.createElement("img");
+        avatar.className = "tour-guide-avatar";
+        avatar.src = "brand/cue.webp";
+        avatar.alt = "Q, the ClickPrompt mascot";
+        var who = document.createElement("div");
+        who.className = "tour-guide-who";
+        var guideName = document.createElement("div");
+        guideName.className = "tour-guide-name";
+        guideName.textContent = "Q";
+        var guideSub = document.createElement("div");
+        guideSub.className = "tour-guide-sub";
+        guideSub.textContent = "your ClickPrompt guide";
+        who.appendChild(guideName);
+        who.appendChild(guideSub);
+        guide.appendChild(avatar);
+        guide.appendChild(who);
         var h = document.createElement("h3");
         h.textContent = step.title;
         var p = document.createElement("p");
@@ -1907,6 +1926,7 @@
         nav.appendChild(skip);
         nav.appendChild(back);
         nav.appendChild(next);
+        tourTooltip.appendChild(guide);
         tourTooltip.appendChild(h);
         tourTooltip.appendChild(p);
         tourTooltip.appendChild(nav);

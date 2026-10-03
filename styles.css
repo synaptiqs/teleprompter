@@ -469,6 +469,10 @@
       font-size: .92rem;
     }
     .tour-tooltip h3 { margin: 0 0 6px; font-size: 1rem; }
+    .tour-guide { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+    .tour-guide-avatar { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; flex: none; border: 1px solid var(--line); background: #000; }
+    .tour-guide-name { font-weight: 700; font-size: .9rem; color: var(--ink); line-height: 1.25; }
+    .tour-guide-sub { font-size: .75rem; color: var(--muted); }
     .tour-tooltip p { margin: 0 0 12px; color: var(--muted); line-height: 1.45; }
     .tour-nav { display: flex; align-items: center; gap: 8px; }
     .tour-count { font-size: .8rem; color: var(--muted); margin-right: auto; }
