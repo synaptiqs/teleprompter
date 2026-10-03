@@ -469,10 +469,22 @@
       font-size: .92rem;
     }
     .tour-tooltip h3 { margin: 0 0 6px; font-size: 1rem; }
-    .tour-guide { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-    .tour-guide-avatar { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; flex: none; border: 1px solid var(--line); background: #000; }
+    .tour-guide { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+    .tour-guide-avatar { width: 22px; height: 22px; flex: none; }
     .tour-guide-name { font-weight: 700; font-size: .9rem; color: var(--ink); line-height: 1.25; }
     .tour-guide-sub { font-size: .75rem; color: var(--muted); }
+    @keyframes q-talk {
+      0%, 100% { transform: translateY(0) scaleY(1); }
+      25% { transform: translateY(-1px) scaleY(.9); }
+      50% { transform: translateY(0) scaleY(1); }
+      75% { transform: translateY(-1px) scaleY(.93); }
+    }
+    .tour-guide-avatar.talking { animation: q-talk .36s ease-in-out infinite; filter: drop-shadow(0 0 4px rgba(34, 211, 238, .7)); }
+    .tour-mute { background: none; border: 0; color: var(--muted); font: inherit; font-size: .85rem; cursor: pointer; padding: 6px 4px; }
+    .tour-mute:hover { color: var(--ink); text-decoration: underline; }
+    @media (prefers-reduced-motion: reduce) {
+      .tour-guide-avatar.talking { animation: none; }
+    }
     .tour-tooltip p { margin: 0 0 12px; color: var(--muted); line-height: 1.45; }
     .tour-nav { display: flex; align-items: center; gap: 8px; }
     .tour-count { font-size: .8rem; color: var(--muted); margin-right: auto; }

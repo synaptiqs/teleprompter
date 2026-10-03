@@ -1817,8 +1817,26 @@
       var tourIndex = -1;
       var tourHighlight = null;
       var tourTooltip = null;
+      var tourTypeTimer = null;
+      var tourAudio = null;
+      var tourMuted = false;
+      try { tourMuted = localStorage.getItem("clickprompt_tour_muted") === "1"; } catch (e) {}
+      function tourTalkingDone() {
+        // Q stops "talking" only when the typewriter AND the voice are both done.
+        var typing = !!tourTypeTimer;
+        var speaking = tourAudio && !tourAudio.paused && !tourAudio.ended;
+        if (!typing && !speaking && tourTooltip) {
+          var a = tourTooltip.querySelector(".tour-guide-avatar");
+          if (a) a.classList.remove("talking");
+        }
+      }
+      function tourStopAudio() {
+        if (tourAudio) { try { tourAudio.pause(); } catch (e) {} tourAudio = null; }
+      }
 
       function tourCleanup() {
+        if (tourTypeTimer) { clearInterval(tourTypeTimer); tourTypeTimer = null; }
+        tourStopAudio();
         if (tourHighlight && tourHighlight.parentNode) tourHighlight.parentNode.removeChild(tourHighlight);
         if (tourTooltip && tourTooltip.parentNode) tourTooltip.parentNode.removeChild(tourTooltip);
         tourHighlight = null;
@@ -1922,7 +1940,19 @@
           if (last) endTour(true);
           else tourAdvance(1);
         });
+        var mute = document.createElement("button");
+        mute.type = "button";
+        mute.className = "tour-mute";
+        mute.textContent = tourMuted ? "Unmute" : "Mute";
+        mute.addEventListener("click", function () {
+          tourMuted = !tourMuted;
+          try { localStorage.setItem("clickprompt_tour_muted", tourMuted ? "1" : "0"); } catch (e) {}
+          mute.textContent = tourMuted ? "Unmute" : "Mute";
+          if (tourMuted) tourStopAudio();
+          tourTalkingDone();
+        });
         nav.appendChild(count);
+        nav.appendChild(mute);
         nav.appendChild(skip);
         nav.appendChild(back);
         nav.appendChild(next);
@@ -1931,9 +1961,44 @@
         tourTooltip.appendChild(p);
         tourTooltip.appendChild(nav);
         next.focus();
+        // Q "talks" the step: typewriter text + voiceover, avatar animates.
+        if (tourTypeTimer) { clearInterval(tourTypeTimer); tourTypeTimer = null; }
+        tourStopAudio();
+        var reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        var fullText = step.text;
+        var guideAvatar = guide.querySelector(".tour-guide-avatar");
+        if (reduceMotion) {
+          p.textContent = fullText;
+        } else {
+          p.textContent = "";
+          var chars = fullText.split("");
+          var ci = 0;
+          if (guideAvatar) guideAvatar.classList.add("talking");
+          tourTypeTimer = setInterval(function () {
+            ci++;
+            p.textContent = fullText.slice(0, ci);
+            if (ci >= chars.length) {
+              clearInterval(tourTypeTimer); tourTypeTimer = null;
+              tourTalkingDone();
+              positionTourStep();
+            }
+          }, 24);
+        }
+        if (!tourMuted && !reduceMotion) {
+          try {
+            tourAudio = new Audio("brand/q-voice-" + (tourIndex + 1) + ".mp3");
+            tourAudio.addEventListener("ended", tourTalkingDone);
+            var playPromise = tourAudio.play();
+            if (playPromise && playPromise.catch) {
+              playPromise.catch(function () { tourAudio = null; tourTalkingDone(); });
+            }
+          } catch (e) { tourAudio = null; }
+        }
       }
 
       function tourAdvance(dir) {
+        if (tourTypeTimer) { clearInterval(tourTypeTimer); tourTypeTimer = null; }
+        tourStopAudio();
         tourIndex += dir;
         if (tourIndex < 0) tourIndex = 0;
         if (tourIndex >= TOUR_STEPS.length) { endTour(true); return; }
