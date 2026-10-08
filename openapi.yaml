@@ -11,9 +11,10 @@ info:
 
     Free tier: script generation is free at 3 scripts/day per visitor, no
     account or key needed. Subscribers get unlimited generations.
-    Paid tier: saving scripts to a personal library is $2.99/month or
-    $34.99 lifetime via Lemon Squeezy, or free for life with an access
-    code. The interview, the full prompter, recording, and downloads stay
+    Paid tier (ClickPrompt Pro): saving scripts to a personal library is
+    $4.99/month, $49.99/year, or $129 lifetime via Lemon Squeezy, or free
+    for life with an access code. Buyers can also unlock with the license
+    key from their purchase email. The interview, the full prompter, recording, and downloads stay
     free forever.
 
     Agent purchase flow (no new code needed once Lemon Squeezy is configured):
@@ -99,7 +100,8 @@ paths:
       summary: Start a Lemon Squeezy checkout for script-saving unlock
       description: |
         Creates a Lemon Squeezy hosted checkout for the script-saving
-        unlock (monthly $2.99/mo or lifetime $34.99 one-time) and returns
+        unlock (monthly $4.99/mo, yearly $49.99/yr, or lifetime $129
+        one-time) and returns
         the checkout URL plus the opaque unlock token.
         The agent must keep the token: the subscription_created webhook matches
         it back via checkout custom_data, and the agent polls /api/me with it.
@@ -115,6 +117,11 @@ paths:
                 origin:
                   type: string
                   description: Redirect origin after checkout (defaults to https://clickprompt.app).
+                plan:
+                  type: string
+                  enum: [monthly, yearly, lifetime]
+                  default: monthly
+                  description: Plan to check out ($4.99/mo, $49.99/yr, or $129 one-time).
       responses:
         '200':
           description: Checkout created.
@@ -146,7 +153,7 @@ paths:
           required: true
           schema:
             type: string
-          description: 'Opaque identity token: "code:CLICK-XXXX-XXXX" or "sub:<hex>".'
+          description: 'Opaque identity token from /api/checkout or /api/redeem: "sub:<hex>", "code:<CODE>", or "lic:<license key>".'
       responses:
         '200':
           description: Unlock state.
@@ -161,16 +168,19 @@ paths:
                   via:
                     type: string
                     nullable: true
-                    enum: [subscription, code]
+                    enum: [subscription, lifetime, code]
                     description: How unlock was granted, null if locked.
 
   /api/redeem:
     post:
       operationId: redeemCode
-      summary: Redeem an access code for lifetime script-saving unlock
+      summary: Redeem an access code or a Lemon Squeezy license key
       description: |
-        Access codes bypass the paywall entirely (free for life). The agent
-        can deliver a code the user already owns; the API validates it.
+        Access codes bypass the paywall entirely (free for life). A license
+        key from a ClickPrompt Pro purchase email unlocks Pro for as long as
+        that purchase is active (lifetime keys never expire). The agent can
+        deliver a code or key the user already owns; the API validates it.
+        Limited-use codes return 409 once used up; 429 when throttled.
       requestBody:
         required: true
         content:
@@ -181,7 +191,7 @@ paths:
               properties:
                 code:
                   type: string
-                  description: Access code, e.g. CLICK-XXXX-XXXX.
+                  description: Access code (e.g. CLICK-XXXX-XXXX) or license key (UUID format).
       responses:
         '200':
           description: Redemption result.

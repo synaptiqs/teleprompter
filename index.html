@@ -14,7 +14,7 @@
   <meta property="og:description" content="A free teleprompter for recording videos: generate a script from five quick questions and read it on camera, right in your browser." />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://clickprompt.app/" />
-  <link rel="stylesheet" href="styles.css?v=20261003a" />
+  <link rel="stylesheet" href="styles.css?v=20261008a" />
 </head>
 <body>
   <main class="app" id="app" data-view="setup">
@@ -233,22 +233,27 @@
         <label class="plan-option">
           <input type="radio" name="plan" value="monthly" checked />
           <span class="plan-name">Monthly</span>
-          <span class="plan-price">$2.99/mo</span>
+          <span class="plan-price">$4.99/mo</span>
+        </label>
+        <label class="plan-option">
+          <input type="radio" name="plan" value="yearly" />
+          <span class="plan-name">Yearly</span>
+          <span class="plan-price">$49.99/yr</span>
         </label>
         <label class="plan-option">
           <input type="radio" name="plan" value="lifetime" />
           <span class="plan-name">Lifetime</span>
-          <span class="plan-price">$34.99</span>
+          <span class="plan-price">$129</span>
           <span class="plan-note">one-time</span>
         </label>
       </div>
-      <p class="price">Unlimited script generations &middot; 100 GB storage &middot; cancel anytime</p>
-      <button class="primary" id="subscribeButton" type="button">Continue &mdash; $2.99/mo</button>
+      <p class="price">Unlimited script generations &middot; 100 GB storage &middot; cancel anytime &middot; 14-day refund</p>
+      <button class="primary" id="subscribeButton" type="button">Continue &mdash; $4.99/mo</button>
       <p class="paywall-status" id="paywallStatus" role="status" aria-live="polite"></p>
       <div class="code-row">
-        <label for="codeInput">Have an access code?</label>
+        <label for="codeInput">Have an access code or license key?</label>
         <div class="code-input-row">
-          <input id="codeInput" type="text" autocomplete="off" autocapitalize="characters" placeholder="CLICK-XXXX-XXXX" />
+          <input id="codeInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="CLICK-XXXX-XXXX or license key" />
           <button class="secondary" id="redeemButton" type="button">Redeem</button>
         </div>
       </div>
@@ -278,6 +283,6 @@
     </div>
   </dialog>
 
-  <script src="app.js?v=20261003a"></script>
+  <script src="app.js?v=20261008a"></script>
 </body>
 </html>

@@ -245,10 +245,16 @@
       var openPrompter = document.getElementById("openPrompter");
       var changeScript = document.getElementById("changeScript");
 
-      // ---- Paywall: script saving ($2.99/mo, $34.99 lifetime, or access code) ----
+      // ---- Paywall: script saving (Pro: $4.99/mo, $49.99/yr, $129 lifetime,
+      // an access code, or the Lemon Squeezy license key from the receipt) ----
       // Everything else (interview, generation, prompter) stays free.
       var API_BASE = "https://teleprompter-script-api.synaptiqs.workers.dev";
       var TOKEN_KEY = "clickprompt_token";
+      // Used only if the Worker can't create a checkout (503: not configured).
+      // ClickPrompt Pro (product 1397885) share checkout in the Synaptiq HQ
+      // store; the buyer picks the plan there and unlocks with the emailed
+      // license key.
+      var SHARE_CHECKOUT_URL = "https://synaptiqshq.lemonsqueezy.com/checkout/buy/b043d615-efb0-4d1d-8fbc-420532e4602c";
       var saveScriptButton = document.getElementById("saveScript");
       var saveStatus = document.getElementById("saveStatus");
       var library = document.getElementById("library");
@@ -312,6 +318,7 @@
         });
         var data = await res.json().catch(function () { return {}; });
         data._ok = res.ok;
+        data._status = res.status;
         return data;
       }
 
@@ -343,7 +350,11 @@
           try {
             var m = await apiGet("/api/me?token=" + encodeURIComponent(getToken()));
             if (m && m.unlocked) unlockState = { unlocked: true, via: m.via || null };
-            else { unlockState = { unlocked: false, via: null }; setToken(""); }
+            else {
+              unlockState = { unlocked: false, via: null };
+              // Keep a license-key token: renewing the plan re-unlocks it.
+              if (getToken().indexOf("lic:") !== 0) setToken("");
+            }
           } catch (e) { unlockState = { unlocked: false, via: null }; }
         }
         updateUnlockUI();
@@ -385,9 +396,15 @@
       }
 
       var PLAN_LABELS = {
-        monthly: "Continue — $2.99/mo",
-        lifetime: "Continue — $34.99 once"
+        monthly: "Continue — $4.99/mo",
+        yearly: "Continue — $49.99/yr",
+        lifetime: "Continue — $129 once"
       };
+      function randomHex(nBytes) {
+        var a = new Uint8Array(nBytes);
+        crypto.getRandomValues(a);
+        return Array.prototype.map.call(a, function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
+      }
       function selectedPlan() {
         var checked = document.querySelector('input[name="plan"]:checked');
         return checked ? checked.value : "monthly";
@@ -407,6 +424,16 @@
             window.location.href = data.url;
             return;
           }
+          if (data._status === 503) {
+            // Worker checkout not configured: fall back to the hosted share
+            // checkout. The custom token still lets the webhook unlock this
+            // browser; the emailed license key works everywhere.
+            var fallbackToken = "sub:" + randomHex(16);
+            setToken(fallbackToken);
+            window.location.href = SHARE_CHECKOUT_URL +
+              "?checkout[custom][unlock_token]=" + encodeURIComponent(fallbackToken);
+            return;
+          }
           paywallStatus.textContent = data.error || "Checkout isn't available right now. Try again later.";
         } catch (e) {
           paywallStatus.textContent = "Couldn't reach the checkout. Check your connection and try again.";
@@ -418,20 +445,23 @@
       async function redeemCode() {
         var code = codeInput.value.trim();
         if (!code) {
-          paywallStatus.textContent = "Enter your access code first.";
+          paywallStatus.textContent = "Enter your access code or license key first.";
           codeInput.focus();
           return;
         }
         redeemButton.disabled = true;
-        paywallStatus.textContent = "Checking your code…";
+        var isLicense = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(code);
+        paywallStatus.textContent = isLicense ? "Checking your license key…" : "Checking your code…";
         try {
           var data = await apiPost("/api/redeem", { code: code });
           if (data._ok && data.unlocked) {
             setToken(data.token);
-            unlockState = { unlocked: true, via: "code" };
+            unlockState = { unlocked: true, via: data.via || "code" };
             updateUnlockUI();
             closePaywall();
-            saveStatus.textContent = "Code accepted — saving is unlocked.";
+            saveStatus.textContent = isLicense
+              ? "License key accepted — Pro is unlocked."
+              : "Code accepted — saving is unlocked.";
             return;
           }
           paywallStatus.textContent = data.error || "That code didn't work.";
