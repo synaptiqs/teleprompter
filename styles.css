@@ -592,7 +592,7 @@
     }
     .platform-working { margin: 14px 0 0; color: var(--accent); font-size: .9rem; font-weight: 600; }
 
-    /* ---- legal pages (privacy/terms drafts) ---- */
+    /* ---- legal pages (privacy/terms/refund/contact) ---- */
     .legal-page {
       max-width: 720px; margin: 0 auto; padding: 32px 20px 60px;
       font-size: .95rem; line-height: 1.65;
@@ -602,9 +602,6 @@
     .legal-page p, .legal-page li { color: var(--ink); }
     .legal-page ul { padding-left: 22px; }
     .legal-updated { color: var(--muted); font-size: .85rem; margin-bottom: 20px; }
-    .legal-draft-banner {
-      border: 2px dashed var(--accent); border-radius: 12px;
-      padding: 14px 16px; margin-bottom: 24px;
-      font-size: .9rem; background: color-mix(in srgb, var(--accent) 8%, transparent);
-    }
+    .legal-page a { color: var(--accent-strong); text-underline-offset: 2px; }
+    .legal-page a:hover { color: var(--ink); }
     .legal-back { display: inline-block; margin-top: 28px; }
