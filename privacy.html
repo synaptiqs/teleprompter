@@ -7,58 +7,78 @@
   <link rel="icon" href="data:," />
   <title>Privacy Policy — ClickPrompt</title>
   <meta name="description" content="ClickPrompt's privacy policy: what we collect, why, and how to delete it." />
+  <link rel="canonical" href="https://clickprompt.app/privacy" />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <main class="legal-page">
-    <div class="legal-draft-banner">
-      <strong>Draft — pending legal review.</strong> This policy has not yet
-      been cleared by our legal reviewer (Elle). It will be finalized before
-      it takes effect.
-    </div>
     <h1>Privacy Policy</h1>
-    <p class="legal-updated">Last updated: September 29, 2026</p>
+    <p class="legal-updated">Last updated: October 7, 2026</p>
 
-    <p>ClickPrompt is a free teleprompter for recording videos. This policy
-    explains what we collect, why we collect it, and how you can get it
-    deleted.</p>
+    <p>ClickPrompt (clickprompt.app) is a teleprompter for recording videos,
+    operated by Lagniappe Ventures Ltd, a Nevada series limited liability company ("we", "us"). This policy explains what we
+    collect, why we collect it, and how you can get it deleted.</p>
+
+    <h2>Your camera and microphone</h2>
+    <p>Recording happens entirely in your browser. Your camera and microphone
+    feed and your video takes stay on your device; we never receive them.
+    You download your takes straight from your browser. The only exception
+    is a voiceover (audio only) that you choose to save to your Pro library:
+    that audio file is uploaded and stored so you can play it back on any
+    device.</p>
 
     <h2>What we collect</h2>
     <ul>
       <li><strong>Your interview answers.</strong> When you generate a script,
-      your answers (name, role, audience, point, length) are sent to our AI
-      provider to draft the script. We do not store your answers after the
-      script is returned.</li>
+      your answers (name or handle, role, audience, main point, length, and
+      any platform or tone you pick) are sent to our script API, which runs
+      on Cloudflare Workers and drafts the script with Cloudflare Workers AI.
+      We don't keep your answers after the script is returned. To handle
+      bursts of identical requests, a generated script may be cached for up
+      to 5 minutes under a one-way hash of the request.</li>
       <li><strong>A visitor cookie.</strong> We set a first-party cookie
-      (<code>cp_vid</code>) so we can count your 3 free scripts per day. It
-      contains a random ID, nothing about you.</li>
-      <li><strong>IP address.</strong> Used only as a fallback for the daily
-      free-script count and for short-term abuse throttling. Not stored
-      long-term.</li>
-      <li><strong>Email address.</strong> Only if you subscribe: our payment
-      provider (Lemon Squeezy, the merchant of record) shares your email so
-      we can manage your subscription and send cancellation notices.</li>
+      (<code>cp_vid</code>, kept for up to one year) so we can count your 3
+      free scripts per day. It contains a random ID, nothing about you.</li>
+      <li><strong>IP address.</strong> Used as a fallback for the daily
+      free-script count (kept for up to 2 days) and for short-term abuse
+      throttling (kept for a few minutes). Our hosting provider, Cloudflare,
+      also processes IP addresses and basic request data to deliver the site
+      and protect it from abuse.</li>
+      <li><strong>Purchase information.</strong> ClickPrompt Pro is sold
+      through <a href="https://www.lemonsqueezy.com" rel="noopener">Lemon Squeezy</a>, our merchant of record. Lemon Squeezy collects your name,
+      email, billing details, and payment information. We receive your email
+      and your order or subscription status so we can unlock Pro, manage your
+      subscription, and send account notices such as cancellation and
+      deletion reminders. We never see or store your full card number.</li>
+      <li><strong>Unlock token.</strong> When you check out or redeem an
+      access code, the app stores one random unlock token in your browser's
+      local storage. Our checkout and redeem APIs link that token to your
+      purchase or code. Access codes are stored only as one-way hashes.</li>
       <li><strong>Saved scripts and voiceovers.</strong> Only what you
-      explicitly save to your library. Stored so you can pull them up on any
+      explicitly save to your library, stored so you can pull it up on any
       device.</li>
       <li><strong>Anonymous usage counts.</strong> Daily totals like "scripts
-      generated" or "recordings started." No personal data, no cross-site
-      tracking.</li>
+      generated" or "recordings started," kept for 90 days. No personal data,
+      no cross-site tracking.</li>
     </ul>
 
     <h2>What we don't collect</h2>
     <ul>
-      <li>No accounts, no passwords, no social logins.</li>
+      <li>No passwords and no social logins.</li>
       <li>No advertising trackers or third-party analytics cookies.</li>
-      <li>Your camera and microphone never leave your device — recording
-      happens entirely in your browser.</li>
+      <li>No video recordings. Your takes never leave your device.</li>
     </ul>
 
+    <p>The app also keeps a few preferences in your browser's local storage,
+    such as your chosen platform, whether you've seen the tour, and its
+    mute setting. These stay on your device.</p>
+
     <h2>Who sees your data</h2>
-    <p>Our AI provider (for script generation), our payment provider Lemon
-    Squeezy (for subscriptions), and our hosting provider Cloudflare (which
-    serves the site and stores your saved library). Nobody else. We do not
-    sell your data, and we do not share it with advertisers.</p>
+    <p>Cloudflare (hosting, the script API, Workers AI script generation, and
+    storage for your saved library), Lemon Squeezy (payments, taxes, refunds,
+    and license keys), and our email delivery provider (only to send account
+    notices to subscribers). Nobody else. We do not sell your data, and we do
+    not share it with advertisers.</p>
 
     <h2>Deletion</h2>
     <p>Delete any saved script or voiceover any time from your library —
@@ -66,13 +86,39 @@
     data is permanently deleted 10 business days after cancellation, after
     email notices on day 0, day 5, and day 10. After deletion there are no
     recoverable copies. Full details are in our
-    <a href="/terms.html">Terms</a>.</p>
+    <a href="/terms">Terms</a>.</p>
+
+    <h2>Your choices and rights</h2>
+    <p>You can ask us to show you, correct, or delete the personal information
+    we hold about you. Depending on where you live, including California and
+    the EU/UK, you may have additional rights under local law. Email <a href="mailto:info@lvltdllc.com">info@lvltdllc.com</a> and
+    we'll respond within 30 days.</p>
+
+    <h2>Children</h2>
+    <p>ClickPrompt is not directed at children under 13, and we do not
+    knowingly collect personal information from them.</p>
+
+    <h2>Changes</h2>
+    <p>If we change this policy, we'll post it here with a new "last updated"
+    date.</p>
 
     <h2>Contact</h2>
-    <p>Questions about this policy: reply to any subscription email, or
-    contact us through clickprompt.app.</p>
+    <p>Lagniappe Ventures Ltd · Nevada, United States<br />
+    Questions about this policy: <a href="mailto:info@lvltdllc.com">info@lvltdllc.com</a></p>
 
     <a class="legal-back" href="/">← Back to ClickPrompt</a>
   </main>
+
+  <footer class="site-footer">
+    <span>ClickPrompt</span>
+    <span class="footer-sep">&middot;</span>
+    <a href="/privacy">Privacy</a>
+    <span class="footer-sep">&middot;</span>
+    <a href="/terms">Terms</a>
+    <span class="footer-sep">&middot;</span>
+    <a href="/refund">Refunds</a>
+    <span class="footer-sep">&middot;</span>
+    <a href="/contact">Contact</a>
+  </footer>
 </body>
 </html>
