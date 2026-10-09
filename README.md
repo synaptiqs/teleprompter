@@ -60,23 +60,29 @@ opaque identity tokens as the REST API. Full machine-readable spec:
 The interview and the full prompter (scroll, camera,
 recording) are free forever. Script generation is free at 3 scripts/day
 per visitor (subscribers get unlimited). Saving scripts to a personal
-library costs $2.99/month or $34.99 lifetime, or is free for life with an
-access code.
+library (ClickPrompt Pro) costs $4.99/month, $49.99/year, or $129
+lifetime, or is free for life with an access code. Buyers can also unlock
+on any device with the Lemon Squeezy license key from their receipt email.
+A cancelled monthly/yearly plan keeps Pro until the paid period ends.
 
 - Worker endpoints: `POST /api/checkout` (Lemon Squeezy hosted checkout,
   recurring), `POST /api/webhook` (Lemon Squeezy events, X-Signature
-  verified), `GET /api/me`, `POST /api/redeem` (access code),
+  verified), `GET /api/me`, `POST /api/redeem` (access code or license key),
   `GET/POST/DELETE /api/scripts` (library CRUD, unlocked identities only).
 - Storage: Cloudflare KV namespace `clickprompt-data`. Access codes are
-  stored as SHA-256 hashes only; subscriptions are keyed by an opaque
+  stored as SHA-256 hashes only (`code:<sha256("code:"+CODE)>`, CODE =
+  uppercase without dashes; records with `max_uses` are limited-use, e.g.
+  giveaway batches); subscriptions are keyed by an opaque
   `sub:<hex>` token passed as checkout `custom_data` and written by the
   verified webhook.
 - Secrets the worker expects: `LEMONSQUEEZY_API_KEY`,
-  `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID`,
-  `LEMONSQUEEZY_VARIANT_ID` (the $2.99/mo subscription variant),
-  `LEMONSQUEEZY_VARIANT_ID_LIFETIME` (the $34.99 one-time variant),
+  `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID` = 485773 (Synaptiq HQ),
+  `LEMONSQUEEZY_VARIANT_ID` (Pro Monthly $4.99),
+  `LEMONSQUEEZY_VARIANT_ID_YEARLY` (Pro Annual $49.99),
+  `LEMONSQUEEZY_VARIANT_ID_LIFETIME` (Pro Lifetime $129), optional
+  `LEMONSQUEEZY_PRODUCT_ID` (license-key product check, default 1397885),
   `LEMONSQUEEZY_STORAGE_TIERS` (JSON map of storage add-on variant ID to
   GB), plus optional `EMAIL_API_KEY`/`EMAIL_FROM` for the cancellation
   email sequence.
 - The frontend keeps one opaque unlock token in `localStorage`
-  (`clickprompt_token`): `code:CLICK-XXXX-XXXX` or `sub:<hex>`.
+  (`clickprompt_token`): `code:<CODE>`, `sub:<hex>`, or `lic:<license key>`.

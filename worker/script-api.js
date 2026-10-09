@@ -31,12 +31,14 @@
  *                               redeem_access_code, start_checkout,
  *                               list_scripts, save_script, delete_script.
  *
- * Paywalled: script SAVING is $2.99/month or $34.99 lifetime via Lemon
- * Squeezy, or free forever with an access code. Everything else stays free.
+ * Paywalled: script SAVING (ClickPrompt Pro) is $4.99/month, $49.99/year,
+ * or $129 lifetime via Lemon Squeezy (Synaptiq HQ store, product 1397885),
+ * or free forever with an access code. Everything else stays free.
  *
  *   POST /api/checkout          { origin, plan, token? } -> { url, token }
  *                               (Lemon Squeezy hosted checkout; plan is
- *                               "monthly" | "lifetime" | "storage250" |
+ *                               "monthly" | "yearly" | "lifetime" |
+ *                               "storage250" |
  *                               "storage500" | "storage1000". Storage plans
  *                               are add-ons for existing subscribers and
  *                               need their unlock token. Needs
@@ -48,8 +50,10 @@
  *                               Keeps subscription/order state in KV keyed
  *                               by the opaque unlock token passed as
  *                               custom_data. subscription_* events drive
- *                               monthly; order_created drives the lifetime
- *                               one-time purchase. Storage add-on purchases
+ *                               monthly/yearly; order_created drives the
+ *                               lifetime one-time purchase. A cancelled
+ *                               subscription keeps Pro until its paid
+ *                               period ends (ends_at). Storage add-on purchases
  *                               (variant IDs in LEMONSQUEEZY_STORAGE_TIERS)
  *                               raise the identity's storage quota.
  *                               Cancellation starts the deletion sequence:
@@ -57,8 +61,12 @@
  *                               hard-delete cron removes everything.
  *   GET  /api/me?token=...     -> { unlocked, via } where via is
  *                               "subscription" | "lifetime" | "code" | null.
- *   POST /api/redeem            { code } -> { unlocked, token }.
- *                               A redeemed code unlocks saving for life.
+ *   POST /api/redeem            { code } -> { unlocked, token, via }.
+ *                               Accepts a CLICK-XXXX-XXXX access code (unlocks
+ *                               saving for life) OR the Lemon Squeezy license
+ *                               key emailed on purchase (validated with the
+ *                               public License API; must belong to the Pro
+ *                               product). Throttled per IP.
  *   GET    /api/scripts?token=  List saved scripts for this identity.
  *   POST   /api/scripts        { token, title, body } -> save (upsert).
  *   DELETE /api/scripts?id=&token=  Delete one saved script.
@@ -87,19 +95,32 @@
  *   due deletion-sequence emails (day 0/5/10).
  *
  * Identity: the frontend stores one opaque token in localStorage:
- *   "code:CLICK-XXXX-XXXX" for code users, or "sub:<hex>" for subscribers
- *   (generated at checkout, matched back via checkout custom_data on the
- *   subscription_created webhook). The Worker never trusts the client claim
- *   alone: codes are validated against hashed KV records, subscriptions
- *   against KV state written by the verified webhook.
+ *   "code:CLICKXXXXXXXX" for legacy (unlimited-use) code users, "sub:<hex>"
+ *   for subscribers (generated at checkout, matched back via checkout
+ *   custom_data on the subscription_created webhook) and for limited-use
+ *   giveaway codes (bound on first redemption), or "lic:<license key>" for
+ *   buyers who entered their Lemon Squeezy license key. The Worker never
+ *   trusts the client claim alone: codes are validated against hashed KV
+ *   records, subscriptions against KV state written by the verified webhook,
+ *   license keys against the Lemon Squeezy License API (cached in KV).
  *
  * KV layout (namespace bound as KV). Shard-ready: every per-identity key
  * is namespaced under a hash of the identity, so a future shard can be
  * chosen by key prefix without re-keying.
- *   code:<sha256(code)>   -> { redeemed: bool, redeemed_at: number|null }
+ *   code:<sha256("code:"+CODE)> -> { redeemed: bool, redeemed_at: number|null }
+ *                              CODE = normalized code (uppercase, no dashes,
+ *                              e.g. CLICKAB12CD34). Limited-use records also
+ *                              carry { max_uses, uses, bound_token, tier,
+ *                              batch }; legacy records without max_uses stay
+ *                              unlimited-use.
+ *   lic:<sha256("lic:"+key)> -> { ok, reason, status, product_id,
+ *                              variant_id, lifetime, expires_at, checked_at }
+ *                              (License API result cache, re-checked every
+ *                              6 h; 30-day TTL)
+ *   redeemthrottle:<10min>:<ip> -> redeem attempt count (20-min TTL)
  *   sub:<hex>             -> { status, ls_subscription_id, email?,
- *                              storage_tier_gb?, cancel_pending?,
- *                              delete_at?, deleted?, updated_at }
+ *                              storage_tier_gb?, cancel_pending?, ends_at?,
+ *                              delete_at?, deleted?, source?, updated_at }
  *   lssub:<lsSubId>       -> <hex>  (reverse map for later webhook events,
  *                              which may not carry custom_data)
  *   evt:<event_id>        -> { at }  (webhook idempotency; LS signs no
@@ -132,8 +153,12 @@
  *
  * Secrets (set via the Workers API):
  *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
- *   LEMONSQUEEZY_STORE_ID, LEMONSQUEEZY_VARIANT_ID (monthly $2.99),
- *   LEMONSQUEEZY_VARIANT_ID_LIFETIME ($34.99 one-time),
+ *   LEMONSQUEEZY_STORE_ID (Synaptiq HQ, 485773),
+ *   LEMONSQUEEZY_VARIANT_ID (Pro Monthly $4.99),
+ *   LEMONSQUEEZY_VARIANT_ID_YEARLY (Pro Annual $49.99),
+ *   LEMONSQUEEZY_VARIANT_ID_LIFETIME (Pro Lifetime $129 one-time),
+ *   LEMONSQUEEZY_PRODUCT_ID (optional; Pro product for license-key checks,
+ *     defaults to 1397885),
  *   LEMONSQUEEZY_STORAGE_TIERS (JSON map variantId -> GB, e.g.
  *     {"123":250,"124":500,"125":1000}),
  *   EMAIL_API_KEY + EMAIL_FROM (optional; without them, deletion emails
@@ -254,6 +279,23 @@ async function checkIpThrottle(env, request) {
     throw err;
   }
   await env.KV.put(key, String(count + 1), { expirationTtl: 120 });
+}
+
+// Redeem throttle: 10 code/license-key attempts per 10 minutes per IP, so
+// access codes can't be brute-forced through /api/redeem or the MCP tool.
+var REDEEM_THROTTLE_MAX = 10;
+async function checkRedeemThrottle(env, request) {
+  if (!env.KV || !request) return;
+  var ip = clientIp(request);
+  var key = "redeemthrottle:" + Math.floor(Date.now() / 600000) + ":" + ip;
+  var count = Number(await env.KV.get(key)) || 0;
+  if (count >= REDEEM_THROTTLE_MAX) {
+    var err = new Error("Too many attempts. Wait a few minutes and try again.");
+    err.status = 429;
+    err.code = "throttled";
+    throw err;
+  }
+  await env.KV.put(key, String(count + 1), { expirationTtl: 1200 });
 }
 
 // Concurrency pool (thundering-herd §8): best-effort KV semaphore capping
@@ -431,14 +473,121 @@ async function codeIsRedeemed(env, code) {
   return !!(rec && rec.redeemed);
 }
 
+function subRecordIsGood(rec) {
+  if (!rec || rec.deleted) return false;
+  if (GOOD_STATUSES[rec.status]) return true;
+  // A cancelled subscription keeps Pro until the end of the period it paid
+  // for (Lemon Squeezy's ends_at); LS then sends subscription_expired.
+  if (rec.status === "cancelled" && rec.ends_at) {
+    var ends = Date.parse(rec.ends_at);
+    if (ends && ends > Date.now()) return true;
+  }
+  return false;
+}
+
 async function subscriptionIsGood(env, hex) {
   if (!env.KV || !hex) return false;
   var rec = await env.KV.get("sub:" + hex, "json");
-  return !!(rec && GOOD_STATUSES[rec.status]);
+  return subRecordIsGood(rec);
+}
+
+// ---- Lemon Squeezy license keys (public License API, no API key) ----
+// Buyers get a license key by email on every ClickPrompt Pro purchase
+// (monthly, yearly, lifetime). Entering it in the redeem box unlocks Pro
+// on any device. The key must belong to the Pro product. Subscription keys
+// stay "active" until the subscription expires (i.e. through the paid
+// period after a cancel), then become "expired", which re-locks Pro.
+
+var PRO_PRODUCT_ID_DEFAULT = "1397885";
+var LICENSE_KEY_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+var LICENSE_RECHECK_MS = 6 * 3600 * 1000;   // re-validate every 6 hours
+var LICENSE_GRACE_MS = 7 * 86400 * 1000;    // honor a good result this long if LS is down
+
+function proProductId(env) {
+  return String(env.LEMONSQUEEZY_PRODUCT_ID || PRO_PRODUCT_ID_DEFAULT).trim();
+}
+
+function normalizeLicenseKey(value) {
+  var k = clean(value, 64).toLowerCase();
+  return LICENSE_KEY_RE.test(k) ? k : "";
+}
+
+async function licenseKvKey(key) {
+  return "lic:" + (await sha256Hex("lic:" + key));
+}
+
+// One License API validate call (no instance_id, so no activation slot is
+// used). Returns a cache record, or null when Lemon Squeezy is unreachable.
+async function checkLicenseWithLemon(env, key) {
+  var res;
+  try {
+    res = await fetch("https://api.lemonsqueezy.com/v1/licenses/validate", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: "license_key=" + encodeURIComponent(key),
+    });
+  } catch (e) {
+    return null;
+  }
+  if (res.status >= 500 || res.status === 429) return null;
+  var d = await res.json().catch(function () { return null; });
+  if (!d) return null;
+  var lk = d.license_key || {};
+  var meta = d.meta || {};
+  var variantId = meta.variant_id != null ? String(meta.variant_id) : null;
+  var lifetimeVariant = String(env.LEMONSQUEEZY_VARIANT_ID_LIFETIME || "").trim();
+  var rec = {
+    ok: false,
+    reason: "",
+    status: lk.status || null,
+    product_id: meta.product_id != null ? String(meta.product_id) : null,
+    variant_id: variantId,
+    lifetime:
+      (!!lifetimeVariant && variantId === lifetimeVariant) ||
+      /lifetime/i.test(String(meta.variant_name || "")),
+    expires_at: lk.expires_at || null,
+    checked_at: Date.now(),
+  };
+  if (!d.valid && !lk.status) rec.reason = "invalid";
+  else if (rec.product_id !== proProductId(env)) rec.reason = "wrong_product";
+  else if (rec.status !== "active" && rec.status !== "inactive") rec.reason = "status_" + rec.status;
+  else if (rec.expires_at && Date.parse(rec.expires_at) <= Date.now()) rec.reason = "expired";
+  else if (!d.valid) rec.reason = "invalid";
+  else rec.ok = true;
+  return rec;
+}
+
+async function resolveLicense(env, key, force) {
+  if (!env.KV) return { ok: false, reason: "no_kv" };
+  var kvKey = await licenseKvKey(key);
+  var cached = await env.KV.get(kvKey, "json");
+  var now = Date.now();
+  if (cached && !force) {
+    var stale = now - (Number(cached.checked_at) || 0) >= LICENSE_RECHECK_MS;
+    var lapsed = cached.ok && cached.expires_at && Date.parse(cached.expires_at) <= now;
+    if (!stale && !lapsed) return cached;
+  }
+  var rec = await checkLicenseWithLemon(env, key);
+  if (!rec) {
+    if (cached && cached.ok && now - (Number(cached.checked_at) || 0) < LICENSE_GRACE_MS &&
+        !(cached.expires_at && Date.parse(cached.expires_at) <= now)) {
+      return cached;
+    }
+    return { ok: false, reason: "unreachable" };
+  }
+  // Only cache real keys (Lemon Squeezy returned a status), so random
+  // guesses don't fill KV.
+  if (rec.status) {
+    await env.KV.put(kvKey, JSON.stringify(rec), { expirationTtl: 30 * 86400 });
+  }
+  return rec;
 }
 
 // Resolve the caller's unlock state from their token.
-// Token is either "code:CLICK-XXXX-XXXX" or "sub:<hex>".
+// Token is "code:<CODE>", "sub:<hex>", or "lic:<license key>".
 async function resolveUnlock(env, token) {
   token = clean(token, 64);
   if (!token) return { unlocked: false, via: null };
@@ -449,12 +598,20 @@ async function resolveUnlock(env, token) {
   }
   if (token.indexOf("sub:") === 0) {
     var hex = token.slice(4);
-    if (!/^[0-9a-f]{32}$/.test(hex)) return { unlocked: false, via: null };
-    if (await subscriptionIsGood(env, hex)) {
-      var rec = await env.KV.get("sub:" + hex, "json");
-      var via = rec && rec.status === "lifetime" ? "lifetime" : "subscription";
+    if (!/^[0-9a-f]{32}$/.test(hex) || !env.KV) return { unlocked: false, via: null };
+    var rec = await env.KV.get("sub:" + hex, "json");
+    if (subRecordIsGood(rec)) {
+      var via = rec.source === "code" ? "code"
+        : rec.status === "lifetime" ? "lifetime" : "subscription";
       return { unlocked: true, via: via };
     }
+    return { unlocked: false, via: null };
+  }
+  if (token.indexOf("lic:") === 0) {
+    var licenseKey = normalizeLicenseKey(token.slice(4));
+    if (!licenseKey) return { unlocked: false, via: null };
+    var lr = await resolveLicense(env, licenseKey, false);
+    if (lr.ok) return { unlocked: true, via: lr.lifetime ? "lifetime" : "subscription", source: "license" };
     return { unlocked: false, via: null };
   }
   return { unlocked: false, via: null };
@@ -701,10 +858,17 @@ async function doGenerate(env, input, request) {
 
 // ---- paywall operations ----
 
-// Pricing (locked by Tyler, 2026-09-29 — brief with Grok; supersedes the
-// 2026-09-28 $4.95/$49.50/$98 tiers): $2.99/month, $34.99 lifetime
-// one-time. No annual plan. Storage add-ons (existing subscribers only)
-// raise the 100 GB base quota to 250 GB / 500 GB / 1 TB.
+// Pricing (set by Tyler, Oct 2026; supersedes the 2026-09-29 $2.99/$34.99
+// tiers): ClickPrompt Pro is $4.99/month, $49.99/year, or $129 lifetime
+// one-time. All three are variants of product 1397885 in the Synaptiq HQ
+// store; each plan's variant ID comes from the env var in PLAN_VARIANT_ENV.
+// Storage add-ons (existing subscribers only) raise the 100 GB base quota
+// to 250 GB / 500 GB / 1 TB.
+var PLAN_VARIANT_ENV = {
+  monthly: "LEMONSQUEEZY_VARIANT_ID",
+  yearly: "LEMONSQUEEZY_VARIANT_ID_YEARLY",
+  lifetime: "LEMONSQUEEZY_VARIANT_ID_LIFETIME",
+};
 var STORAGE_PLANS = {
   storage250:  { gb: 250,  envVar: "LEMONSQUEEZY_VARIANT_ID_STORAGE_250" },
   storage500:  { gb: 500,  envVar: "LEMONSQUEEZY_VARIANT_ID_STORAGE_500" },
@@ -737,8 +901,8 @@ async function doCheckout(env, origin, plan, existingToken) {
   origin = clean(origin, 120) || "https://clickprompt.app";
   if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
 
-  // Plan -> variant. Monthly is the default; lifetime needs its variant
-  // ID set once Lemon Squeezy has the new variants. Storage add-ons
+  // Plan -> variant. Monthly is the default ("annual" is accepted as an
+  // alias for yearly). Storage add-ons
   // (storage250/500/1000) are for existing subscribers and resolve
   // through STORAGE_PLANS below.
   plan = clean(plan, 20);
@@ -756,10 +920,9 @@ async function doCheckout(env, origin, plan, existingToken) {
     custom.unlock_token = existingToken;
     token = existingToken;
   } else {
-    plan = plan === "lifetime" ? "lifetime" : "monthly";
-    if (plan === "lifetime") variantId = env.LEMONSQUEEZY_VARIANT_ID_LIFETIME;
-    else variantId = env.LEMONSQUEEZY_VARIANT_ID;
-    variantId = String(variantId || "").trim();
+    if (plan === "annual") plan = "yearly";
+    if (!PLAN_VARIANT_ENV[plan]) plan = "monthly";
+    variantId = String(env[PLAN_VARIANT_ENV[plan]] || "").trim();
   }
   if (!variantId) {
     throw ApiError(503, "That plan isn't available yet. Try the monthly plan.");
@@ -776,7 +939,9 @@ async function doCheckout(env, origin, plan, existingToken) {
             redirect_url: origin + "/?checkout=done",
             enabled_variants: [variantId],
             receipt_thank_you_note:
-              "Your ClickPrompt script saving is unlocked.",
+              "ClickPrompt Pro is unlocked. To unlock it on another " +
+              "device, enter the license key from this email in " +
+              "ClickPrompt's \"Have an access code or license key?\" box.",
           },
           checkout_data: {
             custom: custom,
@@ -811,15 +976,83 @@ async function doMe(env, token) {
   return me;
 }
 
-async function doRedeem(env, code) {
+async function doRedeemLicense(env, licenseKey) {
+  var lr = await resolveLicense(env, licenseKey, true);
+  if (!lr.ok) {
+    if (lr.reason === "unreachable") {
+      throw ApiError(503, "Couldn't check that license key right now. Try again in a minute.");
+    }
+    if (lr.reason === "wrong_product") {
+      throw ApiError(403, "That license key isn't for ClickPrompt Pro.");
+    }
+    if (lr.reason === "expired" || lr.reason === "status_expired") {
+      throw ApiError(403, "That license key has expired. Renew your plan to turn Pro back on.");
+    }
+    if (lr.reason === "status_disabled") {
+      throw ApiError(403, "That license key has been disabled.");
+    }
+    throw ApiError(404, "That license key isn't recognized.");
+  }
+  return {
+    unlocked: true,
+    token: "lic:" + licenseKey,
+    via: lr.lifetime ? "lifetime" : "subscription",
+    source: "license",
+  };
+}
+
+async function doRedeem(env, code, request) {
   if (!env.KV) throw ApiError(500, "KV is not configured.");
+  if (!clean(code, 64)) throw ApiError(400, "Enter your access code or license key.");
+  await checkRedeemThrottle(env, request);
+
+  // Lemon Squeezy license key (UUID format) from the purchase email.
+  var licenseKey = normalizeLicenseKey(code);
+  if (licenseKey) return doRedeemLicense(env, licenseKey);
+
   code = normalizeCode(code);
-  if (!code) throw ApiError(400, "Enter your access code.");
+  if (!code) throw ApiError(400, "Enter your access code or license key.");
 
   var hash = await sha256Hex("code:" + code);
   var key = "code:" + hash;
   var rec = await env.KV.get(key, "json");
   if (!rec) throw ApiError(404, "That code isn't recognized.");
+
+  // Limited-use codes (giveaway batches) carry max_uses. The first
+  // redemption mints a lifetime identity and binds it to the code; later
+  // redemptions (up to max_uses, for a winner's second device) get the same
+  // identity, so the library follows the code. max_uses: 1 = single-use.
+  if (typeof rec.max_uses === "number") {
+    var uses = Number(rec.uses) || 0;
+    if (uses >= rec.max_uses) {
+      throw ApiError(409, "That code has already been redeemed.");
+    }
+    var bound = typeof rec.bound_token === "string" ? rec.bound_token : "";
+    if (!/^sub:[0-9a-f]{32}$/.test(bound)) {
+      var newHex = randomHex(16);
+      bound = "sub:" + newHex;
+      await env.KV.put(
+        "sub:" + newHex,
+        JSON.stringify({
+          status: "lifetime",
+          source: "code",
+          tier: rec.tier || "lifetime",
+          batch: rec.batch || null,
+          storage_tier_gb: 100,
+          updated_at: Date.now(),
+        })
+      );
+    }
+    rec.uses = uses + 1;
+    rec.redeemed = true;
+    rec.redeemed_at = rec.redeemed_at || Date.now();
+    rec.last_redeemed_at = Date.now();
+    rec.bound_token = bound;
+    await env.KV.put(key, JSON.stringify(rec));
+    return { unlocked: true, token: bound, via: "code" };
+  }
+
+  // Legacy unlimited-use codes: unchanged behavior.
   if (!rec.redeemed) {
     await env.KV.put(
       key,
@@ -1146,13 +1379,21 @@ function fmtDate(ms) {
   return months[d.getUTCMonth()] + " " + d.getUTCDate() + ", " + d.getUTCFullYear();
 }
 
-function deletionEmail1(deleteAt) {
+function deletionEmail1(deleteAt, accessEndsAt) {
+  // If the paid period runs past today, say when Pro actually ends.
+  var stillPaid = accessEndsAt && accessEndsAt > Date.now() + 86400000;
   return {
     subject: "Your ClickPrompt subscription is cancelled — save your data",
     text:
       "Your ClickPrompt Pro subscription has been cancelled.\n\n" +
+      (stillPaid
+        ? "Pro stays on until " + fmtDate(accessEndsAt) + ", the end of the " +
+          "period you paid for. "
+        : "") +
       "Your saved scripts and voiceovers will be permanently deleted on " +
-      fmtDate(deleteAt) + " (10 business days from today). " +
+      fmtDate(deleteAt) +
+      (stillPaid ? " (10 business days after your plan ends). "
+                 : " (10 business days from today). ") +
       "After that date there are no recoverable copies.\n\n" +
       "You can download anything you want to keep any time before then " +
       "— downloads are always free. To do that, open ClickPrompt and save " +
@@ -1249,7 +1490,7 @@ async function delQueueRemove(env, ms, hex) {
   await env.KV.put(key, JSON.stringify(next), { expirationTtl: 60 * 86400 });
 }
 
-async function scheduleDeletion(env, hex, email, deleteAt) {
+async function scheduleDeletion(env, hex, email, deleteAt, accessEndsAt) {
   // Day 0 notice goes out immediately; days 5 and 10 are sent by the cron.
   await env.KV.put(
     "delemail:" + hex,
@@ -1259,7 +1500,7 @@ async function scheduleDeletion(env, hex, email, deleteAt) {
   // Also queue the identity under the day-5 reminder date, since the
   // daily cron only scans queues dated at or before today.
   await delQueueAdd(env, deleteAt - 5 * 86400000, hex);
-  var e1 = deletionEmail1(deleteAt);
+  var e1 = deletionEmail1(deleteAt, accessEndsAt);
   await sendEmail(env, email, e1.subject, e1.text);
 }
 
@@ -1495,6 +1736,9 @@ async function handleWebhook(request, env, cors) {
         email: clean((attrs.user_email || attrs.customer_email || prev.email || ""), 120) || null,
         storage_tier_gb: prev.storage_tier_gb || 100,
         cancel_pending: !!prev.cancel_pending,
+        // End of the paid period on a cancelled subscription (LS ends_at);
+        // Pro stays on until then. LS clears it when a sub is resumed.
+        ends_at: attrs.ends_at !== undefined ? (attrs.ends_at || null) : (prev.ends_at || null),
         delete_at: prev.delete_at || null,
         updated_at: Date.now(),
       };
@@ -1503,12 +1747,15 @@ async function handleWebhook(request, env, cors) {
       // over 10 business days, then the hard-delete cron removes
       // everything. A re-activation cancels it.
       if ((eventName === "subscription_cancelled" || effectiveStatus === "cancelled") && wasActive) {
-        var deleteAt = addBusinessDays(Date.now(), 10);
+        // The 10-business-day deletion window starts when paid access
+        // ends, not at the moment of cancelling.
+        var accessEndsAt = Math.max(Date.now(), Date.parse(rec.ends_at || "") || 0);
+        var deleteAt = addBusinessDays(accessEndsAt, 10);
         rec.cancel_pending = true;
         rec.delete_at = deleteAt;
         await env.KV.put(subKey, JSON.stringify(rec));
         try {
-          await scheduleDeletion(env, hex, rec.email, deleteAt);
+          await scheduleDeletion(env, hex, rec.email, deleteAt, accessEndsAt);
         } catch (e) {}
       } else if ((eventName === "subscription_resumed" || eventName === "subscription_created" ||
                   eventName === "subscription_updated") &&
@@ -1582,8 +1829,8 @@ async function handleMe(request, env, cors) {
 }
 
 async function handleRedeem(request, env, cors) {
-  // POST /api/redeem { code } -> { unlocked: true, token } on success.
-  // A redeemed code unlocks saving for life.
+  // POST /api/redeem { code } -> { unlocked: true, token, via } on success.
+  // Takes a CLICK- access code or a Lemon Squeezy license key.
   var body;
   try {
     body = await request.json();
@@ -1591,7 +1838,7 @@ async function handleRedeem(request, env, cors) {
     return json({ error: "Request body must be JSON." }, 400, cors);
   }
   try {
-    return json(await doRedeem(env, body.code), 200, cors);
+    return json(await doRedeem(env, body.code, request), 200, cors);
   } catch (e) {
     return json({ error: e.message || "Redemption failed." }, e.status || 500, cors);
   }
@@ -1703,12 +1950,14 @@ var MCP_INSTRUCTIONS =
   "short interview (their name, what they do, who the video is for, the one " +
   "point it must land, target length). Script generation is free: 3 scripts " +
   "per day per visitor, no account needed; subscribers get unlimited. " +
-  "Saving scripts to a personal library costs $2.99/month or $34.99 " +
-  "lifetime via Lemon Squeezy, or is free for life with an access code " +
-  "the user already owns. To unlock saving: call start_checkout and show " +
+  "Saving scripts to a personal library (ClickPrompt Pro) costs " +
+  "$4.99/month, $49.99/year, or $129 lifetime via Lemon Squeezy, or is " +
+  "free for life with an access code the user already owns. A buyer can " +
+  "also unlock with the license key from their purchase email. To unlock " +
+  "saving: call start_checkout and show " +
   "the user the returned checkout URL, keep the returned token, then poll " +
   "check_unlock_status with that token until unlocked. Or call " +
-  "redeem_access_code with the user's code. Library tools (list_scripts, " +
+  "redeem_access_code with the user's code or license key. Library tools (list_scripts, " +
   "save_script, delete_script) require an unlocked identity token.";
 
 var MCP_TOOLS = [
@@ -1744,8 +1993,8 @@ var MCP_TOOLS = [
   {
     name: "start_checkout",
     description:
-      "Start a $2.99/month or $34.99 lifetime checkout to unlock script " +
-      "saving. Returns a hosted checkout URL to show the user plus an " +
+      "Start a ClickPrompt Pro checkout ($4.99/month, $49.99/year, or $129 " +
+      "lifetime) to unlock script saving. Returns a hosted checkout URL to show the user plus an " +
       "unlock token. Keep the token and poll check_unlock_status with " +
       "it after the user pays. The user pays Lemon Squeezy (merchant " +
       "of record) in their browser.",
@@ -1758,9 +2007,10 @@ var MCP_TOOLS = [
         },
         plan: {
           type: "string",
-          enum: ["monthly", "lifetime"],
+          enum: ["monthly", "yearly", "lifetime"],
           default: "monthly",
-          description: "Plan to check out: monthly ($2.99/mo) or lifetime ($34.99 one-time).",
+          description:
+            "Plan to check out: monthly ($4.99/mo), yearly ($49.99/yr), or lifetime ($129 one-time).",
         },
       },
     },
@@ -1776,7 +2026,8 @@ var MCP_TOOLS = [
       properties: {
         token: {
           type: "string",
-          description: 'Identity token: "sub:<hex>" from start_checkout or "code:CLICK-XXXX-XXXX".',
+          description:
+            'Identity token from start_checkout or redeem_access_code ("sub:<hex>", "code:<CODE>", or "lic:<license key>").',
         },
       },
     },
@@ -1784,13 +2035,17 @@ var MCP_TOOLS = [
   {
     name: "redeem_access_code",
     description:
-      "Redeem a ClickPrompt access code for lifetime script-saving unlock. " +
-      "Use when the user already owns a code.",
+      "Redeem a ClickPrompt access code (lifetime unlock) or the Lemon " +
+      "Squeezy license key from a ClickPrompt Pro purchase email. Use when " +
+      "the user already owns a code or key. Returns the identity token.",
     inputSchema: {
       type: "object",
       required: ["code"],
       properties: {
-        code: { type: "string", description: "Access code, e.g. CLICK-XXXX-XXXX." },
+        code: {
+          type: "string",
+          description: "Access code (e.g. CLICK-XXXX-XXXX) or license key (UUID format).",
+        },
       },
     },
   },
@@ -1858,7 +2113,7 @@ function mcpToolError(message) {
   };
 }
 
-async function mcpCallTool(env, name, args) {
+async function mcpCallTool(env, name, args, request) {
   args = args || {};
   try {
     switch (name) {
@@ -1869,7 +2124,7 @@ async function mcpCallTool(env, name, args) {
       case "check_unlock_status":
         return mcpToolText(await doMe(env, args.token));
       case "redeem_access_code":
-        return mcpToolText(await doRedeem(env, args.code));
+        return mcpToolText(await doRedeem(env, args.code, request));
       case "list_scripts":
         return mcpToolText(await doScriptsGet(env, args.token));
       case "save_script":
@@ -1942,7 +2197,7 @@ async function handleMcp(request, env, cors) {
       if (!toolName) {
         return json(mcpError(id, -32602, "Missing tool name."), 200, cors);
       }
-      var callResult = await mcpCallTool(env, toolName, params.arguments);
+      var callResult = await mcpCallTool(env, toolName, params.arguments, request);
       return json(mcpResult(id, callResult), 200, cors);
     }
 
