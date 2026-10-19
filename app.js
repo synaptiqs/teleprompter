@@ -1246,6 +1246,8 @@
         downloadLink.disabled = false;
         if (typeof reviewDialog.showModal === "function") reviewDialog.showModal();
         else reviewDialog.setAttribute("open", "");
+        // Smart teleprompter: lets the Up next queue ask "Recorded?".
+        try { document.dispatchEvent(new CustomEvent("cp:take-complete")); } catch (e) {}
       }
 
       function triggerBrowserDownload() {
@@ -2114,6 +2116,42 @@
           }
         });
       })();
+
+      // ---- bridge for the smart teleprompter (smart/ui.js) ----
+      // The Up next queue loads scripts into the prompter through this
+      // small surface. hostedGenerate is the "ClickPrompt writer": the same
+      // Worker endpoint and free cap as the Generate script button.
+      window.ClickPromptApp = {
+        loadScript: function (text) {
+          scriptInput.value = text;
+          setPromptOffset(0);
+          setScrollState(false);
+          updateScript();
+        },
+        openPrompter: function () { return showPrompter(); },
+        setOrientation: function (orientation) { return setRecordingOrientation(orientation); },
+        hostedGenerate: async function (brief) {
+          var payload = Object.assign({}, brief, { visitor_id: visitorId() });
+          var hostedToken = getToken();
+          if (hostedToken) payload.token = hostedToken;
+          var response = await fetch(SCRIPT_API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          var data = null;
+          try { data = await response.json(); } catch (e) {}
+          if (data && typeof data.remaining === "number") updateFreeCap(data.remaining, data.subscribed);
+          if (!response.ok || !data || !data.script) {
+            if (data && data.code === "daily_limit") openPaywall("limit");
+            var err = new Error((data && data.error) || "Couldn't reach the ClickPrompt writer. Try again.");
+            err.code = data && data.code;
+            throw err;
+          }
+          trackEvent("generated");
+          return { script: data.script, remaining: data.remaining };
+        }
+      };
 
       // Set the visitor cookie on first load so the free cap has an
       // identity even before the first generation.

@@ -14,7 +14,7 @@
   <meta property="og:description" content="A free teleprompter for recording videos: generate a script from five quick questions and read it on camera, right in your browser." />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://clickprompt.app/" />
-  <link rel="stylesheet" href="styles.css?v=20261008a" />
+  <link rel="stylesheet" href="styles.css?v=20261019a" />
 </head>
 <body>
   <main class="app" id="app" data-view="setup">
@@ -25,8 +25,23 @@
         <button class="text-button tour-replay" id="replayTour" type="button">Take the tour</button>
       </div>
       <div class="setup-body">
+        <section class="smart" id="smartPanel" aria-labelledby="smartTitle">
+          <div class="smart-head">
+            <h2 class="section-title" id="smartTitle">Up next to record</h2>
+            <div class="smart-links">
+              <button class="chip-button" id="openLoop" type="button">Content loop</button>
+              <button class="chip-button" id="openAi" type="button"><span class="ai-dot" id="aiDot" aria-hidden="true"></span><span id="aiLabel">Connect your AI</span></button>
+            </div>
+          </div>
+          <div class="smart-empty" id="smartEmpty">
+            <p><strong>Smart teleprompter.</strong> Tell ClickPrompt what your channel is about and when you post. It keeps your next scripts written and ready, so you open the app and hit record.</p>
+            <button class="primary" id="setupLoop" type="button">Set up my content loop</button>
+          </div>
+          <ol class="queue" id="queueList" aria-label="Videos to record, soonest first"></ol>
+          <p class="smart-status" id="smartStatus" role="status" aria-live="polite"></p>
+        </section>
         <div>
-          <h2 class="section-title">Your video</h2>
+          <h2 class="section-title">One-off video</h2>
           <div class="field">
             <label for="qName">1. Your name or handle</label>
             <input id="qName" type="text" autocomplete="off" placeholder="e.g. Alex Rivera" />
@@ -222,6 +237,7 @@
         <button class="secondary" id="newTake" type="button">Record another</button>
       </div>
       <p class="download-status" id="downloadStatus" role="status" aria-live="polite"></p>
+      <div class="feedback" id="takeFeedback" hidden></div>
     </div>
   </dialog>
 
@@ -283,6 +299,102 @@
     </div>
   </dialog>
 
-  <script src="app.js?v=20261008a"></script>
+  <dialog id="aiDialog" aria-labelledby="aiTitle">
+    <div class="sheet" tabindex="-1">
+      <h2 id="aiTitle">Connect your AI</h2>
+      <p>Use your own AI account to write your scripts. No ClickPrompt limits: you pay your AI provider directly for what you use.</p>
+      <div class="field">
+        <label for="aiProvider">AI provider</label>
+        <select id="aiProvider">
+          <option value="openai">OpenAI</option>
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="gemini">Google Gemini</option>
+          <option value="xai">xAI (Grok)</option>
+          <option value="openrouter">OpenRouter</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="aiModel">Model</label>
+        <div class="inline-row">
+          <input id="aiModel" type="text" list="aiModelList" autocomplete="off" spellcheck="false" />
+          <button class="secondary" id="aiLoadModels" type="button">Load my models</button>
+        </div>
+        <datalist id="aiModelList"></datalist>
+      </div>
+      <div class="field">
+        <label for="aiKey">API key</label>
+        <input id="aiKey" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <a class="key-link" id="aiKeyLink" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener">Get a key</a>
+      </div>
+      <p class="key-note"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 10V8a5 5 0 0 1 10 0v2m-11 0h12a1 1 0 0 1 1 1v9H5v-9a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.8"/></svg><span>Your key is stored only on this device, in this browser. It is sent only to the AI provider you picked, straight from your browser, and never to ClickPrompt's servers. Tip: set a monthly spend limit on the key at your provider.</span></p>
+      <div class="sheet-actions">
+        <button class="primary" id="aiSave" type="button">Save &amp; test</button>
+        <button class="secondary" id="aiTest" type="button">Test connection</button>
+        <button class="secondary danger" id="aiRemove" type="button">Remove key</button>
+      </div>
+      <p class="sheet-status" id="aiStatus" role="status" aria-live="polite"></p>
+      <div class="or-row"><span>or</span></div>
+      <button class="secondary wide" id="aiOpenRouter" type="button">Connect with OpenRouter</button>
+      <p class="fine">One sign-in, no key to copy. OpenRouter creates a key for ClickPrompt on your account; you pay OpenRouter for what you use.</p>
+      <button class="text-button" id="aiClose" type="button">Done</button>
+    </div>
+  </dialog>
+
+  <dialog id="loopDialog" aria-labelledby="loopTitle">
+    <div class="sheet" tabindex="-1">
+      <h2 id="loopTitle">Your content loop</h2>
+      <p>What you make, who it's for, and when you post. ClickPrompt uses this to plan and write what you record next.</p>
+      <h3 class="section-title">Channel</h3>
+      <div class="field"><label for="loopName">Name or handle</label><input id="loopName" type="text" autocomplete="off" placeholder="e.g. Alex Rivera" /></div>
+      <div class="field"><label for="loopTopic">What's your channel about?</label><input id="loopTopic" type="text" autocomplete="off" placeholder="e.g. DIY plumbing fixes for homeowners" /></div>
+      <div class="field"><label for="loopAudience">Who watches?</label><input id="loopAudience" type="text" autocomplete="off" placeholder="e.g. first-time homeowners who hate calling a pro" /></div>
+      <div class="field"><label for="loopVoice">Your voice and tone</label><input id="loopVoice" type="text" autocomplete="off" placeholder="e.g. calm, funny, no jargon" /></div>
+      <div class="field"><label for="loopSamples">Past scripts (optional, helps match your voice)</label><textarea id="loopSamples" rows="4" placeholder="Paste one or more past scripts. Put a line with --- between them."></textarea></div>
+      <h3 class="section-title">Pillars or series</h3>
+      <div class="field"><label for="loopPillars">One per line</label><textarea id="loopPillars" rows="3" placeholder="Quick fixes&#10;Tool reviews&#10;Myth busting"></textarea></div>
+      <h3 class="section-title">Platforms and length</h3>
+      <div class="platform-rows" id="loopPlatforms"></div>
+      <h3 class="section-title">Posting days</h3>
+      <div class="day-row" id="loopDays" role="group" aria-label="Posting days"></div>
+      <div class="sheet-actions">
+        <button class="primary" id="loopSave" type="button">Save and plan my next videos</button>
+      </div>
+      <p class="sheet-status" id="loopStatus" role="status" aria-live="polite"></p>
+      <button class="text-button" id="loopClose" type="button">Cancel</button>
+    </div>
+  </dialog>
+
+  <dialog id="itemDialog" aria-labelledby="itemTitleLabel">
+    <div class="sheet" tabindex="-1">
+      <p class="item-meta" id="itemMeta"></p>
+      <div class="field"><label for="itemTitle" id="itemTitleLabel">Working title</label><input id="itemTitle" type="text" autocomplete="off" /></div>
+      <div class="section-edit">
+        <div class="label-row"><label for="itemHook">Hook</label><button class="mini" type="button" data-regen="hook">Regenerate</button></div>
+        <textarea id="itemHook" rows="3"></textarea>
+      </div>
+      <div class="section-edit">
+        <div class="label-row"><label for="itemBody">Body</label><button class="mini" type="button" data-regen="body">Regenerate</button></div>
+        <textarea id="itemBody" rows="8"></textarea>
+      </div>
+      <div class="section-edit">
+        <div class="label-row"><label for="itemCta">Call to action</label><button class="mini" type="button" data-regen="cta">Regenerate</button></div>
+        <textarea id="itemCta" rows="2"></textarea>
+      </div>
+      <p class="item-length" id="itemLength"></p>
+      <div class="sheet-actions">
+        <button class="primary" id="itemRecord" type="button">Open in prompter</button>
+        <button class="secondary" id="itemRegenAll" type="button">Rewrite all</button>
+      </div>
+      <p class="sheet-status" id="itemStatus" role="status" aria-live="polite"></p>
+      <div class="feedback" id="itemFeedback"></div>
+      <button class="text-button" id="itemClose" type="button">Save and close</button>
+    </div>
+  </dialog>
+
+  <script src="app.js?v=20261019a"></script>
+  <script src="smart/loop.js?v=20261019a"></script>
+  <script src="smart/ai.js?v=20261019a"></script>
+  <script src="smart/writer.js?v=20261019a"></script>
+  <script src="smart/ui.js?v=20261019a"></script>
 </body>
 </html>
