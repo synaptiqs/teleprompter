@@ -1,0 +1,21 @@
+# ClickPrompt
+
+> ClickPrompt (https://clickprompt.app) is a browser teleprompter for talking-head video. It writes your script, then you read it off your camera while you record. Operated by Lagniappe Ventures Ltd (Nevada). Contact: info@lvltdllc.com
+
+## What it does
+- One-off scripts: answer five questions (name, what you do, audience, the one point, length) and get a spoken script.
+- Smart teleprompter: set up a content loop (channel topic, audience, voice, pillars, platforms with target length, posting days). The "Up next to record" queue plans your next videos and keeps scripts ready, each with a hook, body and call to action formatted for reading on camera.
+- Connect your AI: bring your own OpenAI, Anthropic, Google Gemini, xAI or OpenRouter key. The key stays in your browser and goes only to that provider.
+- Prompter: auto-scrolling script over a live camera preview, vertical or horizontal frame, countdown, video or audio-only recording, download your take. Takes never leave your device.
+- Feedback: after each take, mark it recorded or skipped and leave quick notes (for example "too long", "great hook") that shape future scripts.
+
+## Pages
+- [App](https://clickprompt.app/)
+- [Privacy](https://clickprompt.app/privacy)
+- [Terms](https://clickprompt.app/terms)
+- [Refunds](https://clickprompt.app/refund)
+- [Contact](https://clickprompt.app/contact)
+
+## For agents
+- REST API spec: https://github.com/synaptiqs/teleprompter/blob/main/openapi.yaml
+- MCP endpoint: POST https://teleprompter-script-api.synaptiqs.workers.dev/mcp (tools: generate_script, start_checkout, check_unlock_status, redeem_access_code, list_scripts, save_script, delete_script)
