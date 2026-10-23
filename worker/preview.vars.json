@@ -1,0 +1,6 @@
+{
+  "_comment": "PREVIEW/TEST ONLY. Non-secret Lemon Squeezy TEST-mode variant IDs (store clickprompt.app, not activated). Not read by any deploy; set these as vars on a preview Worker only. Never use for production. API key and store ID are secrets and are NOT stored here.",
+  "LEMONSQUEEZY_VARIANT_ID": "2287468",
+  "LEMONSQUEEZY_VARIANT_ID_ANNUAL": "2287471",
+  "LEMONSQUEEZY_VARIANT_ID_LIFETIME": "2287475"
+}

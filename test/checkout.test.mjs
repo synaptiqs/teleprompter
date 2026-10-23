@@ -38,3 +38,9 @@ test('no hard-coded hosted checkout links in the frontend', () => {
     assert.ok(!/SHARE_CHECKOUT_URL|lemonsqueezy\.com\/checkout\/buy|b043d615/.test(s), f);
   }
 });
+test('preview vars map plans to TEST-mode variants', async () => {
+  const pv = JSON.parse(fs.readFileSync(new URL('../worker/preview.vars.json', import.meta.url), 'utf8'));
+  const env = { LEMONSQUEEZY_API_KEY: 'k', LEMONSQUEEZY_STORE_ID: '1', ...pv };
+  sent = []; for (const p of ['monthly', 'yearly', 'lifetime']) assert.equal((await checkout(env, p)).status, 200);
+  assert.deepEqual(sent, ['2287468', '2287471', '2287475']);
+});
