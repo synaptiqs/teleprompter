@@ -1,0 +1,10 @@
+# AI-training opt-out tokens (these crawl as Googlebot/Applebot; search stays allowed)
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+User-agent: *
+Allow: /
+
