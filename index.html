@@ -53,6 +53,7 @@
             </select>
           </div>
           <div class="setup-action">
+            <div id="genTs" class="cf-turnstile" data-sitekey="0x4AAAAAAFimE5vwGYxq997L" data-action="generate" data-appearance="interaction-only"></div>
             <button class="primary" id="generateScript" type="button">Generate script</button>
           </div>
           <p class="free-cap" id="freeCap" role="status" aria-live="polite">3 free scripts today</p>
@@ -283,6 +284,7 @@
     </div>
   </dialog>
 
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
   <script src="app.js?v=20261008a"></script>
 </body>
 </html>

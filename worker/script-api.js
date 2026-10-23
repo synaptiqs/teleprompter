@@ -1631,12 +1631,38 @@ async function runDeletionCron(env) {
 
 // ---- REST handlers (thin wrappers around the core operations) ----
 
+var TURNSTILE_VERIFY = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+async function turnstileOk(request, env, token) {
+  token = String(token || "");
+  if (!token || token.length > 2048) return false;
+  var form = new FormData();
+  form.append("secret", env.TURNSTILE_SECRET);
+  form.append("response", token);
+  var ip = request.headers.get("CF-Connecting-IP");
+  if (ip) form.append("remoteip", ip);
+  try {
+    var r = await fetch(TURNSTILE_VERIFY, { method: "POST", body: form });
+    var d = await r.json();
+    return !!(d && d.success === true);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function handleGenerate(request, env, cors) {
   var body;
   try {
     body = await request.json();
   } catch (e) {
     return json({ error: "Request body must be JSON." }, 400, cors);
+  }
+  // Turnstile on the free tier only (no secret set = off). Subscribers with a
+  // working unlock token skip it; MCP and BYO-key never come through here.
+  if (env.TURNSTILE_SECRET) {
+    var sub = body && body.token ? (await resolveUnlock(env, body.token)).unlocked : false;
+    if (!sub && !(await turnstileOk(request, env, body && body["cf-turnstile-response"]))) {
+      return json({ error: "Please complete the quick human check, then try again.", code: "human_check" }, 403, cors);
+    }
   }
   try {
     return json(await doGenerate(env, body, request), 200, cors);
@@ -2236,6 +2262,7 @@ async function handleEvent(request, env, cors) {
   return json({ ok: true }, 200, cors);
 }
 
+export { turnstileOk as _turnstileOk };
 export default {
   async fetch(request, env) {
     var cors = {

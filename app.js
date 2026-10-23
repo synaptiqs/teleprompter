@@ -665,6 +665,11 @@
           // free cap entirely.
           var genToken = getToken();
           if (genToken) payload.token = genToken;
+          // Turnstile human check for the free tier (server ignores it for subscribers)
+          if (window.turnstile) {
+            try { payload["cf-turnstile-response"] = window.turnstile.getResponse("#genTs") || ""; } catch (e) {}
+            try { window.turnstile.reset("#genTs"); } catch (e) {}
+          }
           var response = await fetch(SCRIPT_API_URL, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
