@@ -250,11 +250,6 @@
       // Everything else (interview, generation, prompter) stays free.
       var API_BASE = "https://teleprompter-script-api.synaptiqs.workers.dev";
       var TOKEN_KEY = "clickprompt_token";
-      // Used only if the Worker can't create a checkout (503: not configured).
-      // ClickPrompt Pro (product 1397885) share checkout in the Synaptiq HQ
-      // store; the buyer picks the plan there and unlocks with the emailed
-      // license key.
-      var SHARE_CHECKOUT_URL = "https://synaptiqshq.lemonsqueezy.com/checkout/buy/b043d615-efb0-4d1d-8fbc-420532e4602c";
       var saveScriptButton = document.getElementById("saveScript");
       var saveStatus = document.getElementById("saveStatus");
       var library = document.getElementById("library");
@@ -400,11 +395,6 @@
         yearly: "Continue — $49.99/yr",
         lifetime: "Continue — $129 once"
       };
-      function randomHex(nBytes) {
-        var a = new Uint8Array(nBytes);
-        crypto.getRandomValues(a);
-        return Array.prototype.map.call(a, function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
-      }
       function selectedPlan() {
         var checked = document.querySelector('input[name="plan"]:checked');
         return checked ? checked.value : "monthly";
@@ -424,16 +414,7 @@
             window.location.href = data.url;
             return;
           }
-          if (data._status === 503) {
-            // Worker checkout not configured: fall back to the hosted share
-            // checkout. The custom token still lets the webhook unlock this
-            // browser; the emailed license key works everywhere.
-            var fallbackToken = "sub:" + randomHex(16);
-            setToken(fallbackToken);
-            window.location.href = SHARE_CHECKOUT_URL +
-              "?checkout[custom][unlock_token]=" + encodeURIComponent(fallbackToken);
-            return;
-          }
+          // 503 = checkout not configured: show the Worker's message (no hosted fallback link).
           paywallStatus.textContent = data.error || "Checkout isn't available right now. Try again later.";
         } catch (e) {
           paywallStatus.textContent = "Couldn't reach the checkout. Check your connection and try again.";
