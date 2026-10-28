@@ -155,7 +155,7 @@
  *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
  *   LEMONSQUEEZY_STORE_ID (Synaptiq HQ, 485773),
  *   LEMONSQUEEZY_VARIANT_ID (Pro Monthly $4.99),
- *   LEMONSQUEEZY_VARIANT_ID_YEARLY (Pro Annual $49.99),
+ *   LEMONSQUEEZY_VARIANT_ID_ANNUAL (Pro Annual $49.99; _YEARLY also accepted),
  *   LEMONSQUEEZY_VARIANT_ID_LIFETIME (Pro Lifetime $129 one-time),
  *   LEMONSQUEEZY_PRODUCT_ID (optional; Pro product for license-key checks,
  *     defaults to 1397885),
@@ -866,9 +866,18 @@ async function doGenerate(env, input, request) {
 // to 250 GB / 500 GB / 1 TB.
 var PLAN_VARIANT_ENV = {
   monthly: "LEMONSQUEEZY_VARIANT_ID",
-  yearly: "LEMONSQUEEZY_VARIANT_ID_YEARLY",
+  // _ANNUAL is the name set on the live Worker; _YEARLY is still honored.
+  yearly: ["LEMONSQUEEZY_VARIANT_ID_ANNUAL", "LEMONSQUEEZY_VARIANT_ID_YEARLY"],
   lifetime: "LEMONSQUEEZY_VARIANT_ID_LIFETIME",
 };
+function planVariantId(env, plan) {
+  var names = [].concat(PLAN_VARIANT_ENV[plan] || []);
+  for (var i = 0; i < names.length; i++) {
+    var v = String(env[names[i]] || "").trim();
+    if (v) return v;
+  }
+  return "";
+}
 var STORAGE_PLANS = {
   storage250:  { gb: 250,  envVar: "LEMONSQUEEZY_VARIANT_ID_STORAGE_250" },
   storage500:  { gb: 500,  envVar: "LEMONSQUEEZY_VARIANT_ID_STORAGE_500" },
@@ -922,7 +931,7 @@ async function doCheckout(env, origin, plan, existingToken) {
   } else {
     if (plan === "annual") plan = "yearly";
     if (!PLAN_VARIANT_ENV[plan]) plan = "monthly";
-    variantId = String(env[PLAN_VARIANT_ENV[plan]] || "").trim();
+    variantId = planVariantId(env, plan);
   }
   if (!variantId) {
     throw ApiError(503, "That plan isn't available yet. Try the monthly plan.");

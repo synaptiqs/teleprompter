@@ -78,7 +78,7 @@ A cancelled monthly/yearly plan keeps Pro until the paid period ends.
 - Secrets the worker expects: `LEMONSQUEEZY_API_KEY`,
   `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID` = 485773 (Synaptiq HQ),
   `LEMONSQUEEZY_VARIANT_ID` (Pro Monthly $4.99),
-  `LEMONSQUEEZY_VARIANT_ID_YEARLY` (Pro Annual $49.99),
+  `LEMONSQUEEZY_VARIANT_ID_ANNUAL` (Pro Annual $49.99; `_YEARLY` also accepted),
   `LEMONSQUEEZY_VARIANT_ID_LIFETIME` (Pro Lifetime $129), optional
   `LEMONSQUEEZY_PRODUCT_ID` (license-key product check, default 1397885),
   `LEMONSQUEEZY_STORAGE_TIERS` (JSON map of storage add-on variant ID to
