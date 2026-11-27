@@ -14,14 +14,35 @@ const worker = (await import('../worker/script-api.js')).default;
 
 let stripeCalls = [];
 let stripeSessionExpands = {};
+let stripeSessionExpandErrors = {};
 
 function parseForm(body) {
   return Object.fromEntries(new URLSearchParams(body));
 }
 
 function catalogLineItems(plan) {
-  const prices = { monthly: 'price_monthly', yearly: 'price_yearly', lifetime: 'price_lifetime' };
-  return { data: [{ price: { id: prices[plan] } }] };
+  const catalog = {
+    monthly: { id: 'price_monthly', unit_amount: 399 },
+    yearly: { id: 'price_yearly', unit_amount: 2900 },
+    lifetime: { id: 'price_lifetime', unit_amount: 5900 },
+  };
+  const p = catalog[plan];
+  return {
+    data: [{
+      quantity: 1,
+      currency: 'usd',
+      amount_total: p.unit_amount,
+      price: { id: p.id, currency: 'usd', unit_amount: p.unit_amount },
+    }],
+  };
+}
+
+function me(env, token) {
+  return worker.fetch(
+    new Request('https://x.test/api/me?token=' + encodeURIComponent(token)),
+    env,
+    { waitUntil() {} }
+  );
 }
 
 function stripeFetch() {
@@ -35,6 +56,12 @@ function stripeFetch() {
     const sessionGet = href.match(/^https:\/\/api\.stripe\.com\/v1\/checkout\/sessions\/([^?]+)/);
     if (sessionGet && (!init || !init.method || init.method === 'GET')) {
       const sid = decodeURIComponent(sessionGet[1]);
+      if (stripeSessionExpandErrors[sid]) {
+        const fail = stripeSessionExpandErrors[sid];
+        if (typeof fail === 'function') return fail();
+        if (fail instanceof Error) throw fail;
+        return new Response(JSON.stringify({ error: { message: 'unavailable' } }), { status: Number(fail) || 500 });
+      }
       if (stripeSessionExpands[sid]) {
         return new Response(JSON.stringify(stripeSessionExpands[sid]), { status: 200 });
       }
@@ -46,6 +73,7 @@ function stripeFetch() {
 beforeEach(() => {
   stripeCalls = [];
   stripeSessionExpands = {};
+  stripeSessionExpandErrors = {};
   globalThis.fetch = stripeFetch();
 });
 
@@ -303,7 +331,7 @@ test('signed checkout.session.completed unlocks a lifetime purchase', async () =
         id: 'cs_test_life',
         mode: 'payment',
         payment_status: 'paid',
-        metadata: { unlock_token: token, plan: 'lifetime' }, line_items: { data: [{ price: { id: 'price_lifetime' } }] },
+        metadata: { unlock_token: token, plan: 'lifetime' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_lifetime', currency: 'usd' } }] },
         customer_details: { email: 'buyer@example.com' },
       },
     },
@@ -385,7 +413,7 @@ test('signed subscription completed with payment_status unpaid writes no active 
         id: 'cs_unpaid',
         mode: 'subscription',
         payment_status: 'unpaid',
-        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] },
+        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] },
         subscription: 'sub_unpaid',
       },
     },
@@ -406,7 +434,7 @@ test('signed subscription completed with missing payment_status writes nothing',
       object: {
         id: 'cs_missing',
         mode: 'subscription',
-        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] },
+        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] },
         subscription: 'sub_missing',
       },
     },
@@ -428,7 +456,7 @@ test('no_payment_required and async_payment_succeeded grant; async_payment_faile
         id: 'cs_npr',
         mode: 'subscription',
         payment_status: 'no_payment_required',
-        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] },
+        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] },
         subscription: 'sub_npr',
       },
     },
@@ -447,7 +475,7 @@ test('no_payment_required and async_payment_succeeded grant; async_payment_faile
         id: 'cs_async_ok',
         mode: 'subscription',
         payment_status: 'paid',
-        metadata: { unlock_token: token2, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] },
+        metadata: { unlock_token: token2, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] },
         subscription: 'sub_async',
       },
     },
@@ -465,7 +493,7 @@ test('no_payment_required and async_payment_succeeded grant; async_payment_faile
         id: 'cs_async_ok',
         mode: 'subscription',
         payment_status: 'unpaid',
-        metadata: { unlock_token: token2, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] },
+        metadata: { unlock_token: token2, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] },
         subscription: 'sub_async',
       },
     },
@@ -487,7 +515,7 @@ test('lifetime grant requires meta.plan lifetime and does not overwrite a subscr
         id: 'cs_not_life',
         mode: 'payment',
         payment_status: 'paid',
-        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] }
+        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] }
       },
     },
   });
@@ -506,7 +534,7 @@ test('lifetime grant requires meta.plan lifetime and does not overwrite a subscr
         id: 'cs_life_over',
         mode: 'payment',
         payment_status: 'paid',
-        metadata: { unlock_token: subToken, plan: 'lifetime' }, line_items: { data: [{ price: { id: 'price_lifetime' } }] }
+        metadata: { unlock_token: subToken, plan: 'lifetime' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_lifetime', currency: 'usd' } }] }
       },
     },
   });
@@ -532,7 +560,7 @@ test('refund and dispute end Pro for a lifetime purchase', async () => {
         mode: 'payment',
         payment_status: 'paid',
         payment_intent: 'pi_life',
-        metadata: { unlock_token: token, plan: 'lifetime' }, line_items: { data: [{ price: { id: 'price_lifetime' } }] },
+        metadata: { unlock_token: token, plan: 'lifetime' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_lifetime', currency: 'usd' } }] },
         customer_details: { email: 'buyer@example.com' },
       },
     },
@@ -587,7 +615,7 @@ test('out-of-order checkout.session.completed does not override a cancelled subs
         id: 'cs_late',
         mode: 'subscription',
         payment_status: 'paid',
-        metadata: { unlock_token: 'sub:' + hex, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] },
+        metadata: { unlock_token: 'sub:' + hex, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] },
         subscription: 'sub_j',
       },
     },
@@ -605,7 +633,7 @@ test('livemode must match the secret key mode', async () => {
     type: 'checkout.session.completed',
     livemode: true,
     created: Math.floor(Date.now() / 1000),
-    data: { object: { id: 'cs_x', mode: 'subscription', payment_status: 'paid', metadata: { unlock_token: 'sub:' + 'ae'.repeat(16), plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] } } },
+    data: { object: { id: 'cs_x', mode: 'subscription', payment_status: 'paid', metadata: { unlock_token: 'sub:' + 'ae'.repeat(16), plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] } } },
   };
   let r = await signedWebhook({ ...stripeEnv, KV: kv }, event);
   assert.equal(r.status, 400);
@@ -741,7 +769,7 @@ test('older Stripe events are ignored once a newer created timestamp is stored',
         status: 'active',
         cancel_at_period_end: true,
         items: { data: [{ current_period_end: ends }] },
-        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] }
+        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] }
       },
     },
   });
@@ -762,7 +790,7 @@ test('older Stripe events are ignored once a newer created timestamp is stored',
         status: 'active',
         cancel_at_period_end: false,
         items: { data: [{ current_period_end: ends }] },
-        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] }
+        metadata: { unlock_token: token, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] }
       },
     },
   });
@@ -792,7 +820,7 @@ test('older Stripe events are ignored once a newer created timestamp is stored',
         mode: 'subscription',
         payment_status: 'paid',
         subscription: 'sub_deleted_1',
-        metadata: { unlock_token: 'sub:' + deletedHex, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] }
+        metadata: { unlock_token: 'sub:' + deletedHex, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] }
       },
     },
   });
@@ -822,7 +850,7 @@ test('bound stripesub mapping is trusted over a disagreeing unlock_token', async
           id: 'sub_bound_1',
           status: 'active',
           cancel_at_period_end: false,
-          metadata: { unlock_token: 'sub:' + hexA, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] }
+          metadata: { unlock_token: 'sub:' + hexA, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] }
         },
       },
     });
@@ -841,7 +869,7 @@ test('bound stripesub mapping is trusted over a disagreeing unlock_token', async
           id: 'sub_bound_1',
           status: 'active',
           cancel_at_period_end: true,
-          metadata: { unlock_token: 'sub:' + hexB, plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] }
+          metadata: { unlock_token: 'sub:' + hexB, plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] }
         },
       },
     });
@@ -870,7 +898,7 @@ test('webhook secret that does not start with whsec_ returns 503 and is not proc
         id: 'cs_bad_secret',
         mode: 'subscription',
         payment_status: 'paid',
-        metadata: { unlock_token: 'sub:' + 'f'.repeat(32), plan: 'monthly' }, line_items: { data: [{ price: { id: 'price_monthly' } }] }
+        metadata: { unlock_token: 'sub:' + 'f'.repeat(32), plan: 'monthly' }, line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_monthly', currency: 'usd' } }] }
       },
     },
   });
@@ -1285,8 +1313,9 @@ test('customer.subscription.updated does not restore a terminal revoke or delete
   });
   assert.equal(r.status, 200);
   rec = await kv.get('sub:' + hex, 'json');
-  assert.equal(rec.status, 'active');
-  assert.equal(rec.stripe_subscription_id, 'sub_term_new');
+  assert.equal(rec.status, 'refunded');
+  assert.notEqual(rec.stripe_subscription_id, 'sub_term_new');
+  assert.equal(await kv.get('stripesub:sub_term_new'), null);
 });
 
 test('tied event.created lets a revoke win; signed events missing created are rejected', async () => {
@@ -1456,7 +1485,7 @@ test('unknown or mismatched line-item price does not grant Pro', async () => {
         mode: 'subscription',
         payment_status: 'paid',
         metadata: { unlock_token: 'sub:' + hex, plan: 'monthly' },
-        line_items: { data: [{ price: { id: 'price_unknown' } }] },
+        line_items: { data: [{ quantity: 1, currency: 'usd', price: { id: 'price_unknown', currency: 'usd' } }] },
         subscription: 'sub_price_bad',
       },
     },
@@ -1546,4 +1575,525 @@ test('webhook bodies over 1 MB are rejected even without Content-Length', async 
     { waitUntil() {} }
   );
   assert.equal(r.status, 413);
+});
+
+test('expand fetch failure returns 5xx without a dedupe key; a retry then grants', async () => {
+  const kv = memoryKv();
+  const hex = 'c9'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  const event = {
+    id: 'evt_expand_retry',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 17_000,
+    data: {
+      object: {
+        id: 'cs_expand_retry',
+        mode: 'subscription',
+        payment_status: 'paid',
+        metadata: { unlock_token: 'sub:' + hex, plan: 'monthly' },
+        subscription: 'sub_expand_retry',
+      },
+    },
+  };
+
+  stripeSessionExpandErrors.cs_expand_retry = new Error('network down');
+  let r = await signedWebhook(env, event);
+  assert.equal(r.status, 500);
+  const body = await r.json();
+  assert.match(body.error, /Try again/);
+  assert.equal(await kv.get('stripe:evt:evt_expand_retry'), null);
+  assert.equal(await kv.get('sub:' + hex, 'json'), null);
+
+  delete stripeSessionExpandErrors.cs_expand_retry;
+  stripeSessionExpands.cs_expand_retry = {
+    id: 'cs_expand_retry',
+    line_items: catalogLineItems('monthly'),
+  };
+  r = await signedWebhook(env, event);
+  assert.equal(r.status, 200);
+  const rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'active');
+  assert.ok(await kv.get('stripe:evt:evt_expand_retry'));
+});
+
+test('refund carrying only an invoice id revokes the matching purchase', async () => {
+  const kv = memoryKv();
+  const hex = 'ca'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  let r = await signedWebhook(env, {
+    id: 'evt_inv_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 18_000,
+    data: {
+      object: {
+        id: 'cs_inv_only',
+        mode: 'payment',
+        payment_status: 'paid',
+        invoice: 'in_only',
+        metadata: { unlock_token: 'sub:' + hex, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'lifetime');
+  assert.equal(await kv.get('stripeinv:in_only'), hex);
+
+  r = await signedWebhook(env, {
+    id: 'evt_inv_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 18_001,
+    data: {
+      object: {
+        id: 'ch_unmapped',
+        object: 'charge',
+        invoice: 'in_only',
+        refunded: true,
+        amount: 5900,
+        amount_refunded: 5900,
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  const rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'refunded');
+  assert.equal(rec.revoke_reason, 'refund');
+});
+
+test('unbound subscription.updated cannot restore a refunded record; a new paid checkout can', async () => {
+  const kv = memoryKv();
+  const subHex = 'cb'.repeat(16);
+  const lifeHex = 'cc'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+
+  let r = await signedWebhook(env, {
+    id: 'evt_paid_sub_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 19_000,
+    data: {
+      object: {
+        id: 'cs_paid_sub',
+        mode: 'subscription',
+        payment_status: 'paid',
+        payment_intent: 'pi_paid_sub',
+        subscription: 'sub_paid_old',
+        metadata: { unlock_token: 'sub:' + subHex, plan: 'monthly' },
+        line_items: catalogLineItems('monthly'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  r = await signedWebhook(env, {
+    id: 'evt_paid_sub_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 19_001,
+    data: {
+      object: {
+        id: 'ch_paid_sub',
+        object: 'charge',
+        payment_intent: 'pi_paid_sub',
+        subscription: 'sub_paid_old',
+        refunded: true,
+        amount: 399,
+        amount_refunded: 399,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + subHex, 'json')).status, 'refunded');
+
+  r = await signedWebhook(env, {
+    id: 'evt_paid_sub_unbound',
+    type: 'customer.subscription.updated',
+    livemode: false,
+    created: 19_100,
+    data: {
+      object: {
+        id: 'sub_paid_unbound',
+        status: 'active',
+        cancel_at_period_end: false,
+        metadata: { unlock_token: 'sub:' + subHex, plan: 'monthly' },
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + subHex, 'json')).status, 'refunded');
+  assert.equal(await kv.get('stripesub:sub_paid_unbound'), null);
+
+  r = await signedWebhook(env, {
+    id: 'evt_paid_sub_new_checkout',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 19_200,
+    data: {
+      object: {
+        id: 'cs_paid_sub_new',
+        mode: 'subscription',
+        payment_status: 'paid',
+        payment_intent: 'pi_paid_sub_new',
+        subscription: 'sub_paid_new',
+        metadata: { unlock_token: 'sub:' + subHex, plan: 'monthly' },
+        line_items: catalogLineItems('monthly'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  let rec = await kv.get('sub:' + subHex, 'json');
+  assert.equal(rec.status, 'active');
+  assert.equal(rec.stripe_subscription_id, 'sub_paid_new');
+  assert.equal(await kv.get('stripesub:sub_paid_new'), subHex);
+
+  r = await signedWebhook(env, {
+    id: 'evt_paid_life_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 19_300,
+    data: {
+      object: {
+        id: 'cs_paid_life',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_paid_life',
+        metadata: { unlock_token: 'sub:' + lifeHex, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  r = await signedWebhook(env, {
+    id: 'evt_paid_life_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 19_301,
+    data: {
+      object: {
+        id: 'ch_paid_life',
+        object: 'charge',
+        payment_intent: 'pi_paid_life',
+        refunded: true,
+        amount: 5900,
+        amount_refunded: 5900,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + lifeHex, 'json')).status, 'refunded');
+
+  r = await signedWebhook(env, {
+    id: 'evt_paid_life_unbound',
+    type: 'customer.subscription.updated',
+    livemode: false,
+    created: 19_400,
+    data: {
+      object: {
+        id: 'sub_life_unbound',
+        status: 'active',
+        metadata: { unlock_token: 'sub:' + lifeHex, plan: 'monthly' },
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + lifeHex, 'json')).status, 'refunded');
+  assert.equal(await kv.get('stripesub:sub_life_unbound'), null);
+
+  r = await signedWebhook(env, {
+    id: 'evt_paid_life_new_checkout',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 19_500,
+    data: {
+      object: {
+        id: 'cs_paid_life_new',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_paid_life_new',
+        metadata: { unlock_token: 'sub:' + lifeHex, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  rec = await kv.get('sub:' + lifeHex, 'json');
+  assert.equal(rec.status, 'lifetime');
+  const meRes = await me(env, 'sub:' + lifeHex);
+  assert.equal((await meRes.json()).unlocked, true);
+});
+
+test('a long open dispute does not start hard deletion, and a later win restores', async () => {
+  const kv = memoryKv();
+  const hex = 'cd'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  let r = await signedWebhook(env, {
+    id: 'evt_long_dp_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 20_000,
+    data: {
+      object: {
+        id: 'cs_long_dp',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_long_dp',
+        metadata: { unlock_token: 'sub:' + hex, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+
+  r = await signedWebhook(env, {
+    id: 'evt_long_dp_created',
+    type: 'charge.dispute.created',
+    livemode: false,
+    created: 20_001,
+    data: {
+      object: {
+        id: 'dp_long',
+        object: 'dispute',
+        payment_intent: 'pi_long_dp',
+        charge: 'ch_long_dp',
+        status: 'needs_response',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  let rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'refunded');
+  assert.equal(rec.revoke_reason, 'dispute');
+  assert.equal(rec.delete_at, null);
+  rec.updated_at = Date.now() - 20 * 86400 * 1000;
+  await kv.put('sub:' + hex, JSON.stringify(rec));
+
+  r = await signedWebhook(env, {
+    id: 'evt_long_dp_won',
+    type: 'charge.dispute.closed',
+    livemode: false,
+    created: 20_500,
+    data: {
+      object: {
+        id: 'dp_long',
+        object: 'dispute',
+        payment_intent: 'pi_long_dp',
+        charge: 'ch_long_dp',
+        status: 'won',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'lifetime');
+  assert.equal(rec.delete_at, null);
+  const meRes = await me(env, 'sub:' + hex);
+  assert.equal((await meRes.json()).unlocked, true);
+});
+
+test('full refund before checkout leaves /api/me locked', async () => {
+  const kv = memoryKv();
+  const hex = 'ce'.repeat(16);
+  const token = 'sub:' + hex;
+  const env = { ...stripeEnv, KV: kv };
+  let r = await signedWebhook(env, {
+    id: 'evt_early_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 300,
+    data: {
+      object: {
+        id: 'ch_early',
+        object: 'charge',
+        payment_intent: 'pi_early',
+        refunded: true,
+        amount: 399,
+        amount_refunded: 399,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.ok(await kv.get('stripe:refunded:pi_early'));
+  assert.ok(await kv.get('stripe:refunded:ch_early'));
+
+  r = await signedWebhook(env, {
+    id: 'evt_late_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 100,
+    data: {
+      object: {
+        id: 'cs_early_refund',
+        mode: 'subscription',
+        payment_status: 'paid',
+        payment_intent: 'pi_early',
+        subscription: 'sub_early',
+        metadata: { unlock_token: token, plan: 'monthly' },
+        line_items: catalogLineItems('monthly'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(await kv.get('sub:' + hex, 'json'), null);
+  const meRes = await me(env, token);
+  const body = await meRes.json();
+  assert.equal(meRes.status, 200);
+  assert.equal(body.unlocked, false);
+});
+
+test('older dispute.created is ignored after a newer won close', async () => {
+  const kv = memoryKv();
+  const hex = 'cf'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  let r = await signedWebhook(env, {
+    id: 'evt_order_dp_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 21_000,
+    data: {
+      object: {
+        id: 'cs_order_dp',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_order_dp',
+        metadata: { unlock_token: 'sub:' + hex, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'lifetime');
+
+  r = await signedWebhook(env, {
+    id: 'evt_order_dp_won',
+    type: 'charge.dispute.closed',
+    livemode: false,
+    created: 200,
+    data: {
+      object: {
+        id: 'dp_order',
+        object: 'dispute',
+        payment_intent: 'pi_order_dp',
+        charge: 'ch_order_dp',
+        status: 'won',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'lifetime');
+
+  r = await signedWebhook(env, {
+    id: 'evt_order_dp_created',
+    type: 'charge.dispute.created',
+    livemode: false,
+    created: 100,
+    data: {
+      object: {
+        id: 'dp_order',
+        object: 'dispute',
+        payment_intent: 'pi_order_dp',
+        charge: 'ch_order_dp',
+        status: 'needs_response',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'lifetime');
+  const meRes = await me(env, 'sub:' + hex);
+  assert.equal((await meRes.json()).unlocked, true);
+});
+
+test('refunded:true with a smaller amount_refunded does not revoke', async () => {
+  const kv = memoryKv();
+  const hex = 'd0'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  let r = await signedWebhook(env, {
+    id: 'evt_flag_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 22_000,
+    data: {
+      object: {
+        id: 'cs_flag',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_flag',
+        metadata: { unlock_token: 'sub:' + hex, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  r = await signedWebhook(env, {
+    id: 'evt_flag_partial',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 22_001,
+    data: {
+      object: {
+        id: 'ch_flag',
+        object: 'charge',
+        payment_intent: 'pi_flag',
+        refunded: true,
+        amount: 5900,
+        amount_refunded: 1000,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'lifetime');
+});
+
+test('configured amount_total must match before a grant', async () => {
+  const kv = memoryKv();
+  const hex = 'd1'.repeat(16);
+  const env = { ...stripeEnv, KV: kv, STRIPE_PRICE_AMOUNT_MONTHLY: '399' };
+  const items = catalogLineItems('monthly');
+  items.data[0].amount_total = 100;
+  items.data[0].price.unit_amount = 100;
+  let r = await signedWebhook(env, {
+    id: 'evt_amount_mismatch',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 23_000,
+    data: {
+      object: {
+        id: 'cs_amount_bad',
+        mode: 'subscription',
+        payment_status: 'paid',
+        amount_total: 100,
+        metadata: { unlock_token: 'sub:' + hex, plan: 'monthly' },
+        line_items: items,
+        subscription: 'sub_amount_bad',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(await kv.get('sub:' + hex, 'json'), null);
+
+  const hex2 = 'd2'.repeat(16);
+  r = await signedWebhook(env, {
+    id: 'evt_amount_ok',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 23_001,
+    data: {
+      object: {
+        id: 'cs_amount_ok',
+        mode: 'subscription',
+        payment_status: 'paid',
+        amount_total: 399,
+        metadata: { unlock_token: 'sub:' + hex2, plan: 'monthly' },
+        line_items: catalogLineItems('monthly'),
+        subscription: 'sub_amount_ok',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex2, 'json')).status, 'active');
 });

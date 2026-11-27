@@ -630,12 +630,6 @@ var PLAN_PRICE_ENV = {
   lifetime: "STRIPE_PRICE_ID_LIFETIME",
 };
 
-var STORAGE_STRIPE_PLANS = {
-  storage250:  { gb: 250,  envVar: "STRIPE_PRICE_ID_STORAGE_250" },
-  storage500:  { gb: 500,  envVar: "STRIPE_PRICE_ID_STORAGE_500" },
-  storage1000: { gb: 1000, envVar: "STRIPE_PRICE_ID_STORAGE_1000" },
-};
-
 function planPriceId(env, plan) {
   var names = [].concat(PLAN_PRICE_ENV[plan] || []);
   for (var i = 0; i < names.length; i++) {
@@ -826,7 +820,9 @@ async function stripeRequest(secret, method, path, formBody, idempotencyKey) {
 }
 
 // HMAC-SHA-256 of a message, returned as lowercase hex. Used to
-// verify the Stripe-Signature header.
+// verify the Stripe-Signature header. The message may be a string
+// or a Uint8Array of raw body bytes; webhook verification always
+// signs the raw bytes, never a decoded string.
 async function hmacSha256Hex(secret, message) {
   var key = await crypto.subtle.importKey(
     "raw",
@@ -835,11 +831,10 @@ async function hmacSha256Hex(secret, message) {
     false,
     ["sign"]
   );
-  var sig = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(message)
-  );
+  var data = message instanceof Uint8Array
+    ? message
+    : new TextEncoder().encode(String(message || ""));
+  var sig = await crypto.subtle.sign("HMAC", key, data);
   return bytesToHex(new Uint8Array(sig));
 }
 
@@ -865,7 +860,17 @@ async function verifyStripeSignature(rawBody, header, secret, nowMs, toleranceSe
   var tolerance = (toleranceSec == null ? STRIPE_SIGNATURE_TOLERANCE_SEC : Number(toleranceSec)) * 1000;
   var now = nowMs == null ? Date.now() : nowMs;
   if (Math.abs(now - ts * 1000) > tolerance) return false;
-  var expected = await hmacSha256Hex(secret, timestamp + "." + rawBody);
+  // Sign timestamp + "." + raw body bytes. If the caller passed a
+  // string (unit tests), encode it as UTF-8; live webhooks pass the
+  // unread-decoded body bytes from readLimitedBody.
+  var bodyBytes = rawBody instanceof Uint8Array
+    ? rawBody
+    : new TextEncoder().encode(String(rawBody || ""));
+  var prefix = new TextEncoder().encode(timestamp + ".");
+  var signed = new Uint8Array(prefix.length + bodyBytes.length);
+  signed.set(prefix, 0);
+  signed.set(bodyBytes, prefix.length);
+  var expected = await hmacSha256Hex(secret, signed);
   for (var i = 0; i < signatures.length; i++) {
     if (timingSafeEqual(expected, signatures[i])) return true;
   }
@@ -1062,19 +1067,21 @@ async function hexFromStripeRefs(env, obj) {
   return null;
 }
 
-// Look up our unlock hex for a refund or dispute. Only charge,
-// payment_intent, session, and subscription mappings are used.
-// Customer id is never authoritative for a revoke, so two purchases
-// on the same customer cannot revoke each other.
+// Look up our unlock hex for a refund or dispute. Charge,
+// payment_intent, invoice, session, and subscription mappings are
+// used. Customer id is never authoritative for a revoke, so two
+// purchases on the same customer cannot revoke each other.
 async function hexFromStripeRevokeRefs(env, obj) {
   if (!env.KV || !obj) return null;
   var keys = [];
   var pi = stripeRefId(obj.payment_intent);
   var ch = stripeRefId(obj.charge) || (obj.object === "charge" ? String(obj.id || "") : "");
+  var inv = stripeRefId(obj.invoice) || (obj.object === "invoice" ? String(obj.id || "") : "");
   var sub = stripeRefId(obj.subscription);
   var sess = stripeRefId(obj.checkout_session) || (obj.object === "checkout.session" ? String(obj.id || "") : "");
   if (pi) keys.push("stripepi:" + pi);
   if (ch) keys.push("stripecharge:" + ch);
+  if (inv) keys.push("stripeinv:" + inv);
   if (sess) keys.push("stripesession:" + sess);
   if (sub) keys.push("stripesub:" + sub);
   for (var i = 0; i < keys.length; i++) {
@@ -1089,11 +1096,17 @@ async function hexFromStripeRevokeRefs(env, obj) {
 // keep access.
 function isFullStripeRefund(charge) {
   if (!charge) return false;
-  if (charge.refunded === true) return true;
-  var amount = Number(charge.amount);
-  var refunded = Number(charge.amount_refunded);
-  if (!isFinite(amount) || !isFinite(refunded) || amount <= 0) return false;
-  return refunded >= amount;
+  var currency = String(charge.currency || "").toLowerCase();
+  if (currency && currency !== "usd") return false;
+  var hasAmount = charge.amount != null && charge.amount !== "";
+  var hasRefunded = charge.amount_refunded != null && charge.amount_refunded !== "";
+  if (hasAmount || hasRefunded) {
+    var amount = Number(charge.amount);
+    var refundedAmt = Number(charge.amount_refunded);
+    if (!isFinite(amount) || amount <= 0 || !isFinite(refundedAmt)) return false;
+    return refundedAmt >= amount;
+  }
+  return charge.refunded === true;
 }
 
 async function hexFromStripeSubscription(env, sub, metadata) {
@@ -1101,6 +1114,23 @@ async function hexFromStripeSubscription(env, sub, metadata) {
   var customToken = meta.unlock_token;
   var hex = stripeSubHex(customToken);
   var stripeSubId = String((sub && sub.id) || "");
+  var existing = (env.KV && stripeSubId) ? await env.KV.get("stripesub:" + stripeSubId) : null;
+  if (existing) {
+    if (hex && existing !== hex) {
+      try { console.log("stripe unlock_token does not match stored mapping"); } catch (e) {}
+    }
+    await rememberStripeIds(env, existing, {
+      subscription: stripeSubId,
+      customer: stripeRefId(sub && sub.customer),
+    });
+    return existing;
+  }
+  if (!hex) return null;
+  var prev = (env.KV && (await env.KV.get("sub:" + hex, "json"))) || {};
+  // A terminal record must not gain a new stripesub binding from
+  // subscription.updated. Only a paid checkout.session.completed that
+  // already passed payment and catalog checks may bind a new id.
+  if (prev.deleted || stripeRecordIsTerminal(prev)) return hex;
   var bound = await bindStripeSub(env, stripeSubId, hex);
   if (bound) {
     await rememberStripeIds(env, bound, {
@@ -1144,11 +1174,18 @@ function stripeRecordIsTerminal(prev) {
   return false;
 }
 
-function isNewStripeSubscription(prev, sub) {
+// A subscription id counts as new only when stripesub:<id> is already
+// bound to this hex by a paid checkout.session.completed (payment and
+// catalog checks passed). A missing previous subscription id is not
+// treated as new, so a refunded lifetime cannot be restored by a
+// loose subscription.updated.
+async function isPaidBoundNewSubscription(env, prev, sub, hex) {
   var incoming = String((sub && sub.id) || "");
-  if (!incoming) return false;
+  if (!incoming || !hex || !env.KV) return false;
+  var bound = await env.KV.get("stripesub:" + incoming);
+  if (bound !== hex) return false;
   var prevId = String((prev && prev.stripe_subscription_id) || "");
-  if (!prevId) return true;
+  if (!prevId) return false;
   return incoming !== prevId;
 }
 
@@ -1169,13 +1206,6 @@ function shouldSkipCheckoutGrant(prev, eventCreated) {
   return shouldIgnoreOlderEvent(prev, eventCreated, true);
 }
 
-function storagePlanGb(plan, storageGb) {
-  var spec = STORAGE_STRIPE_PLANS[plan];
-  var gb = Number(storageGb) || 0;
-  if (spec && gb === spec.gb) return gb;
-  return 0;
-}
-
 // Apply a Stripe subscription event to the same KV record shape Lemon
 // Squeezy uses, so resolveUnlock / cancel-keeps-Pro / deletion all work
 // unchanged. Stripe spells it "canceled"; we store "cancelled".
@@ -1191,7 +1221,7 @@ async function applyStripeSubscription(env, sub, eventCreated, eventType) {
   var isDeletedEvent = eventType === "customer.subscription.deleted";
   var isCancel = isDeletedEvent || effectiveStatus === "cancelled" || effectiveStatus === "expired";
   var wouldRestore = !isCancel;
-  if (stripeRecordIsTerminal(prev) && !isNewStripeSubscription(prev, sub)) return;
+  if (stripeRecordIsTerminal(prev) && !(await isPaidBoundNewSubscription(env, prev, sub, hex))) return;
   if (shouldIgnoreOlderEvent(prev, eventCreated, wouldRestore)) return;
   var rec = {
     status: effectiveStatus,
@@ -1257,21 +1287,97 @@ function stripePricesMatchPlan(env, plan, priceIds) {
   return true;
 }
 
-async function resolveStripeSessionPriceIds(env, session) {
-  var ids = stripeSessionPriceIds(session);
-  if (ids) return ids;
+function expectedPlanAmountCents(env, plan) {
+  var names = {
+    monthly: "STRIPE_PRICE_AMOUNT_MONTHLY",
+    yearly: ["STRIPE_PRICE_AMOUNT_YEARLY", "STRIPE_PRICE_AMOUNT_ANNUAL"],
+    lifetime: "STRIPE_PRICE_AMOUNT_LIFETIME",
+  };
+  var keys = [].concat(names[plan] || []);
+  for (var i = 0; i < keys.length; i++) {
+    var raw = String((env && env[keys[i]]) || "").trim();
+    if (!raw) continue;
+    var n = Number(raw);
+    if (isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+// In addition to a matching price id, a grant requires currency usd
+// and quantity 1. When STRIPE_PRICE_AMOUNT_* is set, amount_total
+// (and unit_amount) must also match that value in cents. When those
+// env vars are unset, only currency and quantity are compared.
+function stripeLineItemsMatchCatalog(env, plan, items, sessionAmountTotal) {
+  if (!isStripeCheckoutPlan(plan) || !items || !items.length) return false;
+  var expectedPrice = planPriceId(env, plan);
+  if (!expectedPrice) return false;
+  var expectedAmount = expectedPlanAmountCents(env, plan);
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i] || {};
+    var price = item.price;
+    var priceId = typeof price === "string" ? price : (price && price.id) || "";
+    if (priceId !== expectedPrice) return false;
+    var currency = String(item.currency || (price && price.currency) || "").toLowerCase();
+    if (currency !== "usd") return false;
+    if (Number(item.quantity) !== 1) return false;
+    if (expectedAmount != null) {
+      var unit = Number((price && price.unit_amount) || 0);
+      var lineTotal = item.amount_total != null ? Number(item.amount_total) : unit;
+      if (lineTotal !== expectedAmount && unit !== expectedAmount) return false;
+    }
+  }
+  if (expectedAmount != null && sessionAmountTotal != null && sessionAmountTotal !== "") {
+    if (Number(sessionAmountTotal) !== expectedAmount) return false;
+  }
+  return true;
+}
+
+function stripeSessionLineItems(session) {
+  if (!session || !session.line_items || !Array.isArray(session.line_items.data)) return null;
+  return session.line_items.data;
+}
+
+// A failed expand (timeout, 5xx, 429, or network error) must not be
+// treated as a price mismatch. The caller skips the dedupe write and
+// returns 500 so Stripe retries. A successful fetch, including one
+// that returns no usable line items, is a genuine mismatch.
+async function resolveStripeSessionLineItems(env, session) {
+  var items = stripeSessionLineItems(session);
+  if (items) return { items: items, amountTotal: session.amount_total };
   var sid = session && session.id;
-  if (!sid) return [];
+  if (!sid) return { items: [], amountTotal: session && session.amount_total };
+  var got = readStripeSecretKey(env);
+  if (got.hiddenChars || !got.key) {
+    var cfg = new Error("Checkout is not configured yet.");
+    cfg.status = 500;
+    cfg.transient = true;
+    throw cfg;
+  }
   try {
-    var got = readStripeSecretKey(env);
-    if (got.hiddenChars || !got.key) return [];
     var path = "/checkout/sessions/" + encodeURIComponent(sid) + "?expand[]=line_items";
     var expanded = await stripeRequest(got.key, "GET", path);
-    return stripeSessionPriceIds(expanded) || [];
+    return {
+      items: stripeSessionLineItems(expanded) || [],
+      amountTotal: expanded.amount_total != null ? expanded.amount_total : (session && session.amount_total),
+    };
   } catch (e) {
     try { console.log("stripe session expand failed"); } catch (ignore) {}
-    return [];
+    var err = new Error("Could not verify checkout price.");
+    err.status = 500;
+    err.transient = true;
+    throw err;
   }
+}
+
+async function resolveStripeSessionPriceIds(env, session) {
+  var got = await resolveStripeSessionLineItems(env, session);
+  var ids = [];
+  (got.items || []).forEach(function (item) {
+    var price = item && item.price;
+    var id = typeof price === "string" ? price : (price && price.id) || "";
+    if (id) ids.push(String(id));
+  });
+  return ids;
 }
 
 // Grant Pro from a Checkout Session only when payment_status is exactly
@@ -1286,8 +1392,17 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
   }
   var meta = session.metadata || {};
   var plan = String(meta.plan || "");
-  var priceIds = await resolveStripeSessionPriceIds(env, session);
-  if (!stripePricesMatchPlan(env, plan, priceIds)) return;
+  var resolved = await resolveStripeSessionLineItems(env, session);
+  var priceIds = [];
+  (resolved.items || []).forEach(function (item) {
+    var price = item && item.price;
+    var id = typeof price === "string" ? price : (price && price.id) || "";
+    if (id) priceIds.push(String(id));
+  });
+  if (!stripePricesMatchPlan(env, plan, priceIds) || !stripeLineItemsMatchCatalog(env, plan, resolved.items, resolved.amountTotal)) {
+    try { console.log("stripe checkout price does not match catalog"); } catch (e) {}
+    return;
+  }
   var token = meta.unlock_token || session.client_reference_id || "";
   var email = clean(
     ((session.customer_details && session.customer_details.email) || session.customer_email || ""),
@@ -1301,16 +1416,31 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
     subscription: typeof session.subscription === "string"
       ? session.subscription
       : (session.subscription && session.subscription.id) || "",
+    charge: stripeRefId(session.payment_intent && session.payment_intent.latest_charge) || stripeRefId(session.latest_charge) || stripeRefId(session.charge),
   };
+  if (await sessionHasOpenDisputeOrRefund(env, ids)) {
+    try { console.log("stripe checkout skipped because of a refund or dispute tombstone"); } catch (e) {}
+    return;
+  }
 
   if (session.mode === "subscription") {
     var claimed = stripeSubHex(token);
-    var hex = await bindStripeSub(env, ids.subscription, claimed);
+    var existingBind = (env.KV && ids.subscription) ? await env.KV.get("stripesub:" + ids.subscription) : null;
+    if (existingBind && claimed && existingBind !== claimed) {
+      try { console.log("stripe unlock_token does not match stored mapping"); } catch (e) {}
+    }
+    var hex = existingBind || claimed;
     if (hex) {
-      await rememberStripeIds(env, hex, ids);
       var subKey = "sub:" + hex;
       var prev = (await env.KV.get(subKey, "json")) || {};
-      if (shouldSkipCheckoutGrant(prev, eventCreated)) return;
+      if (prev.deleted) return;
+      if (stripeRecordIsTerminal(prev)) {
+        if (!ids.subscription || ids.subscription === String(prev.stripe_subscription_id || "")) return;
+      } else if (shouldSkipCheckoutGrant(prev, eventCreated)) {
+        return;
+      }
+      await bindStripeSub(env, ids.subscription, hex);
+      await rememberStripeIds(env, hex, ids);
       var rec = {
         status: "active",
         stripe_subscription_id: ids.subscription || prev.stripe_subscription_id || null,
@@ -1318,16 +1448,18 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
         email: email || prev.email || null,
         storage_tier_gb: prev.storage_tier_gb || 100,
         cancel_pending: false,
-        ends_at: prev.ends_at || null,
+        ends_at: null,
         delete_at: null,
         source: "stripe",
         provider: "stripe",
         updated_at: Date.now(),
+        subscription_deleted: false,
+        revoke_reason: null,
+        revoke_dispute_id: null,
+        revoke_prior_status: null,
       };
       stampLastEvent(rec, eventCreated);
-      if (prev.cancel_pending) {
-        try { await cancelDeletion(env, hex); } catch (e) {}
-      }
+      try { await cancelDeletion(env, hex); } catch (e) {}
       await env.KV.put(subKey, JSON.stringify(rec));
     }
     return;
@@ -1337,11 +1469,16 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
     if (plan !== "lifetime") return;
     var payHex = stripeSubHex(token);
     if (!payHex) return;
-    await rememberStripeIds(env, payHex, ids);
     var orderSubKey = "sub:" + payHex;
     var orderPrev = (await env.KV.get(orderSubKey, "json")) || {};
-    if (shouldSkipCheckoutGrant(orderPrev, eventCreated)) return;
-    if (isSubscriberRecord(orderPrev)) return;
+    if (orderPrev.deleted) return;
+    if (stripeRecordIsTerminal(orderPrev)) {
+      if (ids.session && orderPrev.stripe_session_id && ids.session === orderPrev.stripe_session_id) return;
+    } else {
+      if (shouldSkipCheckoutGrant(orderPrev, eventCreated)) return;
+      if (isSubscriberRecord(orderPrev)) return;
+    }
+    await rememberStripeIds(env, payHex, ids);
     var lifeRec = {
       status: "lifetime",
       stripe_session_id: ids.session || "",
@@ -1350,16 +1487,113 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
       source: "stripe",
       provider: "stripe",
       updated_at: Date.now(),
+      cancel_pending: false,
+      delete_at: null,
+      subscription_deleted: false,
+      revoke_reason: null,
+      revoke_dispute_id: null,
+      revoke_prior_status: null,
     };
     stampLastEvent(lifeRec, eventCreated);
+    try { await cancelDeletion(env, payHex); } catch (e) {}
     await env.KV.put(orderSubKey, JSON.stringify(lifeRec));
   }
 }
 
-// A full refund or an open dispute ends Pro for that purchase now,
-// matching the refund policy. Saved data then follows the
-// 10-business-day deletion schedule. This does not wait for the paid
-// period to end. Partial refunds do not call this.
+// Pending state for out-of-order webhooks. An event that would be a
+// no-op only because its target identity does not exist yet must not
+// be forgotten after a 200 + stripe:evt: write. Full refunds write
+// stripe:refunded:<payment_intent|charge|invoice> (60-day TTL).
+// Disputes write stripe:dispute:<dispute_id> (status + created) and
+// stripe:disputed:<payment_intent|charge|invoice>. A later checkout
+// grant consults those keys. If an event has no identity and no
+// attachable id, the webhook returns 5xx without a dedupe write so
+// Stripe retries.
+function stripePendingRefKeys(prefix, obj) {
+  var keys = [];
+  var pi = stripeRefId(obj && obj.payment_intent);
+  var ch = stripeRefId(obj && obj.charge) || ((obj && obj.object === "charge") ? String(obj.id || "") : "");
+  var inv = stripeRefId(obj && obj.invoice) || ((obj && obj.object === "invoice") ? String(obj.id || "") : "");
+  if (pi) keys.push(prefix + pi);
+  if (ch) keys.push(prefix + ch);
+  if (inv) keys.push(prefix + inv);
+  return keys;
+}
+
+async function writeStripeRefundTombstones(env, obj) {
+  if (!env.KV || !obj) return [];
+  var keys = stripePendingRefKeys("stripe:refunded:", obj);
+  for (var i = 0; i < keys.length; i++) {
+    await env.KV.put(keys[i], JSON.stringify({ at: Date.now() }), { expirationTtl: STRIPE_EVENT_TTL_SEC });
+  }
+  return keys;
+}
+
+async function writeStripeDisputeRefs(env, dispute, status, eventCreated) {
+  if (!env.KV || !dispute) return [];
+  var keys = stripePendingRefKeys("stripe:disputed:", dispute);
+  var payload = JSON.stringify({
+    status: String(status || ""),
+    created: Number(eventCreated) || 0,
+    dispute_id: String(dispute.id || ""),
+  });
+  for (var i = 0; i < keys.length; i++) {
+    await env.KV.put(keys[i], payload, { expirationTtl: STRIPE_EVENT_TTL_SEC });
+  }
+  return keys;
+}
+
+async function sessionHasOpenDisputeOrRefund(env, ids) {
+  if (!env.KV || !ids) return false;
+  var probe = {
+    payment_intent: ids.paymentIntent,
+    charge: ids.charge,
+    invoice: ids.invoice,
+  };
+  var refundKeys = stripePendingRefKeys("stripe:refunded:", probe);
+  var i;
+  for (i = 0; i < refundKeys.length; i++) {
+    if (await env.KV.get(refundKeys[i])) return true;
+  }
+  var disputeKeys = stripePendingRefKeys("stripe:disputed:", probe);
+  for (i = 0; i < disputeKeys.length; i++) {
+    var st = await env.KV.get(disputeKeys[i], "json");
+    if (st && String(st.status || "") !== "won") return true;
+  }
+  return false;
+}
+
+async function readStripeDisputeState(env, disputeId) {
+  if (!env.KV || !disputeId) return null;
+  return await env.KV.get("stripe:dispute:" + disputeId, "json");
+}
+
+async function writeStripeDisputeState(env, disputeId, status, eventCreated) {
+  if (!env.KV || !disputeId) return;
+  await env.KV.put(
+    "stripe:dispute:" + disputeId,
+    JSON.stringify({ status: String(status || ""), created: Number(eventCreated) || 0 }),
+    { expirationTtl: STRIPE_EVENT_TTL_SEC }
+  );
+}
+
+function disputeStatusIsClosed(status) {
+  var s = String(status || "");
+  return s === "won" || s === "lost" || s === "warning_closed";
+}
+
+// If a refund or dispute cannot be attached to an identity or a
+// payment/charge/invoice id, tell the caller to skip dedupe and
+// return 5xx so Stripe retries.
+function stripePendingNeedsRetry(obj, wroteKeys) {
+  return !(wroteKeys && wroteKeys.length);
+}
+
+// A full refund ends Pro for that purchase now, matching the refund
+// policy. An open dispute pauses Pro but does not start the
+// 10-business-day deletion clock; that clock starts only when the
+// dispute closes lost, so a later won dispute can still restore.
+// Partial refunds do not call this.
 async function applyStripeRevoke(env, obj, eventCreated, reason) {
   if (!env.KV || !obj) return;
   var hex = await hexFromStripeRevokeRefs(env, obj);
@@ -1388,47 +1622,106 @@ async function applyStripeRevoke(env, obj, eventCreated, reason) {
     revoke_prior_status: prev.status,
   };
   stampLastEvent(rec, eventCreated);
+  if (reason === "dispute") {
+    rec.delete_at = null;
+    rec.cancel_pending = false;
+    await env.KV.put(subKey, JSON.stringify(rec));
+    return;
+  }
   await env.KV.put(subKey, JSON.stringify(rec));
   try {
     await scheduleDeletion(env, hex, rec.email, deleteAt, accessEndsAt);
   } catch (e) {}
 }
 
-// A won dispute restores Pro only when this record was revoked by
-// that same dispute. Lost or warning-closed disputes leave access
-// ended.
-async function applyStripeDisputeClosed(env, dispute, eventCreated) {
-  if (!env.KV || !dispute) return;
-  if (String(dispute.status || "") !== "won") return;
-  var hex = await hexFromStripeRevokeRefs(env, dispute);
-  if (!hex) return;
-  var subKey = "sub:" + hex;
-  var prev = (await env.KV.get(subKey, "json")) || {};
-  if (prev.deleted) return;
-  if (prev.revoke_reason !== "dispute") return;
+// Apply a dispute.created event. A created event older than a stored
+// closed event for the same dispute id is ignored, so an out-of-order
+// won close is not overwritten. Open disputes pause Pro but do not
+// start hard deletion.
+async function applyStripeDisputeCreated(env, dispute, eventCreated) {
+  if (!env.KV || !dispute) return { wrotePending: false };
   var disputeId = String(dispute.id || "");
-  if (prev.revoke_dispute_id && disputeId && prev.revoke_dispute_id !== disputeId) return;
-  if (shouldIgnoreOlderEvent(prev, eventCreated, true)) return;
-  var rec = {
-    status: prev.revoke_prior_status || (prev.stripe_subscription_id ? "active" : "lifetime"),
-    ls_subscription_id: prev.ls_subscription_id || null,
-    stripe_subscription_id: prev.stripe_subscription_id || null,
-    stripe_session_id: prev.stripe_session_id || null,
-    email: prev.email || null,
-    storage_tier_gb: prev.storage_tier_gb || 100,
-    cancel_pending: false,
-    ends_at: prev.revoke_prior_status === "lifetime" ? null : prev.ends_at || null,
-    delete_at: null,
-    source: prev.source || "stripe",
-    provider: prev.provider || "stripe",
-    updated_at: Date.now(),
-    revoke_reason: null,
-    revoke_dispute_id: null,
-    revoke_prior_status: null,
-  };
-  stampLastEvent(rec, eventCreated);
-  try { await cancelDeletion(env, hex); } catch (e) {}
-  await env.KV.put(subKey, JSON.stringify(rec));
+  var prevState = await readStripeDisputeState(env, disputeId);
+  if (prevState && disputeStatusIsClosed(prevState.status) && Number(prevState.created) >= Number(eventCreated)) {
+    return { wrotePending: true, ignored: true };
+  }
+  if (disputeId) await writeStripeDisputeState(env, disputeId, String(dispute.status || "open"), eventCreated);
+  var refs = await writeStripeDisputeRefs(env, dispute, String(dispute.status || "open"), eventCreated);
+  await applyStripeRevoke(env, dispute, eventCreated, "dispute");
+  var hex = await hexFromStripeRevokeRefs(env, dispute);
+  return { wrotePending: !!(refs.length || hex || disputeId) };
+}
+
+// A won dispute restores Pro only when this record was revoked by
+// that same dispute. A lost close starts the 10-business-day
+// deletion clock. Lost or warning-closed disputes leave access ended.
+async function applyStripeDisputeClosed(env, dispute, eventCreated) {
+  if (!env.KV || !dispute) return { wrotePending: false };
+  var disputeId = String(dispute.id || "");
+  var status = String(dispute.status || "");
+  var prevState = await readStripeDisputeState(env, disputeId);
+  if (prevState && Number(prevState.created) > Number(eventCreated)) {
+    return { wrotePending: true, ignored: true };
+  }
+  if (disputeId) await writeStripeDisputeState(env, disputeId, status, eventCreated);
+  var refs = await writeStripeDisputeRefs(env, dispute, status, eventCreated);
+  var hex = await hexFromStripeRevokeRefs(env, dispute);
+  if (status === "won") {
+    if (hex) {
+      var subKey = "sub:" + hex;
+      var prev = (await env.KV.get(subKey, "json")) || {};
+      if (!prev.deleted && prev.revoke_reason === "dispute") {
+        if (!prev.revoke_dispute_id || !disputeId || prev.revoke_dispute_id === disputeId) {
+          if (!shouldIgnoreOlderEvent(prev, eventCreated, true)) {
+            var rec = {
+              status: prev.revoke_prior_status || (prev.stripe_subscription_id ? "active" : "lifetime"),
+              ls_subscription_id: prev.ls_subscription_id || null,
+              stripe_subscription_id: prev.stripe_subscription_id || null,
+              stripe_session_id: prev.stripe_session_id || null,
+              email: prev.email || null,
+              storage_tier_gb: prev.storage_tier_gb || 100,
+              cancel_pending: false,
+              ends_at: prev.revoke_prior_status === "lifetime" ? null : prev.ends_at || null,
+              delete_at: null,
+              source: prev.source || "stripe",
+              provider: prev.provider || "stripe",
+              updated_at: Date.now(),
+              revoke_reason: null,
+              revoke_dispute_id: null,
+              revoke_prior_status: null,
+            };
+            stampLastEvent(rec, eventCreated);
+            try { await cancelDeletion(env, hex); } catch (e) {}
+            await env.KV.put(subKey, JSON.stringify(rec));
+          }
+        }
+      }
+    }
+  } else if (status === "lost") {
+    if (hex) {
+      var lostKey = "sub:" + hex;
+      var lostPrev = (await env.KV.get(lostKey, "json")) || {};
+      if (lostPrev.status && lostPrev.status !== "refunded" && !lostPrev.deleted) {
+        await applyStripeRevoke(env, dispute, eventCreated, "refund");
+        lostPrev = (await env.KV.get(lostKey, "json")) || lostPrev;
+      }
+      if (lostPrev.status === "refunded" && !lostPrev.deleted && !lostPrev.delete_at) {
+        if (!lostPrev.revoke_dispute_id || !disputeId || lostPrev.revoke_dispute_id === disputeId) {
+          var accessEndsAt = Date.now();
+          var deleteAt = addBusinessDays(accessEndsAt, 10);
+          lostPrev.delete_at = deleteAt;
+          lostPrev.cancel_pending = true;
+          lostPrev.ends_at = lostPrev.ends_at || new Date(accessEndsAt).toISOString();
+          stampLastEvent(lostPrev, eventCreated);
+          await env.KV.put(lostKey, JSON.stringify(lostPrev));
+          try {
+            await scheduleDeletion(env, hex, lostPrev.email, deleteAt, accessEndsAt);
+          } catch (e) {}
+        }
+      }
+    }
+  }
+  return { wrotePending: !!(refs.length || hex || disputeId) };
 }
 
 // Reject oversized webhook bodies before parsing. Stream with
@@ -1478,14 +1771,16 @@ async function readLimitedBody(request, maxBytes) {
     bytes.set(c, offset);
     offset += c.byteLength;
   });
-  return new TextDecoder("utf-8").decode(bytes);
+  return bytes;
 }
 
 // Verify the Stripe signature (current secret, then the previous one
 // during rotation), reject live events unless Tyler has allowed them,
 // then update entitlements. No CORS headers are added by the caller.
 // Bad signatures return 400. Empty event ids are rejected. Dedupe keys
-// use the stripe:evt: prefix and expire after 60 days.
+// use the stripe:evt: prefix and expire after 60 days. A transient
+// failure during processing skips that write and returns 5xx so
+// Stripe retries.
 // Read-then-write race: two deliveries of the same event can both see a
 // miss and both apply. The KV put is last-write-wins, and entitlement
 // writes are meant to be idempotent. A compare-and-swap is not available
@@ -1500,11 +1795,12 @@ async function handleStripeWebhook(request, env, cors) {
   }
 
   try {
-    var raw = await readLimitedBody(request, STRIPE_WEBHOOK_MAX_BYTES);
+    var rawBytes = await readLimitedBody(request, STRIPE_WEBHOOK_MAX_BYTES);
   } catch (e) {
     if (e && e.status === 413) return json({ error: "Payload too large." }, 413, cors);
     throw e;
   }
+  var raw = new TextDecoder("utf-8").decode(rawBytes);
 
   var sig = request.headers.get("Stripe-Signature");
   var secrets = [env.STRIPE_WEBHOOK_SECRET, env.STRIPE_WEBHOOK_SECRET_PREV]
@@ -1513,7 +1809,7 @@ async function handleStripeWebhook(request, env, cors) {
     .map(function (got) { return got.secret; });
   var signed = false;
   for (var i = 0; i < secrets.length; i++) {
-    if (await verifyStripeSignature(raw, sig, secrets[i])) {
+    if (await verifyStripeSignature(rawBytes, sig, secrets[i])) {
       signed = true;
       break;
     }
@@ -1548,42 +1844,75 @@ async function handleStripeWebhook(request, env, cors) {
   var type = String(event.type || "");
   var obj = (event.data && event.data.object) || {};
 
-  if (type === "checkout.session.completed" || type === "checkout.session.async_payment_succeeded") {
-    await applyStripeCheckoutSession(env, obj, eventCreated);
-  } else if (type === "checkout.session.async_payment_failed") {
-    // Neither grant nor revoke. An unpaid or still-pending session
-    // must not unlock Pro, and a failed async payment must not take
-    // away an already-active entitlement.
-  } else if (type === "customer.subscription.updated" || type === "customer.subscription.deleted") {
-    await applyStripeSubscription(env, obj, eventCreated, type);
-  } else if (type === "refund.created") {
-    try { console.log("stripe refund.created ignored"); } catch (e) {}
-  } else if (type === "charge.refunded") {
-    if (isFullStripeRefund(obj)) await applyStripeRevoke(env, obj, eventCreated, "refund");
-  } else if (type === "charge.dispute.created") {
-    await applyStripeRevoke(env, obj, eventCreated, "dispute");
-  } else if (type === "charge.dispute.closed") {
-    await applyStripeDisputeClosed(env, obj, eventCreated);
-  } else if (type === "invoice.paid" || type === "invoice.payment_succeeded") {
-    var hex = await hexFromStripeRefs(env, obj);
-    if (hex) {
-      await rememberStripeIds(env, hex, {
-        paymentIntent: stripeRefId(obj.payment_intent),
-        invoice: String(obj.id || ""),
-        charge: stripeRefId(obj.charge),
-        subscription: stripeRefId(obj.subscription),
-        customer: stripeRefId(obj.customer),
-      });
+  // Transient failures during processing (expand timeout, 5xx, 429,
+  // or network errors) must not write the dedupe key, so Stripe can
+  // retry. Only a completed apply, including a genuine price
+  // mismatch, returns 200 and records the event id.
+  try {
+    if (type === "checkout.session.completed" || type === "checkout.session.async_payment_succeeded") {
+      await applyStripeCheckoutSession(env, obj, eventCreated);
+    } else if (type === "checkout.session.async_payment_failed") {
+      // Neither grant nor revoke. An unpaid or still-pending session
+      // must not unlock Pro, and a failed async payment must not take
+      // away an already-active entitlement.
+    } else if (type === "customer.subscription.updated" || type === "customer.subscription.deleted") {
+      await applyStripeSubscription(env, obj, eventCreated, type);
+    } else if (type === "refund.created") {
+      try { console.log("stripe refund.created ignored"); } catch (e) {}
+    } else if (type === "charge.refunded") {
+      if (isFullStripeRefund(obj)) {
+        var refundKeys = await writeStripeRefundTombstones(env, obj);
+        await applyStripeRevoke(env, obj, eventCreated, "refund");
+        var refundHex = await hexFromStripeRevokeRefs(env, obj);
+        if (stripePendingNeedsRetry(obj, refundKeys) && !refundHex) {
+          var refundRetry = new Error("Could not process event. Try again.");
+          refundRetry.status = 500;
+          refundRetry.transient = true;
+          throw refundRetry;
+        }
+      }
+    } else if (type === "charge.dispute.created") {
+      var createdOut = await applyStripeDisputeCreated(env, obj, eventCreated);
+      if (!createdOut || !createdOut.wrotePending) {
+        var createdRetry = new Error("Could not process event. Try again.");
+        createdRetry.status = 500;
+        createdRetry.transient = true;
+        throw createdRetry;
+      }
+    } else if (type === "charge.dispute.closed") {
+      var closedOut = await applyStripeDisputeClosed(env, obj, eventCreated);
+      if (!closedOut || !closedOut.wrotePending) {
+        var closedRetry = new Error("Could not process event. Try again.");
+        closedRetry.status = 500;
+        closedRetry.transient = true;
+        throw closedRetry;
+      }
+    } else if (type === "invoice.paid" || type === "invoice.payment_succeeded") {
+      var hex = await hexFromStripeRefs(env, obj);
+      if (hex) {
+        await rememberStripeIds(env, hex, {
+          paymentIntent: stripeRefId(obj.payment_intent),
+          invoice: String(obj.id || ""),
+          charge: stripeRefId(obj.charge),
+          subscription: stripeRefId(obj.subscription),
+          customer: stripeRefId(obj.customer),
+        });
+      }
     }
-  }
-  // All other event types are acknowledged and ignored.
+    // All other event types are acknowledged and ignored.
 
-  await env.KV.put(
-    dedupeKey,
-    JSON.stringify({ at: Date.now() }),
-    { expirationTtl: STRIPE_EVENT_TTL_SEC }
-  );
-  return json({ received: true }, 200, cors);
+    await env.KV.put(
+      dedupeKey,
+      JSON.stringify({ at: Date.now() }),
+      { expirationTtl: STRIPE_EVENT_TTL_SEC }
+    );
+    return json({ received: true }, 200, cors);
+  } catch (e) {
+    try { console.log("stripe webhook processing failed"); } catch (ignore) {}
+    var status = Number(e && e.status) || 500;
+    if (status < 500 || status > 599) status = 500;
+    return json({ error: "Could not process event. Try again." }, status, cors);
+  }
 }
 
 // ---- identity / unlock logic ----

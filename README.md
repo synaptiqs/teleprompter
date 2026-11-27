@@ -157,6 +157,12 @@ Do this in your own Stripe account. Do not put any keys in the repo.
   during signing-secret rotation.
 - `STRIPE_PRICE_ID_MONTHLY`, `STRIPE_PRICE_ID_YEARLY` (or
   `STRIPE_PRICE_ID_ANNUAL`), `STRIPE_PRICE_ID_LIFETIME` (vars).
+- `STRIPE_PRICE_AMOUNT_MONTHLY`, `STRIPE_PRICE_AMOUNT_YEARLY` (or
+  `STRIPE_PRICE_AMOUNT_ANNUAL`), `STRIPE_PRICE_AMOUNT_LIFETIME`
+  (optional vars, integer cents). When set, a Checkout grant also
+  requires the session `amount_total` and line-item amount to match.
+  When unset, the grant still requires currency `usd` and quantity
+  `1`, but does not compare amounts.
 - `STRIPE_ALLOW_LIVE` (var, optional): only Tyler may set this to
   `true`. Without it, live `sk_live_` keys are refused.
 
