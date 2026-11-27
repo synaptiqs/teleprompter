@@ -40,13 +40,14 @@
  *
  *   POST /api/checkout          { origin, plan, token?, attribution? }
  *                               -> { url, token }
- *                               plan is "monthly" | "yearly" | "lifetime" |
- *                               "storage250" | "storage500" | "storage1000".
- *                               Storage plans are add-ons for existing
- *                               subscribers and need their unlock token.
- *                               Optional attribution is {source, medium,
- *                               campaign, content, term, referrer, landing,
- *                               ts}, each sanitized, for first-touch UTM
+ *                               plan is "monthly" | "yearly" | "lifetime".
+ *                               Lemon Squeezy also accepts storage add-on
+ *                               plans (storage250/500/1000) for existing
+ *                               subscribers; the Stripe path does not.
+ *                               Optional attribution is {utm_source,
+ *                               utm_medium, utm_campaign, utm_content,
+ *                               utm_term, referrer, landing, timestamp},
+ *                               each sanitized, for first-touch UTM
  *                               from a sibling branch. PAYMENT_PROVIDER
  *                               chooses the path (default lemonsqueezy):
  *                                 lemonsqueezy: hosted LS checkout; needs
@@ -93,9 +94,12 @@
  *                               checkout.session.async_payment_succeeded
  *                               (grant) and async_payment_failed (no
  *                               grant, no revoke). Refunds and disputes
- *                               (charge.refunded, refund.created,
+ *                               (full charge.refunded, and
  *                               charge.dispute.created) end Pro now, in
- *                               line with the refund policy. Live events
+ *                               line with the refund policy. Partial
+ *                               refunds keep access. A won
+ *                               charge.dispute.closed restores Pro when
+ *                               that dispute revoked it. Live events
  *                               are accepted only when the secret key is
  *                               sk_live_ and STRIPE_ALLOW_LIVE is the
  *                               exact string "true".
@@ -216,7 +220,6 @@
  *   STRIPE_WEBHOOK_SECRET_PREV (optional previous secret, for rotation),
  *   STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY (or _ANNUAL),
  *     STRIPE_PRICE_ID_LIFETIME (confirmed prices $3.99 / $29 / $59),
- *   STRIPE_PRICE_ID_STORAGE_250 / _500 / _1000 (optional add-ons),
  *   STRIPE_ALLOW_LIVE (optional; only Tyler may set this to "true"),
  *   EMAIL_API_KEY + EMAIL_FROM (optional; without them, deletion emails
  *     are logged to KV instead of sent — wire a provider before launch)
@@ -653,18 +656,30 @@ function readStripeSecretKey(env) {
   return { key: stripped, hiddenChars: stripped !== trimmed };
 }
 
+// Classify the secret: sk_live_/rk_live_ are live, sk_test_/rk_test_
+// are test, and any other prefix is invalid and fails closed.
+function stripeKeyMode(env) {
+  var got = readStripeSecretKey(env);
+  if (got.hiddenChars || !got.key) return "invalid";
+  if (got.key.indexOf("sk_live_") === 0 || got.key.indexOf("rk_live_") === 0) return "live";
+  if (got.key.indexOf("sk_test_") === 0 || got.key.indexOf("rk_test_") === 0) return "test";
+  return "invalid";
+}
+
 // Refuse to call Stripe if the secret is a live key, unless Tyler has
-// explicitly set STRIPE_ALLOW_LIVE=true. The key itself is never logged
-// or returned in an error. A live-key refusal is warned with no value.
+// explicitly set STRIPE_ALLOW_LIVE=true. Unknown prefixes and hidden
+// characters fail closed. The key itself is never logged or returned
+// in an error. A live-key refusal is warned with no value.
 function assertStripeTestMode(env) {
   var got = readStripeSecretKey(env);
-  if (!got.key || got.hiddenChars) {
+  var mode = stripeKeyMode(env);
+  if (mode === "invalid") {
     if (got.hiddenChars) {
       try { console.warn("stripe secret key refused"); } catch (e) {}
     }
     throw ApiError(503, "Checkout is not configured yet.");
   }
-  if (got.key.indexOf("sk_test_") !== 0 && !stripeAllowLive(env)) {
+  if (mode === "live" && !stripeAllowLive(env)) {
     try { console.warn("stripe live key refused"); } catch (e) {}
     throw ApiError(
       503,
@@ -679,22 +694,32 @@ function stripeAllowLive(env) {
 }
 
 function stripeKeyIsLive(env) {
-  var got = readStripeSecretKey(env);
-  if (got.hiddenChars || !got.key) return false;
-  return got.key.indexOf("sk_live_") === 0;
+  return stripeKeyMode(env) === "live";
+}
+
+// Read a webhook signing secret, trimming whitespace and dropping
+// zero-width characters. Hidden characters fail closed.
+function readStripeWebhookSecret(secret) {
+  var trimmed = String(secret || "").trim();
+  var stripped = trimmed.replace(STRIPE_ZERO_WIDTH, "");
+  return { secret: stripped, hiddenChars: stripped !== trimmed };
 }
 
 function stripeWebhookSecretOk(secret) {
-  return String(secret || "").trim().indexOf("whsec_") === 0;
+  var got = readStripeWebhookSecret(secret);
+  if (got.hiddenChars || !got.secret) return false;
+  return got.secret.indexOf("whsec_") === 0;
 }
 
-// A live event is accepted only when the secret key is sk_live_ and
-// Tyler has set STRIPE_ALLOW_LIVE to the exact string "true". A test
-// event (livemode false) is required when the key is sk_test_, and is
-// refused when the key is sk_live_.
+// A live event is accepted only when the secret key is live
+// (sk_live_ or rk_live_) and Tyler has set STRIPE_ALLOW_LIVE to the
+// exact string "true". A test event (livemode false) is required when
+// the key is sk_test_ or rk_test_. Any other key mode fails closed.
 function stripeLivemodeAllowed(env, livemode) {
-  if (livemode === true) return stripeKeyIsLive(env) && stripeAllowLive(env);
-  if (livemode === false) return !stripeKeyIsLive(env);
+  var mode = stripeKeyMode(env);
+  if (mode === "invalid") return false;
+  if (livemode === true) return mode === "live" && stripeAllowLive(env);
+  if (livemode === false) return mode === "test";
   return false;
 }
 
@@ -712,6 +737,8 @@ function stripeReturnOrigin(origin) {
   return "https://clickprompt.app";
 }
 
+// Encode Checkout Session fields as application/x-www-form-urlencoded
+// for the Stripe REST API. Empty values are omitted.
 function stripeForm(params) {
   var body = new URLSearchParams();
   Object.keys(params).forEach(function (k) {
@@ -798,6 +825,8 @@ async function stripeRequest(secret, method, path, formBody, idempotencyKey) {
   return data;
 }
 
+// HMAC-SHA-256 of a message, returned as lowercase hex. Used to
+// verify the Stripe-Signature header.
 async function hmacSha256Hex(secret, message) {
   var key = await crypto.subtle.importKey(
     "raw",
@@ -908,6 +937,11 @@ async function emailForUnlockToken(env, token) {
   return clean((rec && rec.email) || "", 120);
 }
 
+// Build and send a Stripe Checkout Session for an exact plan
+// (monthly, yearly, or lifetime). Test mode is required unless
+// Tyler sets STRIPE_ALLOW_LIVE to the exact string "true". Client
+// errors stay generic; Stripe's message is logged server-side
+// without the secret or the request body.
 async function doStripeCheckout(env, origin, plan, existingToken, attribution) {
   var secret = assertStripeTestMode(env);
   origin = stripeReturnOrigin(origin);
@@ -999,6 +1033,10 @@ function stripeRefId(value) {
   return "";
 }
 
+// Look up our unlock hex from IDs on a Stripe object (payment_intent,
+// charge, invoice, subscription, session, or customer). Used for
+// non-revoke events such as invoice.paid. Customer mappings are
+// stored but are not used to revoke access.
 async function hexFromStripeRefs(env, obj) {
   if (!env.KV || !obj) return null;
   var meta = obj.metadata || {};
@@ -1024,6 +1062,40 @@ async function hexFromStripeRefs(env, obj) {
   return null;
 }
 
+// Look up our unlock hex for a refund or dispute. Only charge,
+// payment_intent, session, and subscription mappings are used.
+// Customer id is never authoritative for a revoke, so two purchases
+// on the same customer cannot revoke each other.
+async function hexFromStripeRevokeRefs(env, obj) {
+  if (!env.KV || !obj) return null;
+  var keys = [];
+  var pi = stripeRefId(obj.payment_intent);
+  var ch = stripeRefId(obj.charge) || (obj.object === "charge" ? String(obj.id || "") : "");
+  var sub = stripeRefId(obj.subscription);
+  var sess = stripeRefId(obj.checkout_session) || (obj.object === "checkout.session" ? String(obj.id || "") : "");
+  if (pi) keys.push("stripepi:" + pi);
+  if (ch) keys.push("stripecharge:" + ch);
+  if (sess) keys.push("stripesession:" + sess);
+  if (sub) keys.push("stripesub:" + sub);
+  for (var i = 0; i < keys.length; i++) {
+    var found = await env.KV.get(keys[i]);
+    if (found) return found;
+  }
+  return null;
+}
+
+// A full refund is a charge with refunded === true, or with
+// amount_refunded at least as large as amount. Partial refunds
+// keep access.
+function isFullStripeRefund(charge) {
+  if (!charge) return false;
+  if (charge.refunded === true) return true;
+  var amount = Number(charge.amount);
+  var refunded = Number(charge.amount_refunded);
+  if (!isFinite(amount) || !isFinite(refunded) || amount <= 0) return false;
+  return refunded >= amount;
+}
+
 async function hexFromStripeSubscription(env, sub, metadata) {
   var meta = metadata || (sub && sub.metadata) || {};
   var customToken = meta.unlock_token;
@@ -1047,14 +1119,37 @@ function isSubscriberRecord(rec) {
 
 // Ignore an event whose Stripe created timestamp is older than the
 // last applied event on this subscription, and ignore grants after
-// the identity has been deleted.
-function shouldIgnoreOlderEvent(prev, eventCreated) {
+// the identity has been deleted. Events that would clear a cancel
+// or restore access also lose on a created-timestamp tie, so a
+// revoke at the same second wins.
+function shouldIgnoreOlderEvent(prev, eventCreated, restoresAccess) {
   if (!prev) return false;
   if (prev.deleted) return true;
   var last = Number(prev.last_event_created) || 0;
   var incoming = Number(eventCreated) || 0;
-  if (last && incoming && incoming < last) return true;
+  if (!last || !incoming) return false;
+  if (restoresAccess) return incoming <= last;
+  return incoming < last;
+}
+
+// A full refund, an open or lost dispute, or a deleted subscription
+// is terminal. A later subscription.updated must not restore Pro
+// unless the subscription id is genuinely new.
+function stripeRecordIsTerminal(prev) {
+  if (!prev) return false;
+  if (prev.subscription_deleted) return true;
+  if (prev.status === "refunded" && (prev.revoke_reason === "refund" || prev.revoke_reason === "dispute")) {
+    return true;
+  }
   return false;
+}
+
+function isNewStripeSubscription(prev, sub) {
+  var incoming = String((sub && sub.id) || "");
+  if (!incoming) return false;
+  var prevId = String((prev && prev.stripe_subscription_id) || "");
+  if (!prevId) return true;
+  return incoming !== prevId;
 }
 
 function stampLastEvent(rec, eventCreated) {
@@ -1071,7 +1166,7 @@ function shouldSkipCheckoutGrant(prev, eventCreated) {
   if (prev.status === "cancelled" || prev.status === "expired" || prev.status === "refunded" || prev.cancel_pending) {
     return true;
   }
-  return shouldIgnoreOlderEvent(prev, eventCreated);
+  return shouldIgnoreOlderEvent(prev, eventCreated, true);
 }
 
 function storagePlanGb(plan, storageGb) {
@@ -1085,14 +1180,19 @@ function storagePlanGb(plan, storageGb) {
 // Squeezy uses, so resolveUnlock / cancel-keeps-Pro / deletion all work
 // unchanged. Stripe spells it "canceled"; we store "cancelled".
 // Subscription updated/deleted events are the source of truth for status.
-async function applyStripeSubscription(env, sub, eventCreated) {
+async function applyStripeSubscription(env, sub, eventCreated, eventType) {
   if (!env.KV || !sub) return;
   var hex = await hexFromStripeSubscription(env, sub, sub.metadata);
   if (!hex) return;
   var subKey = "sub:" + hex;
   var prev = (await env.KV.get(subKey, "json")) || {};
-  if (shouldIgnoreOlderEvent(prev, eventCreated)) return;
+  if (prev.deleted) return;
   var effectiveStatus = stripeStatusFromSubscription(sub);
+  var isDeletedEvent = eventType === "customer.subscription.deleted";
+  var isCancel = isDeletedEvent || effectiveStatus === "cancelled" || effectiveStatus === "expired";
+  var wouldRestore = !isCancel;
+  if (stripeRecordIsTerminal(prev) && !isNewStripeSubscription(prev, sub)) return;
+  if (shouldIgnoreOlderEvent(prev, eventCreated, wouldRestore)) return;
   var rec = {
     status: effectiveStatus,
     ls_subscription_id: prev.ls_subscription_id || null,
@@ -1105,10 +1205,12 @@ async function applyStripeSubscription(env, sub, eventCreated) {
     source: prev.source || "stripe",
     provider: "stripe",
     updated_at: Date.now(),
+    subscription_deleted: isDeletedEvent ? true : false,
+    revoke_reason: null,
+    revoke_dispute_id: null,
   };
   stampLastEvent(rec, eventCreated);
   var wasActive = !prev.cancel_pending && (prev.status === "active" || prev.status === "on_trial" || !prev.status);
-  var isCancel = effectiveStatus === "cancelled" || effectiveStatus === "expired";
   if (isCancel && wasActive) {
     var accessEndsAt = Math.max(Date.now(), Date.parse(rec.ends_at || "") || 0);
     var deleteAt = addBusinessDays(accessEndsAt, 10);
@@ -1130,17 +1232,62 @@ async function applyStripeSubscription(env, sub, eventCreated) {
   }
 }
 
+// Collect price ids from an expanded line_items list. Returns null
+// when the list is missing so the caller can fetch it.
+function stripeSessionPriceIds(session) {
+  if (!session || !session.line_items || !Array.isArray(session.line_items.data)) return null;
+  var ids = [];
+  session.line_items.data.forEach(function (item) {
+    var price = item && item.price;
+    var id = typeof price === "string" ? price : (price && price.id) || "";
+    if (id) ids.push(String(id));
+  });
+  return ids;
+}
+
+// True when every line-item price id matches the env catalog price
+// for the given plan. Unknown or mismatched prices grant nothing.
+function stripePricesMatchPlan(env, plan, priceIds) {
+  if (!isStripeCheckoutPlan(plan) || !priceIds || !priceIds.length) return false;
+  var expected = planPriceId(env, plan);
+  if (!expected) return false;
+  for (var i = 0; i < priceIds.length; i++) {
+    if (priceIds[i] !== expected) return false;
+  }
+  return true;
+}
+
+async function resolveStripeSessionPriceIds(env, session) {
+  var ids = stripeSessionPriceIds(session);
+  if (ids) return ids;
+  var sid = session && session.id;
+  if (!sid) return [];
+  try {
+    var got = readStripeSecretKey(env);
+    if (got.hiddenChars || !got.key) return [];
+    var path = "/checkout/sessions/" + encodeURIComponent(sid) + "?expand[]=line_items";
+    var expanded = await stripeRequest(got.key, "GET", path);
+    return stripeSessionPriceIds(expanded) || [];
+  } catch (e) {
+    try { console.log("stripe session expand failed"); } catch (ignore) {}
+    return [];
+  }
+}
+
 // Grant Pro from a Checkout Session only when payment_status is exactly
-// "paid" or "no_payment_required". Lifetime is granted only when
-// metadata.plan is "lifetime". Storage add-ons apply only when plan and
-// storage_gb are a valid pair, and never overwrite a subscriber record
-// with a lifetime grant.
+// "paid" or "no_payment_required", metadata.plan is a catalog plan, and
+// every line-item price id matches the env price for that plan. Lifetime
+// is granted only when metadata.plan is "lifetime", and a subscriber
+// record is never overwritten by a lifetime grant.
 async function applyStripeCheckoutSession(env, session, eventCreated) {
   if (!env.KV || !session) return;
   if (session.payment_status !== "paid" && session.payment_status !== "no_payment_required") {
     return;
   }
   var meta = session.metadata || {};
+  var plan = String(meta.plan || "");
+  var priceIds = await resolveStripeSessionPriceIds(env, session);
+  if (!stripePricesMatchPlan(env, plan, priceIds)) return;
   var token = meta.unlock_token || session.client_reference_id || "";
   var email = clean(
     ((session.customer_details && session.customer_details.email) || session.customer_email || ""),
@@ -1187,24 +1334,13 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
   }
 
   if (session.mode === "payment") {
-    var plan = String(meta.plan || "");
-    var storageGb = storagePlanGb(plan, meta.storage_gb);
-    var lifetimeOk = plan === "lifetime";
-    if (!storageGb && !lifetimeOk) return;
+    if (plan !== "lifetime") return;
     var payHex = stripeSubHex(token);
     if (!payHex) return;
     await rememberStripeIds(env, payHex, ids);
     var orderSubKey = "sub:" + payHex;
     var orderPrev = (await env.KV.get(orderSubKey, "json")) || {};
     if (shouldSkipCheckoutGrant(orderPrev, eventCreated)) return;
-    if (storageGb) {
-      var newTier = Math.min(1000, Math.max(Number(orderPrev.storage_tier_gb) || 100, storageGb));
-      orderPrev.storage_tier_gb = newTier;
-      orderPrev.provider = orderPrev.provider || "stripe";
-      stampLastEvent(orderPrev, eventCreated);
-      await env.KV.put(orderSubKey, JSON.stringify(orderPrev));
-      return;
-    }
     if (isSubscriberRecord(orderPrev)) return;
     var lifeRec = {
       status: "lifetime",
@@ -1220,17 +1356,18 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
   }
 }
 
-// A refund or dispute ends Pro for that purchase now, matching the
-// refund policy. Saved data then follows the 10-business-day deletion
-// schedule. This does not wait for the paid period to end.
-async function applyStripeRevoke(env, obj, eventCreated) {
+// A full refund or an open dispute ends Pro for that purchase now,
+// matching the refund policy. Saved data then follows the
+// 10-business-day deletion schedule. This does not wait for the paid
+// period to end. Partial refunds do not call this.
+async function applyStripeRevoke(env, obj, eventCreated, reason) {
   if (!env.KV || !obj) return;
-  var hex = await hexFromStripeRefs(env, obj);
+  var hex = await hexFromStripeRevokeRefs(env, obj);
   if (!hex) return;
   var subKey = "sub:" + hex;
   var prev = (await env.KV.get(subKey, "json")) || {};
   if (!prev.status || prev.status === "refunded" || prev.deleted) return;
-  if (shouldIgnoreOlderEvent(prev, eventCreated)) return;
+  if (shouldIgnoreOlderEvent(prev, eventCreated, false)) return;
   var accessEndsAt = Date.now();
   var deleteAt = addBusinessDays(accessEndsAt, 10);
   var rec = {
@@ -1246,12 +1383,102 @@ async function applyStripeRevoke(env, obj, eventCreated) {
     source: prev.source || "stripe",
     provider: prev.provider || "stripe",
     updated_at: Date.now(),
+    revoke_reason: reason || "refund",
+    revoke_dispute_id: reason === "dispute" ? String(obj.id || prev.revoke_dispute_id || "") || null : null,
+    revoke_prior_status: prev.status,
   };
   stampLastEvent(rec, eventCreated);
   await env.KV.put(subKey, JSON.stringify(rec));
   try {
     await scheduleDeletion(env, hex, rec.email, deleteAt, accessEndsAt);
   } catch (e) {}
+}
+
+// A won dispute restores Pro only when this record was revoked by
+// that same dispute. Lost or warning-closed disputes leave access
+// ended.
+async function applyStripeDisputeClosed(env, dispute, eventCreated) {
+  if (!env.KV || !dispute) return;
+  if (String(dispute.status || "") !== "won") return;
+  var hex = await hexFromStripeRevokeRefs(env, dispute);
+  if (!hex) return;
+  var subKey = "sub:" + hex;
+  var prev = (await env.KV.get(subKey, "json")) || {};
+  if (prev.deleted) return;
+  if (prev.revoke_reason !== "dispute") return;
+  var disputeId = String(dispute.id || "");
+  if (prev.revoke_dispute_id && disputeId && prev.revoke_dispute_id !== disputeId) return;
+  if (shouldIgnoreOlderEvent(prev, eventCreated, true)) return;
+  var rec = {
+    status: prev.revoke_prior_status || (prev.stripe_subscription_id ? "active" : "lifetime"),
+    ls_subscription_id: prev.ls_subscription_id || null,
+    stripe_subscription_id: prev.stripe_subscription_id || null,
+    stripe_session_id: prev.stripe_session_id || null,
+    email: prev.email || null,
+    storage_tier_gb: prev.storage_tier_gb || 100,
+    cancel_pending: false,
+    ends_at: prev.revoke_prior_status === "lifetime" ? null : prev.ends_at || null,
+    delete_at: null,
+    source: prev.source || "stripe",
+    provider: prev.provider || "stripe",
+    updated_at: Date.now(),
+    revoke_reason: null,
+    revoke_dispute_id: null,
+    revoke_prior_status: null,
+  };
+  stampLastEvent(rec, eventCreated);
+  try { await cancelDeletion(env, hex); } catch (e) {}
+  await env.KV.put(subKey, JSON.stringify(rec));
+}
+
+// Reject oversized webhook bodies before parsing. Stream with
+// getReader(), count bytes, and cancel as soon as the total exceeds
+// maxBytes, even if Content-Length is missing or lies.
+async function readLimitedBody(request, maxBytes) {
+  function tooBig() {
+    var err = new Error("Payload too large.");
+    err.status = 413;
+    return err;
+  }
+  var len = request.headers.get("Content-Length");
+  if (len !== null && len !== "" && /^\d+$/.test(String(len).trim()) && Number(len) > maxBytes) {
+    if (request.body && typeof request.body.cancel === "function") {
+      try { await request.body.cancel(); } catch (e) {}
+    }
+    throw tooBig();
+  }
+
+  var reader = request.body && typeof request.body.getReader === "function"
+    ? request.body.getReader()
+    : null;
+  var chunks = [];
+  var total = 0;
+  if (reader) {
+    while (true) {
+      var step = await reader.read();
+      if (step.done) break;
+      var value = step.value || new Uint8Array(0);
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch (e) {}
+        throw tooBig();
+      }
+      chunks.push(value);
+    }
+  } else {
+    var buf = await request.arrayBuffer();
+    if (buf.byteLength > maxBytes) throw tooBig();
+    chunks.push(new Uint8Array(buf));
+    total = buf.byteLength;
+  }
+
+  var bytes = new Uint8Array(total);
+  var offset = 0;
+  chunks.forEach(function (c) {
+    bytes.set(c, offset);
+    offset += c.byteLength;
+  });
+  return new TextDecoder("utf-8").decode(bytes);
 }
 
 // Verify the Stripe signature (current secret, then the previous one
@@ -1266,23 +1493,27 @@ async function applyStripeRevoke(env, obj, eventCreated) {
 async function handleStripeWebhook(request, env, cors) {
   cors = cors || {};
   if (!stripeWebhookSecretOk(env.STRIPE_WEBHOOK_SECRET)) {
-    return json({ error: "Webhook is not configured yet." }, 503, cors);
+    return json({ error: "STRIPE_WEBHOOK_SECRET is missing or invalid." }, 503, cors);
+  }
+  if (stripeKeyMode(env) === "invalid") {
+    return json({ error: "Checkout is not configured yet." }, 503, cors);
   }
 
-  var declared = Number(request.headers.get("Content-Length") || 0);
-  if (declared > STRIPE_WEBHOOK_MAX_BYTES) {
-    return json({ error: "Payload too large." }, 413, cors);
-  }
-  var raw = await request.text();
-  if (new TextEncoder().encode(raw).length > STRIPE_WEBHOOK_MAX_BYTES) {
-    return json({ error: "Payload too large." }, 413, cors);
+  try {
+    var raw = await readLimitedBody(request, STRIPE_WEBHOOK_MAX_BYTES);
+  } catch (e) {
+    if (e && e.status === 413) return json({ error: "Payload too large." }, 413, cors);
+    throw e;
   }
 
   var sig = request.headers.get("Stripe-Signature");
-  var secrets = [env.STRIPE_WEBHOOK_SECRET, env.STRIPE_WEBHOOK_SECRET_PREV].filter(stripeWebhookSecretOk);
+  var secrets = [env.STRIPE_WEBHOOK_SECRET, env.STRIPE_WEBHOOK_SECRET_PREV]
+    .map(readStripeWebhookSecret)
+    .filter(function (got) { return !got.hiddenChars && got.secret.indexOf("whsec_") === 0; })
+    .map(function (got) { return got.secret; });
   var signed = false;
   for (var i = 0; i < secrets.length; i++) {
-    if (await verifyStripeSignature(raw, sig, String(secrets[i]).trim())) {
+    if (await verifyStripeSignature(raw, sig, secrets[i])) {
       signed = true;
       break;
     }
@@ -1301,6 +1532,10 @@ async function handleStripeWebhook(request, env, cors) {
   if (!eventId) {
     return json({ error: "Missing event id." }, 400, cors);
   }
+  var eventCreated = Number(event && event.created);
+  if (!isFinite(eventCreated) || eventCreated <= 0) {
+    return json({ error: "Missing event created." }, 400, cors);
+  }
   if (!stripeLivemodeAllowed(env, event.livemode)) {
     return json({ error: "Event mode is not allowed." }, 400, cors);
   }
@@ -1314,15 +1549,21 @@ async function handleStripeWebhook(request, env, cors) {
   var obj = (event.data && event.data.object) || {};
 
   if (type === "checkout.session.completed" || type === "checkout.session.async_payment_succeeded") {
-    await applyStripeCheckoutSession(env, obj, event.created);
+    await applyStripeCheckoutSession(env, obj, eventCreated);
   } else if (type === "checkout.session.async_payment_failed") {
     // Neither grant nor revoke. An unpaid or still-pending session
     // must not unlock Pro, and a failed async payment must not take
     // away an already-active entitlement.
   } else if (type === "customer.subscription.updated" || type === "customer.subscription.deleted") {
-    await applyStripeSubscription(env, obj, event.created);
-  } else if (type === "charge.refunded" || type === "refund.created" || type === "charge.dispute.created") {
-    await applyStripeRevoke(env, obj, event.created);
+    await applyStripeSubscription(env, obj, eventCreated, type);
+  } else if (type === "refund.created") {
+    try { console.log("stripe refund.created ignored"); } catch (e) {}
+  } else if (type === "charge.refunded") {
+    if (isFullStripeRefund(obj)) await applyStripeRevoke(env, obj, eventCreated, "refund");
+  } else if (type === "charge.dispute.created") {
+    await applyStripeRevoke(env, obj, eventCreated, "dispute");
+  } else if (type === "charge.dispute.closed") {
+    await applyStripeDisputeClosed(env, obj, eventCreated);
   } else if (type === "invoice.paid" || type === "invoice.payment_succeeded") {
     var hex = await hexFromStripeRefs(env, obj);
     if (hex) {
@@ -2559,13 +2800,15 @@ async function handleGenerate(request, env, cors) {
 }
 
 async function handleCheckout(request, env, cors) {
-  // Creates a hosted checkout for the requested plan (monthly, yearly,
-  // lifetime, or a storage add-on) and returns the URL plus the opaque
-  // unlock token. PAYMENT_PROVIDER selects Lemon Squeezy (default) or
-  // Stripe. The frontend stores the token BEFORE redirecting; the
-  // webhook matches it back via custom_data / metadata. Storage add-ons
-  // pass the subscriber's existing token so the quota lands on their
-  // identity. Optional body.attribution is stored on the checkout.
+  // Creates a hosted checkout for monthly, yearly, or lifetime and
+  // returns the URL plus the opaque unlock token. PAYMENT_PROVIDER
+  // selects Lemon Squeezy (default) or Stripe. The frontend stores
+  // the token BEFORE redirecting; the webhook matches it back via
+  // custom_data / metadata. Lemon Squeezy also accepts storage
+  // add-on plans, which pass the subscriber's existing token so the
+  // quota lands on their identity. The Stripe path does not offer
+  // storage add-ons. Optional body.attribution is stored on the
+  // checkout.
   var body = {};
   try {
     body = await request.json();

@@ -105,9 +105,10 @@ paths:
         The PAYMENT_PROVIDER worker var selects the path: lemonsqueezy
         (default) or stripe. The agent must keep the token: the verified
         webhook matches it back via custom_data or metadata, and the agent
-        polls /api/me with it. Optional attribution (source, medium,
-        campaign, content, term, referrer, landing, ts) is stored on the
-        checkout when present. The user pays in their browser.
+        polls /api/me with it. Optional attribution (utm_source,
+        utm_medium, utm_campaign, utm_content, utm_term, referrer,
+        landing, timestamp) is stored on the checkout when present. The
+        user pays in their browser.
         Returns 503 until the active provider is configured on the worker.
       requestBody:
         required: false
@@ -126,10 +127,10 @@ paths:
                   description: Plan to check out ($3.99/mo, $29/yr, or $59 one-time).
                 token:
                   type: string
-                  description: Existing unlock token, required for storage add-on plans.
+                  description: Existing unlock token. Required for Lemon Squeezy storage add-on plans. On the Stripe path it only prefills a known email.
                 attribution:
                   type: object
-                  description: Optional first-touch UTM fields stored on the checkout.
+                  description: Optional first-touch UTM fields stored on the checkout (utm_source, utm_medium, utm_campaign, utm_content, utm_term, referrer, landing, timestamp).
       responses:
         '200':
           description: Checkout created.
@@ -160,11 +161,15 @@ paths:
         STRIPE_WEBHOOK_SECRET, and STRIPE_WEBHOOK_SECRET_PREV during
         rotation. Grants Pro from checkout.session.completed and
         checkout.session.async_payment_succeeded when payment_status is
-        paid or no_payment_required. customer.subscription.updated and
+        paid or no_payment_required, and the line-item price matches the
+        env catalog for metadata.plan. customer.subscription.updated and
         customer.subscription.deleted are the source of truth for
-        subscription status. charge.refunded, refund.created, and
-        charge.dispute.created end Pro immediately. Live events are
-        accepted only when STRIPE_SECRET_KEY is sk_live_ and
+        subscription status. A full charge.refunded, or
+        charge.dispute.created, ends Pro immediately. Partial refunds
+        keep access. charge.dispute.closed with status won restores Pro
+        only when that dispute revoked it. Pin the endpoint API version
+        to 2025-03-31.basil. Live events are accepted only when
+        STRIPE_SECRET_KEY is a live key (sk_live_ or rk_live_) and
         STRIPE_ALLOW_LIVE is the exact string "true".
       requestBody:
         required: true

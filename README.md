@@ -122,20 +122,30 @@ Do this in your own Stripe account. Do not put any keys in the repo.
      into `STRIPE_PRICE_ID_YEARLY`.
    - ClickPrompt Pro Lifetime: $59, one-time. Copy the Price ID into
      `STRIPE_PRICE_ID_LIFETIME`.
-3. Optional storage add-ons (one-time), if you still want them: create
-   prices and set `STRIPE_PRICE_ID_STORAGE_250`,
-   `STRIPE_PRICE_ID_STORAGE_500`, and `STRIPE_PRICE_ID_STORAGE_1000`.
-4. Open **Developers > API keys** and copy the **test** secret key
-   (`sk_test_...`). This is `STRIPE_SECRET_KEY`. Never commit it. A key
-   that does not start with `sk_test_` is refused unless
-   `STRIPE_ALLOW_LIVE=true`. Only Tyler sets that flag, and only when
-   he is ready to take Stripe live.
-5. After the Worker with this code is uploaded (a later, separate step
+3. Open **Developers > API keys** and copy the **test** secret key
+   (`sk_test_...`). This is `STRIPE_SECRET_KEY`. Never commit it.
+   `sk_test_` and `rk_test_` keys are test mode. `sk_live_` and
+   `rk_live_` keys are live and are refused unless
+   `STRIPE_ALLOW_LIVE=true`. Any other prefix fails closed. Only Tyler
+   sets that flag, and only when he is ready to take Stripe live.
+4. After the Worker with this code is uploaded (a later, separate step
    that also needs Tyler's OK), add a webhook in **Developers >
    Webhooks** for the test endpoint:
    `https://teleprompter-script-api.synaptiqs.workers.dev/api/stripe-webhook`.
-   Listen for `checkout.session.completed`,
-   `customer.subscription.updated`, and `customer.subscription.deleted`.
+   Pin the endpoint API version to `2025-03-31.basil`. Subscribe to
+   these events:
+
+   - `checkout.session.completed`
+   - `checkout.session.async_payment_succeeded`
+   - `checkout.session.async_payment_failed`
+   - `customer.subscription.updated`
+   - `customer.subscription.deleted`
+   - `charge.refunded`
+   - `charge.dispute.created`
+   - `charge.dispute.closed`
+   - `invoice.paid`
+   - `invoice.payment_succeeded`
+
    Copy the signing secret (`whsec_...`) into `STRIPE_WEBHOOK_SECRET`.
 
 ### Worker vars and secrets (set on the Worker, not in git)
@@ -151,10 +161,11 @@ Do this in your own Stripe account. Do not put any keys in the repo.
   `true`. Without it, live `sk_live_` keys are refused.
 
 `POST /api/checkout` accepts an optional `attribution` object
-(`source`, `medium`, `campaign`, `content`, `term`, `referrer`,
-`landing`, `ts`). Each value is sanitized to printable ASCII and, on
-the Stripe path, stored in Checkout Session metadata as `attr_*` keys
-so a later UTM-attribution change can merge cleanly.
+(`utm_source`, `utm_medium`, `utm_campaign`, `utm_content`,
+`utm_term`, `referrer`, `landing`, `timestamp`). UTM values may only
+use `[A-Za-z0-9_.:/-]`. On the Stripe path, values are stored in
+Checkout Session metadata as `attr_*` keys. Unifying this sanitizer
+with the UTM-attribution helper is deferred until that PR merges.
 
 ### Entitlements
 
@@ -164,8 +175,6 @@ Stripe webhooks write the same KV records as Lemon Squeezy:
   `status: "active"`.
 - `checkout.session.completed` for a lifetime (one-time) payment sets
   `status: "lifetime"`.
-- Storage add-on payments raise `storage_tier_gb` on the existing
-  identity instead of minting a new one.
 - `customer.subscription.updated` and `customer.subscription.deleted`
   keep that record in sync. A cancel keeps Pro until
   `current_period_end` (stored as `ends_at`), then the same
