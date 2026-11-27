@@ -97,9 +97,15 @@
  *                               (full charge.refunded, and
  *                               charge.dispute.created) end Pro now, in
  *                               line with the refund policy. Partial
- *                               refunds keep access. A won
- *                               charge.dispute.closed restores Pro when
- *                               that dispute revoked it. Live events
+ *                               refunds keep access. A won or
+ *                               warning_closed charge.dispute.closed
+ *                               restores Pro when that dispute revoked
+ *                               it, or applies a deferred checkout grant
+ *                               if the paid session was skipped because
+ *                               the dispute was already open. Any other
+ *                               closed status, including lost or an
+ *                               unknown value, leaves access ended and
+ *                               starts the deletion clock. Live events
  *                               are accepted only when the secret key is
  *                               sk_live_ and STRIPE_ALLOW_LIVE is the
  *                               exact string "true".
@@ -1029,6 +1035,11 @@ async function rememberStripeIds(env, hex, ids) {
   if (ids.customer) await env.KV.put("stripecust:" + ids.customer, hex);
   if (ids.invoice) await env.KV.put("stripeinv:" + ids.invoice, hex);
   if (ids.charge) await env.KV.put("stripecharge:" + ids.charge, hex);
+  // Remember payment_intent for an invoice so a later charge.refunded
+  // that only carries the invoice id can still tombstone the PI.
+  if (ids.invoice && ids.paymentIntent) {
+    await env.KV.put("stripe:invpi:" + ids.invoice, ids.paymentIntent);
+  }
 }
 
 function stripeRefId(value) {
@@ -1093,7 +1104,10 @@ async function hexFromStripeRevokeRefs(env, obj) {
 
 // A full refund is a charge with refunded === true, or with
 // amount_refunded at least as large as amount. Partial refunds
-// keep access.
+// keep access. When currency is present it must be usd. When
+// currency is missing and amount fields are present, those
+// amounts are compared as usd. When currency and amount fields
+// are all missing, refunded === true is still enough to revoke.
 function isFullStripeRefund(charge) {
   if (!charge) return false;
   var currency = String(charge.currency || "").toLowerCase();
@@ -1125,21 +1139,12 @@ async function hexFromStripeSubscription(env, sub, metadata) {
     });
     return existing;
   }
-  if (!hex) return null;
-  var prev = (env.KV && (await env.KV.get("sub:" + hex, "json"))) || {};
-  // A terminal record must not gain a new stripesub binding from
-  // subscription.updated. Only a paid checkout.session.completed that
-  // already passed payment and catalog checks may bind a new id.
-  if (prev.deleted || stripeRecordIsTerminal(prev)) return hex;
-  var bound = await bindStripeSub(env, stripeSubId, hex);
-  if (bound) {
-    await rememberStripeIds(env, bound, {
-      subscription: stripeSubId,
-      customer: stripeRefId(sub && sub.customer),
-    });
-    return bound;
-  }
-  return null;
+  // Do not bind a new stripesub:<id> here. Only a paid checkout
+  // that already passed payment and catalog checks may create
+  // that mapping. Return the token hex so a later paid bind, or
+  // a cancel/delete against an existing record, can still find
+  // the identity.
+  return hex || null;
 }
 
 function isSubscriberRecord(rec) {
@@ -1212,15 +1217,40 @@ function shouldSkipCheckoutGrant(prev, eventCreated) {
 // Subscription updated/deleted events are the source of truth for status.
 async function applyStripeSubscription(env, sub, eventCreated, eventType) {
   if (!env.KV || !sub) return;
+  var stripeSubId = String((sub && sub.id) || "");
+  var isDeletedEvent = eventType === "customer.subscription.deleted";
+  // Even when no sub: record exists yet, a deleted subscription id
+  // is tombstoned so a later checkout or subscription grant for
+  // this id is skipped.
+  if (isDeletedEvent && stripeSubId) {
+    await env.KV.put(
+      "stripe:deleted:" + stripeSubId,
+      JSON.stringify({ at: Date.now() }),
+      { expirationTtl: STRIPE_EVENT_TTL_SEC }
+    );
+  }
   var hex = await hexFromStripeSubscription(env, sub, sub.metadata);
   if (!hex) return;
   var subKey = "sub:" + hex;
   var prev = (await env.KV.get(subKey, "json")) || {};
   if (prev.deleted) return;
   var effectiveStatus = stripeStatusFromSubscription(sub);
-  var isDeletedEvent = eventType === "customer.subscription.deleted";
   var isCancel = isDeletedEvent || effectiveStatus === "cancelled" || effectiveStatus === "expired";
   var wouldRestore = !isCancel;
+  // Do not create a grant from subscription.updated or .deleted
+  // unless a paid checkout already bound this subscription id.
+  if (!prev.status) {
+    var paidBound = (env.KV && stripeSubId) ? await env.KV.get("stripesub:" + stripeSubId) : null;
+    if (paidBound !== hex) return;
+  }
+  if (wouldRestore) {
+    if (stripeSubId && (await env.KV.get("stripe:deleted:" + stripeSubId))) return;
+    var plan = planFromStripeSubscription(env, sub);
+    if (!stripeSubscriptionItemsMatchCatalog(env, plan, sub)) {
+      try { console.log("stripe subscription items do not match catalog"); } catch (e) {}
+      return;
+    }
+  }
   if (stripeRecordIsTerminal(prev) && !(await isPaidBoundNewSubscription(env, prev, sub, hex))) return;
   if (shouldIgnoreOlderEvent(prev, eventCreated, wouldRestore)) return;
   var rec = {
@@ -1304,10 +1334,14 @@ function expectedPlanAmountCents(env, plan) {
 }
 
 // In addition to a matching price id, a grant requires currency usd
-// and quantity 1. When STRIPE_PRICE_AMOUNT_* is set, amount_total
-// (and unit_amount) must also match that value in cents. When those
-// env vars are unset, only currency and quantity are compared.
-function stripeLineItemsMatchCatalog(env, plan, items, sessionAmountTotal) {
+// and quantity 1. When STRIPE_PRICE_AMOUNT_* is set, the line
+// price.unit_amount must be present and equal to that catalog
+// amount in cents. unit_amount is the catalog price, so it is
+// not affected by tax or a promo. amount_total (session or line)
+// is not compared, so a discounted or tax-inclusive total can
+// still grant. When those env vars are unset, only currency and
+// quantity are compared.
+function stripeLineItemsMatchCatalog(env, plan, items) {
   if (!isStripeCheckoutPlan(plan) || !items || !items.length) return false;
   var expectedPrice = planPriceId(env, plan);
   if (!expectedPrice) return false;
@@ -1321,15 +1355,39 @@ function stripeLineItemsMatchCatalog(env, plan, items, sessionAmountTotal) {
     if (currency !== "usd") return false;
     if (Number(item.quantity) !== 1) return false;
     if (expectedAmount != null) {
-      var unit = Number((price && price.unit_amount) || 0);
-      var lineTotal = item.amount_total != null ? Number(item.amount_total) : unit;
-      if (lineTotal !== expectedAmount && unit !== expectedAmount) return false;
+      if (!price || typeof price === "string" || price.unit_amount == null || price.unit_amount === "") {
+        return false;
+      }
+      if (Number(price.unit_amount) !== expectedAmount) return false;
     }
   }
-  if (expectedAmount != null && sessionAmountTotal != null && sessionAmountTotal !== "") {
-    if (Number(sessionAmountTotal) !== expectedAmount) return false;
-  }
   return true;
+}
+
+function stripeSubscriptionItemList(sub) {
+  if (!sub || !sub.items || !Array.isArray(sub.items.data)) return null;
+  return sub.items.data;
+}
+
+// Prefer metadata.plan when it is a known checkout plan. Otherwise
+// infer the plan from a catalog price id on the subscription items.
+function planFromStripeSubscription(env, sub) {
+  var metaPlan = String((sub && sub.metadata && sub.metadata.plan) || "");
+  if (isStripeCheckoutPlan(metaPlan) && planPriceId(env, metaPlan)) return metaPlan;
+  var items = stripeSubscriptionItemList(sub) || [];
+  var plans = ["monthly", "yearly", "lifetime"];
+  for (var i = 0; i < items.length; i++) {
+    var price = items[i] && items[i].price;
+    var priceId = typeof price === "string" ? price : (price && price.id) || "";
+    for (var p = 0; p < plans.length; p++) {
+      if (priceId && planPriceId(env, plans[p]) === priceId) return plans[p];
+    }
+  }
+  return metaPlan;
+}
+
+function stripeSubscriptionItemsMatchCatalog(env, plan, sub) {
+  return stripeLineItemsMatchCatalog(env, plan, stripeSubscriptionItemList(sub));
 }
 
 function stripeSessionLineItems(session) {
@@ -1337,10 +1395,22 @@ function stripeSessionLineItems(session) {
   return session.line_items.data;
 }
 
-// A failed expand (timeout, 5xx, 429, or network error) must not be
-// treated as a price mismatch. The caller skips the dedupe write and
-// returns 500 so Stripe retries. A successful fetch, including one
-// that returns no usable line items, is a genuine mismatch.
+// A failed expand that looks transient (timeout, network error,
+// 429, or 5xx) must not be treated as a price mismatch. The
+// caller skips the dedupe write and returns 500 so Stripe retries.
+// A 4xx other than 429 (for example a 404 for a deleted session)
+// is a permanent miss: the caller logs a mismatch, returns 200,
+// and writes the dedupe key, same as a catalog mismatch. A
+// successful fetch, including one that returns no usable line
+// items, is also a genuine mismatch.
+function isStripeTransientExpandError(err) {
+  var status = Number(err && err.status);
+  if (status === 429) return true;
+  if (status >= 500 && status <= 599) return true;
+  if (status >= 400 && status <= 499) return false;
+  return true;
+}
+
 async function resolveStripeSessionLineItems(env, session) {
   var items = stripeSessionLineItems(session);
   if (items) return { items: items, amountTotal: session.amount_total };
@@ -1362,6 +1432,9 @@ async function resolveStripeSessionLineItems(env, session) {
     };
   } catch (e) {
     try { console.log("stripe session expand failed"); } catch (ignore) {}
+    if (!isStripeTransientExpandError(e)) {
+      return { items: [], amountTotal: session && session.amount_total };
+    }
     var err = new Error("Could not verify checkout price.");
     err.status = 500;
     err.transient = true;
@@ -1385,6 +1458,80 @@ async function resolveStripeSessionPriceIds(env, session) {
 // every line-item price id matches the env price for that plan. Lifetime
 // is granted only when metadata.plan is "lifetime", and a subscriber
 // record is never overwritten by a lifetime grant.
+// Write a paid Checkout grant to KV. Used by checkout.session.completed
+// and by a later won or warning_closed dispute that applies a deferred
+// grant. email may be null (deferred grants never store email).
+async function writeStripePaidGrant(env, opts) {
+  if (!env.KV || !opts || !opts.hex) return;
+  var hex = opts.hex;
+  var ids = opts.ids || {};
+  var email = opts.email || null;
+  var eventCreated = opts.eventCreated;
+  var mode = opts.mode;
+  var plan = opts.plan;
+  var subKey = "sub:" + hex;
+  var prev = (await env.KV.get(subKey, "json")) || {};
+  if (prev.deleted) return;
+  if (mode === "subscription") {
+    if (stripeRecordIsTerminal(prev)) {
+      if (!ids.subscription || ids.subscription === String(prev.stripe_subscription_id || "")) return;
+    } else if (shouldSkipCheckoutGrant(prev, eventCreated)) {
+      return;
+    }
+    await bindStripeSub(env, ids.subscription, hex);
+    await rememberStripeIds(env, hex, ids);
+    var rec = {
+      status: "active",
+      stripe_subscription_id: ids.subscription || prev.stripe_subscription_id || null,
+      stripe_session_id: ids.session || prev.stripe_session_id || null,
+      email: email || prev.email || null,
+      storage_tier_gb: prev.storage_tier_gb || 100,
+      cancel_pending: false,
+      ends_at: null,
+      delete_at: null,
+      source: "stripe",
+      provider: "stripe",
+      updated_at: Date.now(),
+      subscription_deleted: false,
+      revoke_reason: null,
+      revoke_dispute_id: null,
+      revoke_prior_status: null,
+    };
+    stampLastEvent(rec, eventCreated);
+    try { await cancelDeletion(env, hex); } catch (e) {}
+    await env.KV.put(subKey, JSON.stringify(rec));
+    return;
+  }
+  if (mode === "payment") {
+    if (plan !== "lifetime") return;
+    if (stripeRecordIsTerminal(prev)) {
+      if (ids.session && prev.stripe_session_id && ids.session === prev.stripe_session_id) return;
+    } else {
+      if (shouldSkipCheckoutGrant(prev, eventCreated)) return;
+      if (isSubscriberRecord(prev)) return;
+    }
+    await rememberStripeIds(env, hex, ids);
+    var lifeRec = {
+      status: "lifetime",
+      stripe_session_id: ids.session || "",
+      email: email || prev.email || null,
+      storage_tier_gb: Number(prev.storage_tier_gb) || 100,
+      source: "stripe",
+      provider: "stripe",
+      updated_at: Date.now(),
+      cancel_pending: false,
+      delete_at: null,
+      subscription_deleted: false,
+      revoke_reason: null,
+      revoke_dispute_id: null,
+      revoke_prior_status: null,
+    };
+    stampLastEvent(lifeRec, eventCreated);
+    try { await cancelDeletion(env, hex); } catch (e) {}
+    await env.KV.put(subKey, JSON.stringify(lifeRec));
+  }
+}
+
 async function applyStripeCheckoutSession(env, session, eventCreated) {
   if (!env.KV || !session) return;
   if (session.payment_status !== "paid" && session.payment_status !== "no_payment_required") {
@@ -1399,7 +1546,7 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
     var id = typeof price === "string" ? price : (price && price.id) || "";
     if (id) priceIds.push(String(id));
   });
-  if (!stripePricesMatchPlan(env, plan, priceIds) || !stripeLineItemsMatchCatalog(env, plan, resolved.items, resolved.amountTotal)) {
+  if (!stripePricesMatchPlan(env, plan, priceIds) || !stripeLineItemsMatchCatalog(env, plan, resolved.items)) {
     try { console.log("stripe checkout price does not match catalog"); } catch (e) {}
     return;
   }
@@ -1418,85 +1565,48 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
       : (session.subscription && session.subscription.id) || "",
     charge: stripeRefId(session.payment_intent && session.payment_intent.latest_charge) || stripeRefId(session.latest_charge) || stripeRefId(session.charge),
   };
-  if (await sessionHasOpenDisputeOrRefund(env, ids)) {
-    try { console.log("stripe checkout skipped because of a refund or dispute tombstone"); } catch (e) {}
+  var claimed = stripeSubHex(token);
+  var existingBind = (env.KV && ids.subscription) ? await env.KV.get("stripesub:" + ids.subscription) : null;
+  if (existingBind && claimed && existingBind !== claimed) {
+    try { console.log("stripe unlock_token does not match stored mapping"); } catch (e) {}
+  }
+  var hex = (session.mode === "subscription") ? (existingBind || claimed) : claimed;
+  if (session.mode === "payment" && plan !== "lifetime") return;
+  if (!hex) return;
+
+  if (ids.subscription && (await env.KV.get("stripe:deleted:" + ids.subscription))) {
+    try { console.log("stripe checkout skipped because the subscription was already deleted"); } catch (e) {}
+    return;
+  }
+  if (await sessionHasRefundTombstone(env, ids)) {
+    try { console.log("stripe checkout skipped because of a refund tombstone"); } catch (e) {}
+    return;
+  }
+  if (await sessionHasBlockingDispute(env, ids)) {
+    // Paid and catalog-ok, but an open dispute arrived first. Store a
+    // deferred grant keyed by payment_intent (and charge/invoice when
+    // present) so a later won or warning_closed close can grant. Signed
+    // ids only; no email or other PII. Refund tombstones do not take
+    // this path.
+    await writePendingStripeGrant(env, ids, {
+      plan: plan,
+      hex: hex,
+      mode: session.mode,
+      created: eventCreated,
+    });
+    try { console.log("stripe checkout deferred because of an open dispute"); } catch (e) {}
     return;
   }
 
-  if (session.mode === "subscription") {
-    var claimed = stripeSubHex(token);
-    var existingBind = (env.KV && ids.subscription) ? await env.KV.get("stripesub:" + ids.subscription) : null;
-    if (existingBind && claimed && existingBind !== claimed) {
-      try { console.log("stripe unlock_token does not match stored mapping"); } catch (e) {}
-    }
-    var hex = existingBind || claimed;
-    if (hex) {
-      var subKey = "sub:" + hex;
-      var prev = (await env.KV.get(subKey, "json")) || {};
-      if (prev.deleted) return;
-      if (stripeRecordIsTerminal(prev)) {
-        if (!ids.subscription || ids.subscription === String(prev.stripe_subscription_id || "")) return;
-      } else if (shouldSkipCheckoutGrant(prev, eventCreated)) {
-        return;
-      }
-      await bindStripeSub(env, ids.subscription, hex);
-      await rememberStripeIds(env, hex, ids);
-      var rec = {
-        status: "active",
-        stripe_subscription_id: ids.subscription || prev.stripe_subscription_id || null,
-        stripe_session_id: ids.session || prev.stripe_session_id || null,
-        email: email || prev.email || null,
-        storage_tier_gb: prev.storage_tier_gb || 100,
-        cancel_pending: false,
-        ends_at: null,
-        delete_at: null,
-        source: "stripe",
-        provider: "stripe",
-        updated_at: Date.now(),
-        subscription_deleted: false,
-        revoke_reason: null,
-        revoke_dispute_id: null,
-        revoke_prior_status: null,
-      };
-      stampLastEvent(rec, eventCreated);
-      try { await cancelDeletion(env, hex); } catch (e) {}
-      await env.KV.put(subKey, JSON.stringify(rec));
-    }
-    return;
-  }
-
-  if (session.mode === "payment") {
-    if (plan !== "lifetime") return;
-    var payHex = stripeSubHex(token);
-    if (!payHex) return;
-    var orderSubKey = "sub:" + payHex;
-    var orderPrev = (await env.KV.get(orderSubKey, "json")) || {};
-    if (orderPrev.deleted) return;
-    if (stripeRecordIsTerminal(orderPrev)) {
-      if (ids.session && orderPrev.stripe_session_id && ids.session === orderPrev.stripe_session_id) return;
-    } else {
-      if (shouldSkipCheckoutGrant(orderPrev, eventCreated)) return;
-      if (isSubscriberRecord(orderPrev)) return;
-    }
-    await rememberStripeIds(env, payHex, ids);
-    var lifeRec = {
-      status: "lifetime",
-      stripe_session_id: ids.session || "",
-      email: email || orderPrev.email || null,
-      storage_tier_gb: Number(orderPrev.storage_tier_gb) || 100,
-      source: "stripe",
-      provider: "stripe",
-      updated_at: Date.now(),
-      cancel_pending: false,
-      delete_at: null,
-      subscription_deleted: false,
-      revoke_reason: null,
-      revoke_dispute_id: null,
-      revoke_prior_status: null,
-    };
-    stampLastEvent(lifeRec, eventCreated);
-    try { await cancelDeletion(env, payHex); } catch (e) {}
-    await env.KV.put(orderSubKey, JSON.stringify(lifeRec));
+  if (session.mode === "subscription" || session.mode === "payment") {
+    await writeStripePaidGrant(env, {
+      hex: hex,
+      ids: ids,
+      mode: session.mode,
+      plan: plan,
+      email: email,
+      eventCreated: eventCreated,
+    });
   }
 }
 
@@ -1505,8 +1615,12 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
 // be forgotten after a 200 + stripe:evt: write. Full refunds write
 // stripe:refunded:<payment_intent|charge|invoice> (60-day TTL).
 // Disputes write stripe:dispute:<dispute_id> (status + created) and
-// stripe:disputed:<payment_intent|charge|invoice>. A later checkout
-// grant consults those keys. If an event has no identity and no
+// stripe:disputed:<payment_intent|charge|invoice>. A paid checkout
+// skipped because a dispute is already open writes
+// stripe:grant:<payment_intent|charge|invoice> (signed ids only, no
+// email, 60-day TTL). A subscription.deleted with no record writes
+// stripe:deleted:<sub_id> (60-day TTL). A later checkout grant
+// consults those keys. If an event has no identity and no
 // attachable id, the webhook returns 5xx without a dedupe write so
 // Stripe retries.
 function stripePendingRefKeys(prefix, obj) {
@@ -1520,13 +1634,122 @@ function stripePendingRefKeys(prefix, obj) {
   return keys;
 }
 
+// Resolve refund tombstone ids. We always tombstone charge and
+// invoice when they are present. When payment_intent is missing,
+// look it up from an expanded invoice.payment_intent, from
+// stripe:invpi:<invoice> written at grant time, or by fetching
+// the invoice from Stripe. If the PI still cannot be resolved,
+// the invoice tombstone alone is enough to skip a later checkout
+// that carries the same invoice id.
+async function resolveStripeRefundRefs(env, obj) {
+  var paymentIntent = stripeRefId(obj && obj.payment_intent);
+  var charge = stripeRefId(obj && obj.charge) || ((obj && obj.object === "charge") ? String(obj.id || "") : "");
+  var invoice = stripeRefId(obj && obj.invoice) || ((obj && obj.object === "invoice") ? String(obj.id || "") : "");
+  if (paymentIntent) {
+    return { payment_intent: paymentIntent, charge: charge, invoice: invoice };
+  }
+  var invObj = obj && obj.invoice;
+  var fromObj = (invObj && typeof invObj === "object") ? stripeRefId(invObj.payment_intent) : "";
+  if (fromObj) {
+    return { payment_intent: fromObj, charge: charge, invoice: invoice };
+  }
+  if (invoice && env && env.KV) {
+    var stored = await env.KV.get("stripe:invpi:" + invoice);
+    if (stored) {
+      return { payment_intent: stored, charge: charge, invoice: invoice };
+    }
+  }
+  if (invoice) {
+    try {
+      var got = readStripeSecretKey(env);
+      if (got && got.key && !got.hiddenChars) {
+        var fetched = await stripeRequest(got.key, "GET", "/invoices/" + encodeURIComponent(invoice));
+        var pi = stripeRefId(fetched && fetched.payment_intent);
+        if (pi) return { payment_intent: pi, charge: charge, invoice: invoice };
+      }
+    } catch (e) {
+      try { console.log("stripe invoice payment_intent lookup failed"); } catch (ignore) {}
+    }
+  }
+  return { payment_intent: paymentIntent, charge: charge, invoice: invoice };
+}
+
 async function writeStripeRefundTombstones(env, obj) {
   if (!env.KV || !obj) return [];
-  var keys = stripePendingRefKeys("stripe:refunded:", obj);
+  var resolved = await resolveStripeRefundRefs(env, obj);
+  var probe = {
+    payment_intent: resolved.payment_intent,
+    charge: resolved.charge || obj.charge,
+    invoice: resolved.invoice || obj.invoice,
+    object: obj.object,
+    id: obj.id,
+  };
+  var keys = stripePendingRefKeys("stripe:refunded:", probe);
   for (var i = 0; i < keys.length; i++) {
     await env.KV.put(keys[i], JSON.stringify({ at: Date.now() }), { expirationTtl: STRIPE_EVENT_TTL_SEC });
   }
   return keys;
+}
+
+// Store a deferred paid checkout so a later won or warning_closed
+// dispute can grant if the session was skipped because a dispute
+// was already open. Keyed by payment_intent, charge, and invoice.
+// Signed ids only; no email or other PII.
+async function writePendingStripeGrant(env, ids, grant) {
+  if (!env.KV || !grant || !grant.hex) return [];
+  var probe = {
+    payment_intent: ids && ids.paymentIntent,
+    charge: ids && ids.charge,
+    invoice: ids && ids.invoice,
+  };
+  var keys = stripePendingRefKeys("stripe:grant:", probe);
+  var payload = JSON.stringify({
+    plan: String(grant.plan || ""),
+    hex: String(grant.hex),
+    mode: String(grant.mode || ""),
+    session: (ids && ids.session) || "",
+    subscription: (ids && ids.subscription) || "",
+    payment_intent: (ids && ids.paymentIntent) || "",
+    charge: (ids && ids.charge) || "",
+    invoice: (ids && ids.invoice) || "",
+    created: Number(grant.created) || 0,
+  });
+  for (var i = 0; i < keys.length; i++) {
+    await env.KV.put(keys[i], payload, { expirationTtl: STRIPE_EVENT_TTL_SEC });
+  }
+  return keys;
+}
+
+async function readPendingStripeGrant(env, obj) {
+  if (!env.KV || !obj) return null;
+  var keys = stripePendingRefKeys("stripe:grant:", obj);
+  for (var i = 0; i < keys.length; i++) {
+    var got = await env.KV.get(keys[i], "json");
+    if (got && got.hex) return got;
+  }
+  return null;
+}
+
+async function applyPendingStripeGrant(env, pending, eventCreated) {
+  if (!env.KV || !pending || !pending.hex) return;
+  var ids = {
+    session: pending.session || "",
+    paymentIntent: pending.payment_intent || "",
+    invoice: pending.invoice || "",
+    subscription: pending.subscription || "",
+    charge: pending.charge || "",
+    customer: "",
+  };
+  if (ids.subscription && (await env.KV.get("stripe:deleted:" + ids.subscription))) return;
+  if (await sessionHasRefundTombstone(env, ids)) return;
+  await writeStripePaidGrant(env, {
+    hex: pending.hex,
+    ids: ids,
+    mode: pending.mode,
+    plan: pending.plan,
+    email: null,
+    eventCreated: eventCreated,
+  });
 }
 
 async function writeStripeDisputeRefs(env, dispute, status, eventCreated) {
@@ -1543,7 +1766,7 @@ async function writeStripeDisputeRefs(env, dispute, status, eventCreated) {
   return keys;
 }
 
-async function sessionHasOpenDisputeOrRefund(env, ids) {
+async function sessionHasRefundTombstone(env, ids) {
   if (!env.KV || !ids) return false;
   var probe = {
     payment_intent: ids.paymentIntent,
@@ -1551,16 +1774,29 @@ async function sessionHasOpenDisputeOrRefund(env, ids) {
     invoice: ids.invoice,
   };
   var refundKeys = stripePendingRefKeys("stripe:refunded:", probe);
-  var i;
-  for (i = 0; i < refundKeys.length; i++) {
+  for (var i = 0; i < refundKeys.length; i++) {
     if (await env.KV.get(refundKeys[i])) return true;
   }
+  return false;
+}
+
+async function sessionHasBlockingDispute(env, ids) {
+  if (!env.KV || !ids) return false;
+  var probe = {
+    payment_intent: ids.paymentIntent,
+    charge: ids.charge,
+    invoice: ids.invoice,
+  };
   var disputeKeys = stripePendingRefKeys("stripe:disputed:", probe);
-  for (i = 0; i < disputeKeys.length; i++) {
+  for (var i = 0; i < disputeKeys.length; i++) {
     var st = await env.KV.get(disputeKeys[i], "json");
-    if (st && String(st.status || "") !== "won") return true;
+    if (st && !disputeStatusRestoresAccess(st.status)) return true;
   }
   return false;
+}
+
+async function sessionHasOpenDisputeOrRefund(env, ids) {
+  return (await sessionHasRefundTombstone(env, ids)) || (await sessionHasBlockingDispute(env, ids));
 }
 
 async function readStripeDisputeState(env, disputeId) {
@@ -1580,6 +1816,14 @@ async function writeStripeDisputeState(env, disputeId, status, eventCreated) {
 function disputeStatusIsClosed(status) {
   var s = String(status || "");
   return s === "won" || s === "lost" || s === "warning_closed";
+}
+
+// won and warning_closed restore access. Every other closed
+// status, including lost and any unknown value, takes the lost
+// path (record stays revoked and the deletion clock starts).
+function disputeStatusRestoresAccess(status) {
+  var s = String(status || "");
+  return s === "won" || s === "warning_closed";
 }
 
 // If a refund or dispute cannot be attached to an identity or a
@@ -1652,9 +1896,12 @@ async function applyStripeDisputeCreated(env, dispute, eventCreated) {
   return { wrotePending: !!(refs.length || hex || disputeId) };
 }
 
-// A won dispute restores Pro only when this record was revoked by
-// that same dispute. A lost close starts the 10-business-day
-// deletion clock. Lost or warning-closed disputes leave access ended.
+// A won or warning_closed dispute restores Pro when this record
+// was revoked by that same dispute. If there is no sub: record,
+// apply a deferred checkout grant stored when a paid session was
+// skipped because the dispute was already open. A lost close, or
+// any other or unknown close status, starts the 10-business-day
+// deletion clock and leaves access ended.
 async function applyStripeDisputeClosed(env, dispute, eventCreated) {
   if (!env.KV || !dispute) return { wrotePending: false };
   var disputeId = String(dispute.id || "");
@@ -1666,7 +1913,8 @@ async function applyStripeDisputeClosed(env, dispute, eventCreated) {
   if (disputeId) await writeStripeDisputeState(env, disputeId, status, eventCreated);
   var refs = await writeStripeDisputeRefs(env, dispute, status, eventCreated);
   var hex = await hexFromStripeRevokeRefs(env, dispute);
-  if (status === "won") {
+  if (disputeStatusRestoresAccess(status)) {
+    var restored = false;
     if (hex) {
       var subKey = "sub:" + hex;
       var prev = (await env.KV.get(subKey, "json")) || {};
@@ -1693,11 +1941,22 @@ async function applyStripeDisputeClosed(env, dispute, eventCreated) {
             stampLastEvent(rec, eventCreated);
             try { await cancelDeletion(env, hex); } catch (e) {}
             await env.KV.put(subKey, JSON.stringify(rec));
+            restored = true;
           }
         }
       }
     }
-  } else if (status === "lost") {
+    if (!restored) {
+      var existing = hex ? ((await env.KV.get("sub:" + hex, "json")) || {}) : {};
+      if (!existing.status) {
+        var pending = await readPendingStripeGrant(env, dispute);
+        if (pending) await applyPendingStripeGrant(env, pending, eventCreated);
+      }
+    }
+  } else {
+    if (status !== "lost") {
+      try { console.log("stripe dispute closed with unhandled status", status || "(empty)"); } catch (e) {}
+    }
     if (hex) {
       var lostKey = "sub:" + hex;
       var lostPrev = (await env.KV.get(lostKey, "json")) || {};
