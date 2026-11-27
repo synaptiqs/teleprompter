@@ -148,6 +148,11 @@ Do this in your own Stripe account. Do not put any keys in the repo.
 
    Copy the signing secret (`whsec_...`) into `STRIPE_WEBHOOK_SECRET`.
 
+   A charge-only refund whose charge GET is a 404 still tombstones
+   that charge and returns 500, so Stripe retries for about 3 days.
+   A PI-only lifetime checkout in that window still grants, because
+   the session does not carry the tombstoned charge id.
+
 ### Worker vars and secrets (set on the Worker, not in git)
 
 - `PAYMENT_PROVIDER` (var): `lemonsqueezy` (default) or `stripe`.
