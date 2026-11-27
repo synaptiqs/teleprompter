@@ -353,8 +353,12 @@ function launchThrottleError() {
 // bypass the limit with a new address per try. IPv4 stays a single IP.
 // A zone index is stripped first, then IPv4-mapped forms
 // (::ffff:a.b.c.d, 0:0:0:0:0:ffff:a.b.c.d, and hex ::ffff:xxxx:yyyy)
-// are treated as IPv4.
+// and IPv4-translated forms (::ffff:0:a.b.c.d and hex ::ffff:0:xxxx:yyyy)
+// are treated as IPv4. Malformed IP strings share a fixed "invalid" bucket.
 function expandIpv6Groups(ip) {
+  // ":::" is malformed (an extra colon, not just a valid "::" compression).
+  if (ip.indexOf(":::") !== -1) return null;
+  if ((ip.match(/::/g) || []).length > 1) return null;
   var dotted = ip.match(/:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
   var head = ip;
   var extra = [];
@@ -375,6 +379,9 @@ function expandIpv6Groups(ip) {
     if (sides.length !== 2) return null;
     var left = sides[0] ? sides[0].split(":") : [];
     var right = sides[1] ? sides[1].split(":") : [];
+    if (left.some(function (g) { return g === ""; }) || right.some(function (g) { return g === ""; })) {
+      return null;
+    }
     var fill = 8 - left.length - right.length - extra.length;
     if (fill < 0) return null;
     parts = left.concat(Array(fill).fill("0"), right, extra);
@@ -389,24 +396,41 @@ function expandIpv6Groups(ip) {
   return parts;
 }
 
+function parseIpv4(ip) {
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) return null;
+  var oct = ip.split(".").map(Number);
+  if (oct.some(function (n) { return !isFinite(n) || n < 0 || n > 255; })) return null;
+  return oct.join(".");
+}
+
+function ipv4FromMappedOrTranslated(parts) {
+  function norm(h) { return String(h).replace(/^0+/, "") || "0"; }
+  var n = parts.map(norm);
+  var mapped = n[0] === "0" && n[1] === "0" && n[2] === "0" && n[3] === "0" && n[4] === "0" && n[5] === "ffff";
+  // IPv4-translated: ::ffff:0:a.b.c.d and hex ::ffff:0:xxxx:yyyy
+  var translated = n[0] === "0" && n[1] === "0" && n[2] === "0" && n[3] === "0" && n[4] === "ffff" && n[5] === "0";
+  if (!mapped && !translated) return null;
+  var hi = parseInt(parts[6], 16);
+  var lo = parseInt(parts[7], 16);
+  if (!isFinite(hi) || !isFinite(lo)) return null;
+  return [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join(".");
+}
+
 function throttleIpKey(ip) {
   ip = String(ip || "").trim().toLowerCase();
   if (!ip || ip === "unknown") return "unknown";
   // Strip a zone index (%eth0, %wlan0, %15) before any mapped-IPv4 check.
   ip = ip.split("%")[0];
   if (!ip) return "unknown";
-  if (ip.indexOf(":") === -1) return ip;
-  var parts = expandIpv6Groups(ip);
-  if (!parts) return ip;
-  function norm(h) { return String(h).replace(/^0+/, "") || "0"; }
-  var n = parts.map(norm);
-  if (n[0] === "0" && n[1] === "0" && n[2] === "0" && n[3] === "0" && n[4] === "0" && n[5] === "ffff") {
-    var hi = parseInt(parts[6], 16);
-    var lo = parseInt(parts[7], 16);
-    if (!isFinite(hi) || !isFinite(lo)) return ip;
-    return [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join(".");
+  if (ip.indexOf(":") === -1) {
+    return parseIpv4(ip) || "invalid";
   }
-  return n.slice(0, 4).join(":") + "::/64";
+  var parts = expandIpv6Groups(ip);
+  if (!parts) return "invalid";
+  var asV4 = ipv4FromMappedOrTranslated(parts);
+  if (asV4) return asV4;
+  function norm(h) { return String(h).replace(/^0+/, "") || "0"; }
+  return parts.map(norm).slice(0, 4).join(":") + "::/64";
 }
 
 // Launch-list throttle runs before the body is read. Prefer the optional
@@ -629,10 +653,14 @@ function sanitizeAttrTimestamp(value) {
 var ATTR_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 var ATTR_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
 
-// Drop the whole attribution object when its timestamp is 90 days old
-// or older, unparseable, or more than one day in the future.
+// Drop the whole attribution object when the timestamp is missing,
+// invalid, 90 days old or older, or more than one day in the future.
+// This matches the client: a missing or invalid timestamp is treated
+// as stale. A timestamp up to one day in the future is kept so a
+// little clock skew between the device and the Worker does not drop
+// a fresh first-touch record.
 function attributionTimestampFresh(timestamp) {
-  if (!timestamp) return true;
+  if (!timestamp) return false;
   var at = Date.parse(timestamp);
   if (!isFinite(at)) return false;
   var now = Date.now();
@@ -655,8 +683,8 @@ function sanitizeAttribution(input) {
   var landing = sanitizeLandingPath(input.landing || input.landing_path || input.attr_landing);
   if (landing) out.landing = landing;
   var timestamp = sanitizeAttrTimestamp(input.timestamp || input.ts || input.attr_ts);
-  if (timestamp && !attributionTimestampFresh(timestamp)) return {};
-  if (timestamp) out.timestamp = timestamp;
+  if (!timestamp || !attributionTimestampFresh(timestamp)) return {};
+  out.timestamp = timestamp;
   return out;
 }
 
@@ -2029,9 +2057,21 @@ function isAllowedTurnstileHost(host) {
   return false;
 }
 
-async function turnstileOk(request, env, token) {
+// options.timeoutMs or options.signal can be passed by tests so the
+// abort does not rely on AbortSignal.timeout, whose timer is unref'd
+// on some Node versions and can let the test runner exit early.
+// Production (no options) still uses a 5000 ms timeout.
+async function turnstileOk(request, env, token, options) {
   token = String(token || "");
   if (!token || token.length > 2048) return false;
+  options = options || {};
+  var signal = options.signal;
+  if (!signal) {
+    var timeoutMs = options.timeoutMs == null ? 5000 : options.timeoutMs;
+    signal = typeof options.makeSignal === "function"
+      ? options.makeSignal(timeoutMs)
+      : AbortSignal.timeout(timeoutMs);
+  }
   var form = new FormData();
   form.append("secret", env.TURNSTILE_SECRET);
   form.append("response", token);
@@ -2041,8 +2081,9 @@ async function turnstileOk(request, env, token) {
     var r = await fetch(TURNSTILE_VERIFY, {
       method: "POST",
       body: form,
-      signal: AbortSignal.timeout(5000)
+      signal: signal
     });
+    if (!r.ok) return false;
     var d = await r.json();
     if (!d || d.success !== true) return false;
     if (!isAllowedTurnstileHost(d.hostname)) return false;

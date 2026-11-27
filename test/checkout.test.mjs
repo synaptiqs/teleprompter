@@ -7,6 +7,7 @@ let lastCheckout = null;
 let turnstileSuccess = true;
 let turnstilePayload = { hostname: 'clickprompt.app', action: 'launch' };
 let turnstileHang = false;
+let turnstileStatus = 200;
 let lastTurnstile = null;
 globalThis.fetch = async (url, init) => {
   const u = String(url);
@@ -29,7 +30,7 @@ globalThis.fetch = async (url, init) => {
       success: turnstileSuccess,
       hostname: turnstilePayload.hostname,
       action: turnstilePayload.action
-    }), { status: 200 });
+    }), { status: turnstileStatus });
   }
   if (u !== 'https://api.lemonsqueezy.com/v1/checkouts') throw new Error('blocked ' + url);
   const b = JSON.parse(init.body);
@@ -182,7 +183,7 @@ test('launch-notify stores email and attribution, first signup wins, always {ok:
   const env = { LAUNCH_KV: kv };
   const r = await launch(env, {
     email: 'Alex@Example.com',
-    attribution: { utm_source: 'tiktok', utm_campaign: 'first10', landing: '/' }
+    attribution: { utm_source: 'tiktok', utm_campaign: 'first10', landing: '/', timestamp: new Date().toISOString() }
   });
   assert.equal(r.status, 200);
   const body = await r.json();
@@ -351,6 +352,17 @@ test('throttleIpKey strips a zone index first and treats dotted, expanded, and h
   assert.equal(key('::ffff:cb00:710a'), '203.0.113.10');
   assert.equal(key('0:0:0:0:0:ffff:cb00:710a'), '203.0.113.10');
   assert.equal(key('::FFFF:CB00:710A%wlan0'), '203.0.113.10');
+  assert.equal(key('::ffff:0:203.0.113.10'), '203.0.113.10');
+  assert.equal(key('::ffff:0:203.0.113.10%eth0'), '203.0.113.10');
+  assert.equal(key('0:0:0:0:ffff:0:203.0.113.10'), '203.0.113.10');
+  assert.equal(key('::ffff:0:cb00:710a'), '203.0.113.10');
+  assert.equal(key('0:0:0:0:ffff:0:cb00:710a'), '203.0.113.10');
+  assert.equal(key('not-an-ip'), 'invalid');
+  assert.equal(key('999.1.1.1'), 'invalid');
+  assert.equal(key('1.2.3'), 'invalid');
+  assert.equal(key(':::'), 'invalid');
+  assert.equal(key('2001:db8::gggg'), 'invalid');
+  assert.equal(key('unknown'), 'unknown');
 });
 
 test('20 KB stream with Content-Length 100 is rejected without reading it all', async () => {
@@ -425,6 +437,7 @@ test('turnstileOk requires an allowed hostname, action launch, and fails closed 
   const env = { TURNSTILE_SECRET: 'test-secret' };
 
   turnstileHang = false;
+  turnstileStatus = 200;
   turnstileSuccess = true;
   turnstilePayload = { hostname: 'clickprompt.app', action: 'launch' };
   assert.equal(await turnstileOk(req, env, 'tok'), true);
@@ -439,10 +452,30 @@ test('turnstileOk requires an allowed hostname, action launch, and fails closed 
   turnstilePayload = { hostname: 'abc.teleprompter-5fz.pages.dev', action: 'launch' };
   assert.equal(await turnstileOk(req, env, 'tok'), true);
 
+  // Fail closed on abort with a ref'd timer + AbortController so this
+  // does not hang on Node 22, where AbortSignal.timeout is unref'd.
   turnstilePayload = { hostname: 'clickprompt.app', action: 'launch' };
   turnstileHang = true;
-  assert.equal(await turnstileOk(req, env, 'tok'), false);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 20);
+  try {
+    assert.equal(await turnstileOk(req, env, 'tok', { signal: ac.signal }), false);
+  } finally {
+    clearTimeout(timer);
+    turnstileHang = false;
+  }
+});
+
+test('turnstileOk returns false when siteverify is not ok, before trusting the body', async () => {
+  const { _turnstileOk: turnstileOk } = await import('../worker/script-api.js');
+  const req = new Request('https://x.test/', { headers: { 'CF-Connecting-IP': '203.0.113.71' } });
+  const env = { TURNSTILE_SECRET: 'test-secret' };
   turnstileHang = false;
+  turnstileSuccess = true;
+  turnstilePayload = { hostname: 'clickprompt.app', action: 'launch' };
+  turnstileStatus = 500;
+  assert.equal(await turnstileOk(req, env, 'tok'), false);
+  turnstileStatus = 200;
 });
 
 test('honeypot submissions go through Turnstile and a KV get before {ok:true}', async () => {
@@ -491,12 +524,23 @@ test('Worker drops attribution older than 90 days or more than 1 day in the futu
   assert.equal(skewed.utm_source, 'reddit');
   const tooFuture = sanitize({ utm_source: 'reddit', timestamp: iso(now + 25 * 60 * 60 * 1000) });
   assert.deepEqual(tooFuture, {});
+  const missingTs = sanitize({ utm_source: 'reddit' });
+  assert.deepEqual(missingTs, {});
+  const invalidTs = sanitize({ utm_source: 'reddit', timestamp: 'not-a-date' });
+  assert.deepEqual(invalidTs, {});
 
   lastCheckout = null;
   const r = await checkoutWith(base, {
     attribution: { utm_source: 'reddit', timestamp: iso(now - 91 * day) }
   });
   assert.equal(r.status, 200);
+  assert.equal(lastCheckout.data.attributes.checkout_data.custom.utm_source, undefined);
+
+  lastCheckout = null;
+  const rMissing = await checkoutWith(base, {
+    attribution: { utm_source: 'reddit' }
+  });
+  assert.equal(rMissing.status, 200);
   assert.equal(lastCheckout.data.attributes.checkout_data.custom.utm_source, undefined);
 });
 
@@ -513,6 +557,10 @@ test('README documents rate-limiter-before-redeploy, the commented wrangler snip
   const md = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
   assert.ok(md.includes('LAUNCH_RATE_LIMITER') && md.includes('before the Worker is redeployed') || md.includes('before that redeploy'));
   assert.ok(md.includes('# [[unsafe.bindings]]') && md.includes('# name = "LAUNCH_RATE_LIMITER"'));
+  assert.ok(md.includes('burst limit') && md.includes('5 per 60 seconds'));
+  assert.ok(md.includes('5 per hour') || md.includes('hourly fallback') || md.includes('hourly cap'));
+  assert.ok(md.includes('10 or 60'));
+  assert.ok(md.includes('Both limits are intentional'));
   assert.ok(md.includes("sha256") || md.includes('SHA-256'));
   assert.ok(md.includes('wrangler kv key delete'));
   assert.ok(md.includes('0d3a072d-8d93-45f5-b3f1-70870a445457'));

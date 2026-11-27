@@ -115,10 +115,13 @@ and honeypot submissions all return `{ ok: true }` with no extra flags.
   `LAUNCH_KV`. The launch list stays closed (503) until this binding
   exists. The Worker will not fall back to the main `KV` namespace.
 - Bind a Cloudflare Rate Limiting binding as `LAUNCH_RATE_LIMITER`
-  (with Tyler's OK) before the Worker is redeployed. The KV throttle
-  on `LAUNCH_KV` is only a fallback (5 tries per hour, IPv6 grouped
-  by /64, counts kept for 2 hours, keys hashed so raw IPs are not
-  stored). Do not add this binding to live config in the repo.
+  (with Tyler's OK) before the Worker is redeployed. The binding is a
+  burst limit (5 per 60 seconds). Cloudflare only allows a period of
+  10 or 60 seconds, so this cannot be an hourly cap. The KV throttle
+  on `LAUNCH_KV` is the hourly fallback (5 tries per hour, IPv6
+  grouped by /64, counts kept for 2 hours, keys hashed so raw IPs are
+  not stored). Both limits are intentional. Do not add this binding
+  to live config in the repo.
 - Optional, server-side only and inert unless set: `TURNSTILE_SECRET`.
   If this secret is set, `/api/launch-notify` requires a valid
   Turnstile token. The front end does not load the Turnstile script
@@ -143,13 +146,16 @@ Pages can ship before the Worker. The frontend treats 404, 405, or
 Before the Worker is redeployed, with Tyler's OK:
 
 1. Create and bind the `LAUNCH_KV` namespace.
-2. Bind `LAUNCH_RATE_LIMITER` before that redeploy. The KV throttle
-   is only a fallback when the binding is missing or does not return
-   `{ success: true }`. Do not add the binding to live config in this
-   repo (there is no `wrangler.toml` change in this PR).
+2. Bind `LAUNCH_RATE_LIMITER` before that redeploy. The binding is a
+   burst limit (5 per 60 seconds). Cloudflare's rate-limit binding
+   only supports a period of 10 or 60 seconds, so this is not an
+   hourly cap. The KV throttle is the hourly fallback (5 per hour)
+   when the binding is missing or does not return `{ success: true }`.
+   Both limits are intentional. Do not add the binding to live config
+   in this repo (there is no `wrangler.toml` change in this PR).
 
 Commented `wrangler.toml` snippet, for Tyler to add when he is ready
-(not checked in as live config):
+(not checked in as live config). `period` must be 10 or 60:
 
 ```
 # [[unsafe.bindings]]
@@ -160,7 +166,8 @@ Commented `wrangler.toml` snippet, for Tyler to add when he is ready
 ```
 
 `namespace_id` is a number Tyler chooses (Cloudflare uses it to
-group rate-limit counters). Adjust the limit and period as needed.
+group rate-limit counters). Keep `period` at 60 (or 10) and adjust
+only the burst `limit` if needed.
 
 ### Rollback
 
