@@ -30,7 +30,7 @@
 <body>
   <main class="legal-page">
     <h1>Privacy Policy</h1>
-    <p class="legal-updated">Last updated: October 28, 2026</p>
+    <p class="legal-updated">Last updated: November 27, 2026</p>
 
     <p>ClickPrompt (clickprompt.app) is a teleprompter for recording videos,
     operated by Lagniappe Ventures Ltd, a Nevada series limited liability company ("we", "us"). This policy explains what we
@@ -58,7 +58,10 @@
       free scripts per day. It contains a random ID, nothing about you.</li>
       <li><strong>IP address.</strong> Used as a fallback for the daily
       free-script count (kept for up to 2 days) and for short-term abuse
-      throttling (kept for a few minutes). Our hosting provider, Cloudflare,
+      throttling: script-generation and redeem attempts are kept for a few
+      minutes, and launch-list signup attempt counts are kept for up to 2
+      hours (IPv6 addresses are grouped by /64). We do not store your IP
+      on the launch-list row itself. Our hosting provider, Cloudflare,
       also processes IP addresses and basic request data to deliver the site
       and protect it from abuse.</li>
       <li><strong>Purchase information.</strong> ClickPrompt Pro is sold
@@ -77,6 +80,16 @@
       <li><strong>Anonymous usage counts.</strong> Daily totals like "scripts
       generated" or "recordings started," kept for 90 days. No personal data,
       no cross-site tracking.</li>
+      <li><strong>Launch list.</strong> If you ask us to notify you when the
+      store goes live, we store your email address and the marketing source
+      of your first visit (for example, the campaign or site that brought
+      you here). We keep that row for up to one year, or until you ask us
+      to delete it. We use this only to email you about the ClickPrompt launch
+      and to see which sources the list came from. We do not send a
+      confirmation email when you sign up, and we do not use this list for
+      other marketing unless you opt in later. Email
+      <a href="mailto:info@lvltdllc.com">info@lvltdllc.com</a> to be
+      removed.</li>
     </ul>
 
     <h2>What we don't collect</h2>
@@ -87,7 +100,12 @@
 
     <p>The app also keeps a few preferences in your browser's local storage,
     such as your chosen platform, whether you've seen the tour, and its
-    mute setting. These stay on your device.</p>
+    mute setting. On your first visit we also store a first-touch marketing
+    record there (UTM parameters, the referring site, the page you landed
+    on, and the time) so we can attribute a later checkout or launch-list
+    signup to that first visit. First-touch source data stays on the device
+    and expires after 90 days. These stay on your device unless you send
+    them to us by checking out or joining the launch list.</p>
 
     <h2>Advertising measurement</h2>
     <p>We use the Meta (Facebook) Pixel on clickprompt.app. It fires a
@@ -106,10 +124,13 @@
     <a href="mailto:info@lvltdllc.com">info@lvltdllc.com</a>.</p>
 
     <h2>Who sees your data</h2>
-    <p>Cloudflare (hosting, the script API, Workers AI script generation, and
-    storage for your saved library), Lemon Squeezy (payments, taxes, refunds,
-    and license keys), our email delivery provider (only to send account
-    notices to subscribers), and Meta (the Facebook Pixel, which receives a
+    <p>Cloudflare (hosting, the script API, Workers AI script generation,
+    storage for your saved library, and the launch list), Lemon Squeezy
+    (payments, taxes, refunds, and license keys; if you check out, the
+    first-touch marketing source is also sent as checkout custom data so
+    it appears on the order), our email delivery provider (account notices
+    to subscribers, and a launch-list email when the store goes live if
+    you signed up), and Meta (the Facebook Pixel, which receives a
     PageView when you load a page so we can measure our ads). We do not sell
     your data.</p>
 
@@ -121,6 +142,9 @@
     days into that window. After deletion there are no
     recoverable copies. Full details are in our
     <a href="/terms">Terms</a>.</p>
+    <p>To leave the launch list, email
+    <a href="mailto:info@lvltdllc.com">info@lvltdllc.com</a> and we will
+    delete your email and the marketing source stored with it.</p>
 
     <h2>Your choices and rights</h2>
     <p>You can ask us to show you, correct, or delete the personal information
@@ -154,5 +178,6 @@
     <span class="footer-sep">&middot;</span>
     <a href="/contact">Contact</a>
   </footer>
+  <script src="attribution.js?v=20261127a"></script>
 </body>
 </html>

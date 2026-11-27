@@ -86,3 +86,115 @@ A cancelled monthly/yearly plan keeps Pro until the paid period ends.
   email sequence.
 - The frontend keeps one opaque unlock token in `localStorage`
   (`clickprompt_token`): `code:<CODE>`, `sub:<hex>`, or `lic:<license key>`.
+
+## First-touch attribution and the launch list
+
+On every public page, `attribution.js` records the first visit (UTM
+parameters, referrer host, landing path, and timestamp) in
+`localStorage` under `clickprompt_attribution`. Later visits do not
+overwrite that record, so checkout, the launch list, and future
+features can reuse it. First-touch source data stays on the device
+and expires after 90 days (a missing, invalid, or future timestamp
+is treated as expired). An expired record is replaced by the current
+touch, or cleared if the current page has no UTM or referrer.
+
+When the app starts a Lemon Squeezy checkout it sends the record as
+`attribution` on `POST /api/checkout`. The Worker sanitizes the fields
+and copies them into `checkout_data.custom` so they show on the order
+and on webhooks. **The Worker must be redeployed by hand for that
+forwarding to work.** Until then the live Worker ignores the extra
+field and checkout still succeeds.
+
+`POST /api/launch-notify` stores an email plus that attribution for
+the "Notify me when the store goes live" form. New signups, repeats,
+and honeypot submissions all return `{ ok: true }` with no extra flags.
+
+**Tyler setup (do not create these until he says OK):**
+
+- Create a Cloudflare KV namespace and bind it to the Worker as
+  `LAUNCH_KV`. The launch list stays closed (503) until this binding
+  exists. The Worker will not fall back to the main `KV` namespace.
+- Bind a Cloudflare Rate Limiting binding as `LAUNCH_RATE_LIMITER`
+  (with Tyler's OK) before the Worker is redeployed. The binding is a
+  burst limit (5 per 60 seconds). Cloudflare only allows a period of
+  10 or 60 seconds, so this cannot be an hourly cap. The KV throttle
+  on `LAUNCH_KV` is the hourly fallback (5 tries per hour, IPv6
+  grouped by /64, counts kept for 2 hours, keys hashed so raw IPs are
+  not stored). Both limits are intentional. Do not add this binding
+  to live config in the repo.
+- Optional, server-side only and inert unless set: `TURNSTILE_SECRET`.
+  If this secret is set, `/api/launch-notify` requires a valid
+  Turnstile token. The front end does not load the Turnstile script
+  or widgets in this change, and it does not send a token, so the
+  secret must stay unset or signups would fail. Enabling Turnstile
+  later needs Tyler's OK, the front-end widget and script re-added
+  to the signup forms, and a disclosure on `privacy.html`.
+
+Do not create those Cloudflare resources as part of this PR. The
+Worker must be redeployed by hand for `/api/launch-notify` and
+checkout attribution forwarding to work. Until then the frontend
+treats 404, 405, or 503 from the launch endpoint as "not available
+yet," so Pages can ship first.
+
+Launch-list rows expire after about one year.
+
+## Rollout (do not merge or deploy without Tyler's OK)
+
+Pages can ship before the Worker. The frontend treats 404, 405, or
+503 from `/api/launch-notify` as "not available yet."
+
+Before the Worker is redeployed, with Tyler's OK:
+
+1. Create and bind the `LAUNCH_KV` namespace.
+2. Bind `LAUNCH_RATE_LIMITER` before that redeploy. The binding is a
+   burst limit (5 per 60 seconds). Cloudflare's rate-limit binding
+   only supports a period of 10 or 60 seconds, so this is not an
+   hourly cap. The KV throttle is the hourly fallback (5 per hour)
+   when the binding is missing or does not return `{ success: true }`.
+   Both limits are intentional. Do not add the binding to live config
+   in this repo (there is no `wrangler.toml` change in this PR).
+
+Commented `wrangler.toml` snippet, for Tyler to add when he is ready
+(not checked in as live config). `period` must be 10 or 60:
+
+```
+# [[unsafe.bindings]]
+# name = "LAUNCH_RATE_LIMITER"
+# type = "ratelimit"
+# namespace_id = "1001"
+# simple = { limit = 5, period = 60 }
+```
+
+`namespace_id` is a number Tyler chooses (Cloudflare uses it to
+group rate-limit counters). Keep `period` at 60 (or 10) and adjust
+only the burst `limit` if needed.
+
+### Rollback
+
+- Pages production deploy: `0d3a072d-8d93-45f5-b3f1-70870a445457`
+- Worker version: `56737990-2d7f-4178-a376-8ef429683125`
+- After rollback, delete `launch:` and `launchthrottle:` keys from
+  `LAUNCH_KV` if that namespace was created.
+
+### Deleting one launch-list row
+
+The KV key is `launch:` plus the SHA-256 hex digest of the string
+`launch:` followed by the email, lowercased and trimmed. Example
+for `alex@example.com`, with Tyler's OK:
+
+```
+# key = launch:$(printf %s 'launch:alex@example.com' | sha256sum | awk '{print $1}')
+npx wrangler kv key delete "launch:<hex>" --binding LAUNCH_KV
+```
+
+Replace `<hex>` with the 64-character digest. Confirm the namespace
+and account before running this.
+
+## Tests
+
+From the repo root (no network; Lemon Squeezy is faked):
+
+```
+node --test test/*.mjs
+```
+

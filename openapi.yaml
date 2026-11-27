@@ -122,6 +122,24 @@ paths:
                   enum: [monthly, yearly, lifetime]
                   default: monthly
                   description: Plan to check out ($4.99/mo, $49.99/yr, or $129 one-time).
+                attribution:
+                  type: object
+                  description: >
+                    Optional first-touch attribution captured in the browser
+                    (utm_source, utm_medium, utm_campaign, utm_content,
+                    utm_term, referrer, landing, timestamp). The worker
+                    sanitizes each field and forwards them as Lemon Squeezy
+                    checkout_data.custom strings. Older worker deploys ignore
+                    this field and still create the checkout.
+                  properties:
+                    utm_source: { type: string }
+                    utm_medium: { type: string }
+                    utm_campaign: { type: string }
+                    utm_content: { type: string }
+                    utm_term: { type: string }
+                    referrer: { type: string }
+                    landing: { type: string }
+                    timestamp: { type: string }
       responses:
         '200':
           description: Checkout created.
@@ -142,6 +160,58 @@ paths:
           description: Could not start checkout.
         '503':
           description: Checkout not configured yet.
+
+  /api/launch-notify:
+    post:
+      operationId: launchNotify
+      summary: Join the launch list (notify me when the store goes live)
+      description: |
+        Stores an email plus optional first-touch attribution on the launch
+        list. No confirmation email is sent. New signups, repeat signups,
+        and a filled honeypot (hp_website_url) all return { ok: true }
+        with no extra flags. Repeats keep the original row; honeypots are
+        not stored. Requires the LAUNCH_KV binding (no fallback to the
+        main KV namespace) and returns 503 if it is missing. Optional
+        LAUNCH_RATE_LIMITER is used when bound, otherwise a KV throttle
+        on LAUNCH_KV (5 per hour, IPv6 /64). Optional TURNSTILE_SECRET:
+        when set, a cf-turnstile-response token is required. Body must be
+        application/json and at most 8 KB. Launch rows expire after about
+        one year.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+                attribution:
+                  type: object
+                  description: Same first-touch record used at checkout.
+                hp_website_url:
+                  type: string
+                  description: Honeypot. Leave empty.
+                cf-turnstile-response:
+                  type: string
+                  description: Turnstile token; required only when TURNSTILE_SECRET is set.
+      responses:
+        '200':
+          description: Always { ok: true } for a new signup, a repeat, or a honeypot.
+        '400':
+          description: Email was missing or invalid, or the body was not JSON.
+        '403':
+          description: Turnstile check failed (only when TURNSTILE_SECRET is set).
+        '413':
+          description: Request body larger than 8 KB.
+        '415':
+          description: Content-Type was not application/json.
+        '429':
+          description: Too many attempts from this network.
+        '503':
+          description: LAUNCH_KV is not bound; the launch list is not available yet.
 
   /api/me:
     get:

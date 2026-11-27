@@ -74,6 +74,26 @@
  *                               (generated, recording_started, download,
  *                               subscribe). No PII; increments a daily KV
  *                               counter.
+ *   POST /api/launch-notify     { email, attribution?, hp_website_url?,
+ *                               cf-turnstile-response? } -> { ok: true }.
+ *                               Stores an email on the launch list (notify
+ *                               me when the store goes live) with first-touch
+ *                               attribution. New signups, repeats, and a
+ *                               filled honeypot (hp_website_url) all
+ *                               return the same { ok: true }; honeypots are
+ *                               not stored and repeats keep the original
+ *                               row. No confirmation email is sent. Requires
+ *                               a LAUNCH_KV binding (no fallback to KV).
+ *                               Optional LAUNCH_RATE_LIMITER binding should
+ *                               be bound (with Tyler's OK) before a Worker
+ *                               redeploy; otherwise a KV throttle on
+ *                               LAUNCH_KV is the fallback (5/hour, IPv6 /64).
+ *                               Optional TURNSTILE_SECRET: when set, a
+ *                               Turnstile token is required (same helper as
+ *                               the pending generate-script Turnstile PR).
+ *                               Body must be application/json, max 8 KB,
+ *                               streamed and aborted at 8 KB. Launch rows
+ *                               expire after about one year.
  *
  * Paywalled the same way: saved VOICEOVERS (audio-only recordings).
  * Storage: 100 GB base quota per paid identity (video blobs metered;
@@ -150,6 +170,11 @@
  *   emaillog:<ts>:<rand>  -> { to, subject, text, at } (queued when no
  *                              email provider is configured)
  *   ev:<YYYY-MM-DD>:<event> -> analytics counter (90-day TTL)
+ *   launch:<sha256("launch:"+email)> -> { email, attribution, created_at }
+ *                              (launch-list signup; email is stored
+ *                              lowercase; first signup wins; ~1-year TTL)
+ *   launchthrottle:<hour>:<ip> -> launch-list attempt count (2-hour TTL;
+ *                              IPv6 addresses are bucketed by /64)
  *
  * Secrets (set via the Workers API):
  *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
@@ -162,9 +187,16 @@
  *   LEMONSQUEEZY_STORAGE_TIERS (JSON map variantId -> GB, e.g.
  *     {"123":250,"124":500,"125":1000}),
  *   EMAIL_API_KEY + EMAIL_FROM (optional; without them, deletion emails
- *     are logged to KV instead of sent — wire a provider before launch)
+ *     are logged to KV instead of sent (wire a provider before launch),
+ *   TURNSTILE_SECRET (optional; when set, /api/launch-notify requires a
+ *     valid Turnstile token; off when unset)
  *
- * Bindings: AI (Workers AI), KV (this namespace),
+ * Bindings: AI (Workers AI), KV (scripts, unlocks, generate caps),
+ *   LAUNCH_KV (required for the launch list; no fallback to KV; Tyler
+ *     creates and binds this, this code does not),
+ *   LAUNCH_RATE_LIMITER (optional Cloudflare Rate Limiting binding;
+ *     bind with Tyler's OK before a Worker redeploy; KV throttle on
+ *     LAUNCH_KV is the fallback),
  *   VOICEOVER_AUDIO (R2 bucket, optional until R2 is enabled).
  */
 
@@ -298,6 +330,202 @@ async function checkRedeemThrottle(env, request) {
   await env.KV.put(key, String(count + 1), { expirationTtl: 1200 });
 }
 
+// Launch-list storage is a dedicated LAUNCH_KV binding. There is no
+// fallback to the main KV namespace, so a missing binding stays 503
+// ("not available yet") until Tyler creates and binds it.
+function launchKv(env) {
+  return env && env.LAUNCH_KV ? env.LAUNCH_KV : null;
+}
+
+var LAUNCH_THROTTLE_MAX = 5;
+var LAUNCH_THROTTLE_TTL = 7200; // 2 hours, matches the hourly window slack
+var LAUNCH_ROW_TTL = 365 * 24 * 60 * 60; // about one year
+var LAUNCH_BODY_MAX = 8192; // 8 KB
+
+function launchThrottleError() {
+  var err = new Error("Too many signups from this network. Please try again later.");
+  err.status = 429;
+  err.code = "throttled";
+  return err;
+}
+
+// IPv6 addresses share a throttle bucket at /64 so one network cannot
+// bypass the limit with a new address per try. IPv4 stays a single IP.
+// A zone index is stripped first, then IPv4-mapped forms
+// (::ffff:a.b.c.d, 0:0:0:0:0:ffff:a.b.c.d, and hex ::ffff:xxxx:yyyy)
+// and IPv4-translated forms (::ffff:0:a.b.c.d and hex ::ffff:0:xxxx:yyyy)
+// are treated as IPv4. Malformed IP strings share a fixed "invalid" bucket.
+function expandIpv6Groups(ip) {
+  // ":::" is malformed (an extra colon, not just a valid "::" compression).
+  if (ip.indexOf(":::") !== -1) return null;
+  if ((ip.match(/::/g) || []).length > 1) return null;
+  var dotted = ip.match(/:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  var head = ip;
+  var extra = [];
+  if (dotted) {
+    var oct = dotted[1].split(".").map(Number);
+    if (oct.length !== 4 || oct.some(function (n) { return !isFinite(n) || n < 0 || n > 255; })) {
+      return null;
+    }
+    head = ip.slice(0, ip.length - dotted[0].length);
+    extra = [
+      ((oct[0] << 8) | oct[1]).toString(16),
+      ((oct[2] << 8) | oct[3]).toString(16)
+    ];
+  }
+  var parts;
+  if (head.indexOf("::") !== -1) {
+    var sides = head.split("::");
+    if (sides.length !== 2) return null;
+    var left = sides[0] ? sides[0].split(":") : [];
+    var right = sides[1] ? sides[1].split(":") : [];
+    if (left.some(function (g) { return g === ""; }) || right.some(function (g) { return g === ""; })) {
+      return null;
+    }
+    var fill = 8 - left.length - right.length - extra.length;
+    if (fill < 0) return null;
+    parts = left.concat(Array(fill).fill("0"), right, extra);
+  } else {
+    parts = (head ? head.split(":") : []).concat(extra);
+  }
+  if (parts.length !== 8) return null;
+  for (var i = 0; i < 8; i++) {
+    if (!/^[0-9a-f]{0,4}$/.test(parts[i] || "0")) return null;
+    parts[i] = parts[i] || "0";
+  }
+  return parts;
+}
+
+function parseIpv4(ip) {
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(ip)) return null;
+  var oct = ip.split(".").map(Number);
+  if (oct.some(function (n) { return !isFinite(n) || n < 0 || n > 255; })) return null;
+  return oct.join(".");
+}
+
+function ipv4FromMappedOrTranslated(parts) {
+  function norm(h) { return String(h).replace(/^0+/, "") || "0"; }
+  var n = parts.map(norm);
+  var mapped = n[0] === "0" && n[1] === "0" && n[2] === "0" && n[3] === "0" && n[4] === "0" && n[5] === "ffff";
+  // IPv4-translated: ::ffff:0:a.b.c.d and hex ::ffff:0:xxxx:yyyy
+  var translated = n[0] === "0" && n[1] === "0" && n[2] === "0" && n[3] === "0" && n[4] === "ffff" && n[5] === "0";
+  if (!mapped && !translated) return null;
+  var hi = parseInt(parts[6], 16);
+  var lo = parseInt(parts[7], 16);
+  if (!isFinite(hi) || !isFinite(lo)) return null;
+  return [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join(".");
+}
+
+function throttleIpKey(ip) {
+  ip = String(ip || "").trim().toLowerCase();
+  if (!ip || ip === "unknown") return "unknown";
+  // Strip a zone index (%eth0, %wlan0, %15) before any mapped-IPv4 check.
+  ip = ip.split("%")[0];
+  if (!ip) return "unknown";
+  if (ip.indexOf(":") === -1) {
+    return parseIpv4(ip) || "invalid";
+  }
+  var parts = expandIpv6Groups(ip);
+  if (!parts) return "invalid";
+  var asV4 = ipv4FromMappedOrTranslated(parts);
+  if (asV4) return asV4;
+  function norm(h) { return String(h).replace(/^0+/, "") || "0"; }
+  return parts.map(norm).slice(0, 4).join(":") + "::/64";
+}
+
+// Launch-list throttle runs before the body is read. Prefer the optional
+// Rate Limiting binding when it is present and result.success is true.
+// Skip the KV fallback only in that case; anything else (including {})
+// falls through to KV. success: false still rejects.
+//
+// The KV counter is a read-then-write, so two requests in the same
+// instant can both pass the cap (best-effort, same as other counters
+// in this Worker). Keys store a hash of the IP bucket, not the raw IP.
+async function checkLaunchThrottle(env, request) {
+  if (!request) return;
+  var ip = throttleIpKey(clientIp(request));
+  if (env.LAUNCH_RATE_LIMITER && typeof env.LAUNCH_RATE_LIMITER.limit === "function") {
+    try {
+      var result = await env.LAUNCH_RATE_LIMITER.limit({ key: ip });
+      if (result && result.success === false) throw launchThrottleError();
+      if (result && result.success === true) return;
+      // Missing, empty, or unexpected result: use the KV throttle.
+    } catch (e) {
+      if (e && e.status === 429) throw e;
+      // Binding failed unexpectedly: fall through to the KV throttle.
+    }
+  }
+  var kv = launchKv(env);
+  if (!kv) return;
+  var bucket = await sha256Hex("throttle:" + ip);
+  var key = "launchthrottle:" + Math.floor(Date.now() / 3600000) + ":" + bucket;
+  var count = Number(await kv.get(key)) || 0;
+  if (count >= LAUNCH_THROTTLE_MAX) throw launchThrottleError();
+  await kv.put(key, String(count + 1), { expirationTtl: LAUNCH_THROTTLE_TTL });
+}
+
+function isJsonContentType(request) {
+  var ct = (request.headers.get("Content-Type") || "").toLowerCase();
+  return ct.split(";")[0].trim() === "application/json";
+}
+
+// Reject oversized bodies before JSON.parse. Stream the body with
+// getReader(), count bytes, and cancel as soon as the total exceeds
+// maxBytes, even if Content-Length is missing or lies.
+async function readLimitedJsonBody(request, maxBytes) {
+  function tooBig() {
+    var err = new Error("Request is too large.");
+    err.status = 413;
+    return err;
+  }
+  var len = request.headers.get("Content-Length");
+  if (len !== null && len !== "" && /^\d+$/.test(String(len).trim()) && Number(len) > maxBytes) {
+    if (request.body && typeof request.body.cancel === "function") {
+      try { await request.body.cancel(); } catch (e) { /* already closed */ }
+    }
+    throw tooBig();
+  }
+
+  var reader = request.body && typeof request.body.getReader === "function"
+    ? request.body.getReader()
+    : null;
+  var chunks = [];
+  var total = 0;
+  if (reader) {
+    while (true) {
+      var step = await reader.read();
+      if (step.done) break;
+      var value = step.value || new Uint8Array(0);
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch (e) { /* already closed */ }
+        throw tooBig();
+      }
+      chunks.push(value);
+    }
+  } else {
+    var buf = await request.arrayBuffer();
+    if (buf.byteLength > maxBytes) throw tooBig();
+    chunks.push(new Uint8Array(buf));
+    total = buf.byteLength;
+  }
+
+  var bytes = new Uint8Array(total);
+  var offset = 0;
+  for (var i = 0; i < chunks.length; i++) {
+    bytes.set(chunks[i], offset);
+    offset += chunks[i].byteLength;
+  }
+  var text = new TextDecoder("utf-8").decode(bytes);
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    var bad = new Error("Request body must be JSON.");
+    bad.status = 400;
+    throw bad;
+  }
+}
+
 // Concurrency pool (thundering-herd §8): best-effort KV semaphore capping
 // simultaneous AI calls. 90s TTL self-heals leaked slots.
 var GEN_POOL_MAX = 5;
@@ -380,6 +608,116 @@ function clean(value, max) {
   return (value === undefined || value === null ? "" : String(value))
     .trim()
     .slice(0, max);
+}
+
+// First-touch attribution rules (keep in sync with attribution.js).
+// UTM values are [a-z0-9_-], max 64 characters. Referrer is a hostname
+// (dots allowed). Landing is a path (slashes allowed). These fields are
+// later copied into Lemon Squeezy checkout_data.custom as strings.
+var ATTR_UTM_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"];
+var ATTR_MAX = 64;
+// Never let client attribution overwrite checkout identity fields.
+var ATTR_RESERVED = { unlock_token: 1, storage_gb: 1 };
+
+function sanitizeUtmValue(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, ATTR_MAX);
+}
+
+function sanitizeReferrerHost(value) {
+  var raw = String(value || "").trim();
+  if (!raw) return "";
+  var host = raw;
+  try {
+    if (/^https?:\/\//i.test(raw)) host = new URL(raw).hostname;
+    else host = raw.split("/")[0];
+  } catch (e) {
+    host = raw.split("/")[0];
+  }
+  return host.toLowerCase().replace(/[^a-z0-9.-]/g, "").replace(/^\.+|\.+$/g, "").slice(0, ATTR_MAX);
+}
+
+function sanitizeLandingPath(value) {
+  var raw = String(value || "").trim() || "";
+  if (!raw) return "";
+  if (raw.charAt(0) !== "/") raw = "/" + raw;
+  raw = raw.split("?")[0].split("#")[0];
+  return raw.toLowerCase().replace(/[^a-z0-9/_-]/g, "").slice(0, ATTR_MAX) || "";
+}
+
+function sanitizeAttrTimestamp(value) {
+  var raw = String(value || "").trim().slice(0, ATTR_MAX);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(raw)) return "";
+  return raw;
+}
+
+var ATTR_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+var ATTR_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+
+// Drop the whole attribution object when the timestamp is missing,
+// invalid, 90 days old or older, or more than one day in the future.
+// This matches the client: a missing or invalid timestamp is treated
+// as stale. A timestamp up to one day in the future is kept so a
+// little clock skew between the device and the Worker does not drop
+// a fresh first-touch record.
+function attributionTimestampFresh(timestamp) {
+  if (!timestamp) return false;
+  var at = Date.parse(timestamp);
+  if (!isFinite(at)) return false;
+  var now = Date.now();
+  if ((at - now) > ATTR_FUTURE_SKEW_MS) return false;
+  if ((now - at) >= ATTR_MAX_AGE_MS) return false;
+  return true;
+}
+
+// Accept the frontend record or the flat checkout_data names. Invalid
+// input is ignored so checkout still succeeds if a client sends junk.
+function sanitizeAttribution(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  var out = {};
+  ATTR_UTM_KEYS.forEach(function (key) {
+    var value = sanitizeUtmValue(input[key]);
+    if (value) out[key] = value;
+  });
+  var referrer = sanitizeReferrerHost(input.referrer || input.attr_referrer);
+  if (referrer) out.referrer = referrer;
+  var landing = sanitizeLandingPath(input.landing || input.landing_path || input.attr_landing);
+  if (landing) out.landing = landing;
+  var timestamp = sanitizeAttrTimestamp(input.timestamp || input.ts || input.attr_ts);
+  if (!timestamp || !attributionTimestampFresh(timestamp)) return {};
+  out.timestamp = timestamp;
+  return out;
+}
+
+// Flatten a sanitized record into Lemon Squeezy custom data (string values only).
+function attributionToCustom(record) {
+  var out = {};
+  if (!record) return out;
+  ATTR_UTM_KEYS.forEach(function (key) {
+    if (record[key]) out[key] = String(record[key]);
+  });
+  if (record.referrer) out.attr_referrer = String(record.referrer);
+  if (record.landing) out.attr_landing = String(record.landing);
+  if (record.timestamp) out.attr_ts = String(record.timestamp);
+  return out;
+}
+
+function applyAttribution(custom, raw) {
+  var flat = attributionToCustom(sanitizeAttribution(raw));
+  Object.keys(flat).forEach(function (key) {
+    if (ATTR_RESERVED[key]) return;
+    custom[key] = flat[key];
+  });
+  return custom;
+}
+
+// Simple email check: one @, a dotted domain, no spaces. Lowercased.
+function normalizeLaunchEmail(value) {
+  // Reject (do not truncate) addresses longer than 254 characters.
+  var email = (value === undefined || value === null ? "" : String(value)).trim().toLowerCase();
+  if (!email || email.length > 254) return "";
+  if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return "";
+  if (email.indexOf("..") !== -1) return "";
+  return email;
 }
 
 // ---- crypto helpers (WebCrypto, no dependencies) ----
@@ -899,7 +1237,32 @@ function storageTierGb(env) {
   }
 }
 
-async function doCheckout(env, origin, plan, existingToken) {
+// Checkout may only redirect back to the production site or this project's
+// Pages previews. Any other origin, including http, falls back to production
+// so a crafted request cannot send buyers to a third-party host.
+function allowedCheckoutOrigin(origin) {
+  var fallback = "https://clickprompt.app";
+  origin = clean(origin, 120);
+  if (!origin) return fallback;
+  var url;
+  try {
+    url = new URL(origin);
+  } catch (e) {
+    return fallback;
+  }
+  if (url.protocol !== "https:") return fallback;
+  var host = url.hostname.toLowerCase();
+  if (host === "clickprompt.app" || host === "www.clickprompt.app") {
+    return "https://" + host;
+  }
+  var pages = "teleprompter-5fz.pages.dev";
+  if (host === pages || (host.length > pages.length && host.slice(-pages.length - 1) === "." + pages)) {
+    return "https://" + host;
+  }
+  return fallback;
+}
+
+async function doCheckout(env, origin, plan, existingToken, attribution) {
   if (
     !env.LEMONSQUEEZY_API_KEY ||
     !env.LEMONSQUEEZY_STORE_ID ||
@@ -907,8 +1270,7 @@ async function doCheckout(env, origin, plan, existingToken) {
   ) {
     throw ApiError(503, "Checkout is not configured yet.");
   }
-  origin = clean(origin, 120) || "https://clickprompt.app";
-  if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
+  origin = allowedCheckoutOrigin(origin);
 
   // Plan -> variant. Monthly is the default ("annual" is accepted as an
   // alias for yearly). Storage add-ons
@@ -918,6 +1280,9 @@ async function doCheckout(env, origin, plan, existingToken) {
   var variantId;
   var token = "sub:" + randomHex(16);
   var custom = { unlock_token: token };
+  // Attach first-touch attribution after identity fields are set so
+  // reserved keys (unlock_token, storage_gb) cannot be overwritten.
+  applyAttribution(custom, attribution);
   var storagePlan = STORAGE_PLANS[plan];
   if (storagePlan) {
     existingToken = clean(existingToken, 64);
@@ -1673,10 +2038,127 @@ async function handleCheckout(request, env, cors) {
     body = {};
   }
   try {
-    return json(await doCheckout(env, body.origin, body.plan, body.token), 200, cors);
+    return json(await doCheckout(env, body.origin, body.plan, body.token, body.attribution), 200, cors);
   } catch (e) {
     return json({ error: e.message || "Could not start checkout." }, e.status || 500, cors);
   }
+}
+
+// Same Turnstile siteverify helper as the pending free-tier generate PR
+// (#10). Off until TURNSTILE_SECRET is set. Shared so both features can
+// use one secret and one sitekey without drifting.
+var TURNSTILE_VERIFY = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+function isAllowedTurnstileHost(host) {
+  host = String(host || "").toLowerCase();
+  if (host === "clickprompt.app" || host === "www.clickprompt.app") return true;
+  var pages = "teleprompter-5fz.pages.dev";
+  if (host === pages) return true;
+  if (host.length > pages.length && host.slice(-(pages.length + 1)) === "." + pages) return true;
+  return false;
+}
+
+// options.timeoutMs or options.signal can be passed by tests so the
+// abort does not rely on AbortSignal.timeout, whose timer is unref'd
+// on some Node versions and can let the test runner exit early.
+// Production (no options) still uses a 5000 ms timeout.
+async function turnstileOk(request, env, token, options) {
+  token = String(token || "");
+  if (!token || token.length > 2048) return false;
+  options = options || {};
+  var signal = options.signal;
+  if (!signal) {
+    var timeoutMs = options.timeoutMs == null ? 5000 : options.timeoutMs;
+    signal = typeof options.makeSignal === "function"
+      ? options.makeSignal(timeoutMs)
+      : AbortSignal.timeout(timeoutMs);
+  }
+  var form = new FormData();
+  form.append("secret", env.TURNSTILE_SECRET);
+  form.append("response", token);
+  var ip = request.headers.get("CF-Connecting-IP");
+  if (ip) form.append("remoteip", ip);
+  try {
+    var r = await fetch(TURNSTILE_VERIFY, {
+      method: "POST",
+      body: form,
+      signal: signal
+    });
+    if (!r.ok) return false;
+    var d = await r.json();
+    if (!d || d.success !== true) return false;
+    if (!isAllowedTurnstileHost(d.hostname)) return false;
+    if (d.action !== "launch") return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function handleLaunchNotify(request, env, cors) {
+  // Throttle first, then require JSON and cap the body, then store.
+  // New, repeat, and honeypot all return { ok: true } with no extra flags.
+  try {
+    await checkLaunchThrottle(env, request);
+    if (!isJsonContentType(request)) {
+      return json({ error: "Content-Type must be application/json." }, 415, cors);
+    }
+    var body = await readLimitedJsonBody(request, LAUNCH_BODY_MAX);
+    return json(await doLaunchNotify(env, request, body), 200, cors);
+  } catch (e) {
+    var out = { error: e.message || "Could not save that email." };
+    if (e.code) out.code = e.code;
+    return json(out, e.status || 500, cors);
+  }
+}
+
+async function doLaunchNotify(env, request, body) {
+  body = body || {};
+  var kv = launchKv(env);
+  if (!kv) {
+    throw ApiError(503, "The launch list is not available yet.");
+  }
+
+  // Turnstile is off until TURNSTILE_SECRET is set (same as PR #10).
+  // Honeypot submissions take this path too, so a missing token is 403
+  // whether or not the hidden field was filled.
+  if (env.TURNSTILE_SECRET) {
+    if (!(await turnstileOk(request, env, body["cf-turnstile-response"]))) {
+      var human = ApiError(403, "Please complete the quick human check, then try again.");
+      human.code = "human_check";
+      throw human;
+    }
+  }
+
+  var honeypot = clean(body.hp_website_url, 120);
+  var email = normalizeLaunchEmail(body.email);
+
+  // Always do a KV get before the generic { ok: true } so honeypot
+  // timing matches a real signup. Honeypots are not stored.
+  if (honeypot) {
+    var hpKey = email
+      ? "launch:" + (await sha256Hex("launch:" + email))
+      : "launch:" + (await sha256Hex("launch:honeypot"));
+    await kv.get(hpKey, "json");
+    return { ok: true };
+  }
+
+  if (!email) {
+    throw ApiError(400, "Please enter a valid email address.");
+  }
+
+  var key = "launch:" + (await sha256Hex("launch:" + email));
+  var existing = await kv.get(key, "json");
+  if (existing && existing.email) {
+    return { ok: true };
+  }
+
+  var record = {
+    email: email,
+    attribution: sanitizeAttribution(body.attribution),
+    created_at: new Date().toISOString(),
+  };
+  await kv.put(key, JSON.stringify(record), { expirationTtl: LAUNCH_ROW_TTL });
+  return { ok: true };
 }
 
 async function handleWebhook(request, env, cors) {
@@ -2260,22 +2742,44 @@ export default {
     var url = new URL(request.url);
     var path = url.pathname;
 
+    // Known paths with the wrong method return 405 and an Allow header
+    // instead of a generic 404.
+    var routeMethods = {
+      "/mcp": "POST",
+      "/api/generate-script": "POST",
+      "/api/checkout": "POST",
+      "/api/webhook": "POST",
+      "/api/me": "GET",
+      "/api/redeem": "POST",
+      "/api/scripts": "GET, POST, DELETE",
+      "/api/audio": "GET, POST, DELETE",
+      "/api/event": "POST",
+      "/api/launch-notify": "POST"
+    };
+    var allowed = routeMethods[path];
+    if (allowed) {
+      var methods = allowed.split(",").map(function (m) { return m.trim(); });
+      if (methods.indexOf(request.method) === -1) {
+        return json({ error: "Method not allowed." }, 405, Object.assign({}, cors, { Allow: allowed }));
+      }
+    }
+
     if (path === "/mcp") {
       return handleMcp(request, env, cors);
     }
-    if (path === "/api/generate-script" && request.method === "POST") {
+    if (path === "/api/generate-script") {
       return handleGenerate(request, env, cors);
     }
-    if (path === "/api/checkout" && request.method === "POST") {
+    if (path === "/api/checkout") {
       return handleCheckout(request, env, cors);
     }
-    if (path === "/api/webhook" && request.method === "POST") {
+    if (path === "/api/webhook") {
       return handleWebhook(request, env, cors);
     }
-    if (path === "/api/me" && request.method === "GET") {
+    if (path === "/api/me") {
       return handleMe(request, env, cors);
     }
-    if (path === "/api/redeem" && request.method === "POST") {
+    if (path === "/api/redeem") {
       return handleRedeem(request, env, cors);
     }
     if (path === "/api/scripts") {
@@ -2284,8 +2788,11 @@ export default {
     if (path === "/api/audio") {
       return handleAudio(request, env, cors);
     }
-    if (path === "/api/event" && request.method === "POST") {
+    if (path === "/api/event") {
       return handleEvent(request, env, cors);
+    }
+    if (path === "/api/launch-notify") {
+      return handleLaunchNotify(request, env, cors);
     }
 
     return json({ error: "Not found." }, 404, cors);
@@ -2296,3 +2803,4 @@ export default {
     ctx.waitUntil(runDeletionCron(env));
   },
 };
+export { turnstileOk as _turnstileOk, throttleIpKey as _throttleIpKey, allowedCheckoutOrigin as _allowedCheckoutOrigin, sanitizeAttribution as _sanitizeAttribution };

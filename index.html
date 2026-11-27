@@ -14,7 +14,7 @@
   <meta property="og:description" content="A free teleprompter for recording videos: generate a script from five quick questions and read it on camera, right in your browser." />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://clickprompt.app/" />
-  <link rel="stylesheet" href="styles.css?v=20261008a" />
+  <link rel="stylesheet" href="styles.css?v=20261127a" />
   <!-- Meta Pixel Code -->
   <script>
   !function(f,b,e,v,n,t,s)
@@ -32,6 +32,7 @@
   src="https://www.facebook.com/tr?id=1425895313089708&ev=PageView&noscript=1"
   /></noscript>
   <!-- End Meta Pixel Code -->
+  <script src="attribution.js?v=20261127a"></script>
 </head>
 <body>
   <main class="app" id="app" data-view="setup">
@@ -40,6 +41,22 @@
         <h1>ClickPrompt</h1>
         <p>Answer five quick questions and we'll draft your script. You can edit every word before you record.</p>
         <button class="text-button tour-replay" id="replayTour" type="button">Take the tour</button>
+
+        <!-- Launch-list signup on the home setup screen. -->
+        <form class="launch-signup" data-launch-signup>
+          <p class="launch-signup-title">Notify me when the store goes live</p>
+          <label class="launch-email-label">Email
+            <input type="email" name="email" autocomplete="email" inputmode="email" required placeholder="you@example.com" />
+          </label>
+          <div class="launch-honeypot" aria-hidden="true">
+            <label>Website
+              <input type="text" name="hp_website_url" tabindex="-1" autocomplete="off" />
+            </label>
+          </div>
+          <button class="secondary" type="submit">Notify me</button>
+          <p class="launch-notice">We store your email and the marketing source of your first visit. See our <a href="/privacy">Privacy Policy</a>.</p>
+          <p class="launch-status" role="status" aria-live="polite"></p>
+        </form>
       </div>
       <div class="setup-body">
         <div>
@@ -274,6 +291,21 @@
           <button class="secondary" id="redeemButton" type="button">Redeem</button>
         </div>
       </div>
+
+      <form class="launch-signup launch-signup-paywall" data-launch-signup>
+        <p class="launch-signup-title">Notify me when the store goes live</p>
+        <label class="launch-email-label">Email
+          <input type="email" name="email" autocomplete="email" inputmode="email" required placeholder="you@example.com" />
+        </label>
+        <div class="launch-honeypot" aria-hidden="true">
+          <label>Website
+            <input type="text" name="hp_website_url" tabindex="-1" autocomplete="off" />
+          </label>
+        </div>
+        <button class="secondary" type="submit">Notify me</button>
+        <p class="launch-notice">We store your email and the marketing source of your first visit. See our <a href="/privacy">Privacy Policy</a>.</p>
+        <p class="launch-status" role="status" aria-live="polite"></p>
+      </form>
       <button class="text-button" id="paywallClose" type="button">Not now</button>
     </div>
   </dialog>
@@ -300,6 +332,6 @@
     </div>
   </dialog>
 
-  <script src="app.js?v=20261008a"></script>
+  <script src="app.js?v=20261127a"></script>
 </body>
 </html>

@@ -36,8 +36,11 @@
       // Free-cap identity: a first-party visitor cookie (cp_vid), with the
       // client IP as the server-side fallback. Set once, lasts a year.
       function visitorId() {
-        var m = document.cookie.match(/(?:^|;\s*)cp_vid=([0-9a-f]{32})/);
-        if (m) return m[1];
+        // Cookie access can throw in a locked-down or sandboxed document.
+        try {
+          var m = document.cookie.match(/(?:^|;\s*)cp_vid=([0-9a-f]{32})/);
+          if (m) return m[1];
+        } catch (e) { /* proceed and mint a session id */ }
         var id = "";
         try {
           var bytes = new Uint8Array(16);
@@ -49,7 +52,9 @@
           id = String(Date.now().toString(16)) + String(Math.random()).slice(2, 18);
           id = (id + "00000000000000000000000000000000").slice(0, 32);
         }
-        document.cookie = "cp_vid=" + id + "; max-age=31536000; path=/; SameSite=Lax";
+        try {
+          document.cookie = "cp_vid=" + id + "; max-age=31536000; path=/; SameSite=Lax";
+        } catch (e) { /* still return the id for this session */ }
         return id;
       }
 
@@ -406,7 +411,22 @@
         subscribeButton.disabled = true;
         paywallStatus.textContent = "Opening secure checkout…";
         try {
-          var data = await apiPost("/api/checkout", { origin: window.location.origin, plan: selectedPlan() });
+          // Include first-touch attribution when we have it. The live
+          // Worker may ignore this field until it is redeployed; checkout
+          // still works either way.
+          var checkoutBody = { origin: window.location.origin, plan: selectedPlan() };
+          // Attribution is optional. A throwing or blocked store must not break checkout.
+          try {
+            if (window.ClickPromptAttribution) {
+              if (typeof window.ClickPromptAttribution.attachTo === "function") {
+                window.ClickPromptAttribution.attachTo(checkoutBody);
+              } else {
+                var attr = window.ClickPromptAttribution.get();
+                if (attr) checkoutBody.attribution = attr;
+              }
+            }
+          } catch (e) { /* proceed without attribution */ }
+          var data = await apiPost("/api/checkout", checkoutBody);
           if (data._ok && data.url && data.token) {
             // Store the unlock token BEFORE leaving: the webhook matches it
             // back via checkout custom data, and /api/me polls it on return.
@@ -1725,6 +1745,64 @@
       codeInput.addEventListener("keydown", function (e) {
         if (e.key === "Enter") redeemCode();
       });
+
+      // Launch-list signup: email plus the first-touch attribution record.
+      // Works from the paywall and from the home-page form.
+      async function submitLaunchSignup(form) {
+        var emailInput = form.querySelector('input[type="email"], input[name="email"]');
+        var honeypotInput = form.querySelector('input[name="hp_website_url"]');
+        var status = form.querySelector(".launch-status");
+        var button = form.querySelector('button[type="submit"]');
+        var email = emailInput ? emailInput.value.trim() : "";
+        if (status) status.textContent = "";
+        if (!email) {
+          if (status) status.textContent = "Enter your email first.";
+          if (emailInput) emailInput.focus();
+          return;
+        }
+        var body = { email: email };
+        if (honeypotInput && honeypotInput.value) body.hp_website_url = honeypotInput.value;
+        // Attribution is optional. A throwing or blocked store must not break signup.
+        // No Turnstile token is sent: the widget is not on the page until Tyler OKs it.
+        try {
+          if (window.ClickPromptAttribution) {
+            if (typeof window.ClickPromptAttribution.attachTo === "function") {
+              window.ClickPromptAttribution.attachTo(body);
+            } else {
+              var launchAttr = window.ClickPromptAttribution.get();
+              if (launchAttr) body.attribution = launchAttr;
+            }
+          }
+        } catch (e) { /* proceed without attribution */ }
+        if (button) button.disabled = true;
+        if (status) status.textContent = "Saving...";
+        try {
+          var result = await apiPost("/api/launch-notify", body);
+          if (result._ok && result.ok) {
+            // One generic message for new signups, repeats, and honeypots.
+            if (status) status.textContent = "You are on the list. We will email you when the store goes live.";
+            if (emailInput) emailInput.value = "";
+          } else if (result._status === 503 || result._status === 404 || result._status === 405) {
+            // Live Worker may not have this route yet; Pages can ship first.
+            if (status) status.textContent = "The launch list is not available yet. Please try again after the next update.";
+          } else {
+            if (status) status.textContent = result.error || "Could not save that email. Please try again.";
+          }
+        } catch (e) {
+          if (status) status.textContent = "Could not reach the server. Check your connection and try again.";
+        } finally {
+          if (button) button.disabled = false;
+        }
+      }
+      var launchForms = document.querySelectorAll("[data-launch-signup]");
+      for (var li = 0; li < launchForms.length; li++) {
+        (function (form) {
+          form.addEventListener("submit", function (e) {
+            e.preventDefault();
+            submitLaunchSignup(form);
+          });
+        })(launchForms[li]);
+      }
 
       countdownToggle.addEventListener("click", function () { togglePressed(countdownToggle); });
       mirrorToggle.addEventListener("click", function () {
