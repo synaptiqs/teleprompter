@@ -107,6 +107,14 @@ test('assertStripeTestMode refuses live keys unless STRIPE_ALLOW_LIVE=true', () 
     assertStripeTestMode({ STRIPE_SECRET_KEY: 'sk_live_abc', STRIPE_ALLOW_LIVE: 'true' }),
     'sk_live_abc'
   );
+  assert.throws(
+    () => assertStripeTestMode({ STRIPE_SECRET_KEY: 'rk_live_abc' }),
+    (e) => e.status === 503 && /STRIPE_ALLOW_LIVE=true/.test(e.message) && !/rk_live_/.test(e.message)
+  );
+  assert.throws(
+    () => assertStripeTestMode({ STRIPE_SECRET_KEY: 'sk_live_abc', STRIPE_ALLOW_LIVE: 'TRUE' }),
+    (e) => e.status === 503
+  );
 });
 
 test('live-key checkout is refused and does not call Stripe', async () => {
@@ -136,10 +144,13 @@ test('session creation: monthly is a subscription on the monthly price', async (
   assert.equal(stripeCalls[0].method, 'POST');
   assert.equal(stripeCalls[0].headers.Authorization, 'Bearer sk_test_123');
   assert.equal(stripeCalls[0].headers['Content-Type'], 'application/x-www-form-urlencoded');
+  assert.equal(stripeCalls[0].headers['Stripe-Version'], '2025-03-31.basil');
+  assert.match(stripeCalls[0].headers['Idempotency-Key'], /^cp_checkout_sub:[0-9a-f]{32}$/);
   const form = parseForm(stripeCalls[0].body);
   assert.equal(form.mode, 'subscription');
   assert.equal(form['line_items[0][price]'], 'price_monthly');
   assert.equal(form['line_items[0][quantity]'], '1');
+  assert.equal(form['payment_method_types[0]'], 'card');
   assert.equal(form.success_url, 'https://clickprompt.app/?checkout=done');
   assert.equal(form.cancel_url, 'https://clickprompt.app/?checkout=cancel');
   assert.equal(form['metadata[unlock_token]'], data.token);
@@ -198,8 +209,8 @@ test('session creation puts sanitized attribution in metadata', async () => {
   assert.equal(form['metadata[attr_campaign]'], 'first10');
   assert.equal(form['metadata[attr_content]'], 'ad-1');
   assert.equal(form['metadata[attr_term]'], 'teleprompter');
-  assert.equal(form['metadata[attr_referrer]'], 'https://reddit.com/r/something');
-  assert.equal(form['metadata[attr_landing]'], 'https://clickprompt.app/?utm_source=reddit');
+  assert.equal(form['metadata[attr_referrer]'], 'reddit.com');
+  assert.equal(form['metadata[attr_landing]'], '/');
   assert.equal(form['metadata[attr_ts]'], '2026-11-27T13:00:00.000Z');
   assert.equal(form['subscription_data[metadata][attr_source]'], 'reddit');
   assert.ok(!form['metadata[attr_extra]']);
@@ -219,6 +230,14 @@ test('sanitizeAttribution drops non-printable and unknown keys', () => {
   assert.equal(got.campaign, 'first10');
   assert.ok(!got.evil);
   assert.equal(got.medium.length, 200);
+  const urls = sanitizeAttribution({
+    referrer: 'https://reddit.com/r/something?utm=1',
+    landing: 'https://clickprompt.app/pricing?utm_source=reddit#hash',
+  });
+  assert.equal(urls.referrer, 'reddit.com');
+  assert.equal(urls.landing, '/pricing');
+  assert.ok(!String(urls.referrer).includes('?'));
+  assert.ok(!String(urls.landing).includes('?'));
 });
 
 test('buildStripeCheckoutForm encodes success and cancel URLs on clickprompt.app', () => {
@@ -267,6 +286,7 @@ test('signed checkout.session.completed unlocks a lifetime purchase', async () =
   const raw = JSON.stringify({
     id: 'evt_lifetime_1',
     type: 'checkout.session.completed',
+    livemode: false,
     data: {
       object: {
         id: 'cs_test_life',
@@ -295,10 +315,9 @@ test('signed checkout.session.completed unlocks a lifetime purchase', async () =
   assert.equal(rec.email, 'buyer@example.com');
 });
 
-test('unsigned or live-key webhook is refused', async () => {
-  const raw = JSON.stringify({ id: 'evt_x', type: 'checkout.session.completed', data: { object: {} } });
+test('unsigned webhook returns 400', async () => {
+  const raw = JSON.stringify({ id: 'evt_x', type: 'checkout.session.completed', livemode: false, data: { object: {} } });
   const ts = Math.floor(Date.now() / 1000);
-  const sig = await signStripe(stripeEnv.STRIPE_WEBHOOK_SECRET, raw, ts);
   const bad = await worker.fetch(
     new Request('https://x.test/api/stripe-webhook', {
       method: 'POST',
@@ -308,16 +327,347 @@ test('unsigned or live-key webhook is refused', async () => {
     { ...stripeEnv, KV: memoryKv() },
     { waitUntil() {} }
   );
-  assert.equal(bad.status, 401);
+  assert.equal(bad.status, 400);
+});
 
-  const live = await worker.fetch(
+function webhookRequest(raw, env, sig) {
+  return worker.fetch(
     new Request('https://x.test/api/stripe-webhook', {
       method: 'POST',
       headers: { 'Stripe-Signature': sig, 'Content-Type': 'application/json' },
       body: raw,
     }),
-    { ...stripeEnv, STRIPE_SECRET_KEY: 'sk_live_abc', KV: memoryKv() },
+    env,
     { waitUntil() {} }
   );
-  assert.equal(live.status, 503);
+}
+
+async function signedWebhook(env, event) {
+  const raw = JSON.stringify(event);
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = await signStripe(env.STRIPE_WEBHOOK_SECRET || stripeEnv.STRIPE_WEBHOOK_SECRET, raw, ts);
+  return webhookRequest(raw, env, sig);
+}
+
+test('checkout errors stay generic and do not echo Stripe details', async () => {
+  globalThis.fetch = async (url, init) => {
+    stripeCalls.push({ url: String(url), headers: init && init.headers, body: init && init.body });
+    return new Response(JSON.stringify({ error: { message: 'No such price: price_secret_detail', code: 'resource_missing' } }), { status: 400 });
+  };
+  const r = await checkout(stripeEnv, 'monthly');
+  assert.equal(r.status, 502);
+  const body = await r.json();
+  assert.equal(body.error, 'Could not start checkout. Try again.');
+  assert.doesNotMatch(body.error, /price_secret_detail|resource_missing|sk_test_/);
+});
+
+test('signed subscription completed with payment_status unpaid writes no active record', async () => {
+  const kv = memoryKv();
+  const token = 'sub:' + 'c'.repeat(32);
+  const r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_unpaid_1',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: 'cs_unpaid',
+        mode: 'subscription',
+        payment_status: 'unpaid',
+        metadata: { unlock_token: token, plan: 'monthly' },
+        subscription: 'sub_unpaid',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(await kv.get('sub:' + 'c'.repeat(32)), null);
+});
+
+test('signed subscription completed with missing payment_status writes nothing', async () => {
+  const kv = memoryKv();
+  const token = 'sub:' + 'd'.repeat(32);
+  const r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_missing_ps',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: 'cs_missing',
+        mode: 'subscription',
+        metadata: { unlock_token: token, plan: 'monthly' },
+        subscription: 'sub_missing',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(await kv.get('sub:' + 'd'.repeat(32)), null);
+});
+
+test('no_payment_required and async_payment_succeeded grant; async_payment_failed does not revoke', async () => {
+  const kv = memoryKv();
+  const token = 'sub:' + 'e'.repeat(32);
+  let r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_npr',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: 'cs_npr',
+        mode: 'subscription',
+        payment_status: 'no_payment_required',
+        metadata: { unlock_token: token, plan: 'monthly' },
+        subscription: 'sub_npr',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + 'e'.repeat(32), 'json')).status, 'active');
+
+  const token2 = 'sub:' + 'f'.repeat(32);
+  r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_async_ok',
+    type: 'checkout.session.async_payment_succeeded',
+    livemode: false,
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: 'cs_async_ok',
+        mode: 'subscription',
+        payment_status: 'paid',
+        metadata: { unlock_token: token2, plan: 'monthly' },
+        subscription: 'sub_async',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + 'f'.repeat(32), 'json')).status, 'active');
+
+  r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_async_fail',
+    type: 'checkout.session.async_payment_failed',
+    livemode: false,
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: 'cs_async_ok',
+        mode: 'subscription',
+        payment_status: 'unpaid',
+        metadata: { unlock_token: token2, plan: 'monthly' },
+        subscription: 'sub_async',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + 'f'.repeat(32), 'json')).status, 'active');
+});
+
+test('lifetime grant requires meta.plan lifetime and does not overwrite a subscriber', async () => {
+  const kv = memoryKv();
+  const token = 'sub:' + 'aa'.repeat(16);
+  let r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_not_life',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: 'cs_not_life',
+        mode: 'payment',
+        payment_status: 'paid',
+        metadata: { unlock_token: token, plan: 'monthly' },
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal(await kv.get('sub:' + 'aa'.repeat(16)), null);
+
+  const subToken = 'sub:' + 'ab'.repeat(16);
+  await kv.put('sub:' + 'ab'.repeat(16), JSON.stringify({ status: 'active', stripe_subscription_id: 'sub_keep', updated_at: Date.now() }));
+  r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_life_over',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: 'cs_life_over',
+        mode: 'payment',
+        payment_status: 'paid',
+        metadata: { unlock_token: subToken, plan: 'lifetime' },
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  const rec = await kv.get('sub:' + 'ab'.repeat(16), 'json');
+  assert.equal(rec.status, 'active');
+  assert.equal(rec.stripe_subscription_id, 'sub_keep');
+});
+
+test('refund and dispute end Pro for a lifetime purchase', async () => {
+  const kv = memoryKv();
+  const hex = 'ac'.repeat(16);
+  const token = 'sub:' + hex;
+  const created = Math.floor(Date.now() / 1000);
+  let r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_life_paid',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created,
+    data: {
+      object: {
+        id: 'cs_life_paid',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_life',
+        metadata: { unlock_token: token, plan: 'lifetime' },
+        customer_details: { email: 'buyer@example.com' },
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'lifetime');
+
+  r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_refunded',
+    type: 'charge.refunded',
+    livemode: false,
+    created: created + 1,
+    data: { object: { id: 'ch_life', object: 'charge', payment_intent: 'pi_life', refunded: true } },
+  });
+  assert.equal(r.status, 200);
+  let rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'refunded');
+  assert.ok(rec.ends_at);
+  assert.ok(Date.parse(rec.ends_at) <= Date.now());
+
+  await kv.put('sub:' + hex, JSON.stringify({ status: 'lifetime', updated_at: Date.now() }));
+  await kv.put('stripepi:pi_life', hex);
+  r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_dispute',
+    type: 'charge.dispute.created',
+    livemode: false,
+    created: created + 2,
+    data: { object: { id: 'dp_life', object: 'dispute', payment_intent: 'pi_life' } },
+  });
+  assert.equal(r.status, 200);
+  rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'refunded');
+});
+
+test('out-of-order checkout.session.completed does not override a cancelled subscriber', async () => {
+  const kv = memoryKv();
+  const hex = 'ad'.repeat(16);
+  const now = Date.now();
+  await kv.put('sub:' + hex, JSON.stringify({
+    status: 'cancelled',
+    cancel_pending: true,
+    stripe_subscription_id: 'sub_j',
+    updated_at: now,
+  }));
+  const r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: 'evt_late_completed',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: Math.floor(now / 1000) - 30,
+    data: {
+      object: {
+        id: 'cs_late',
+        mode: 'subscription',
+        payment_status: 'paid',
+        metadata: { unlock_token: 'sub:' + hex, plan: 'monthly' },
+        subscription: 'sub_j',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  const rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'cancelled');
+  assert.equal(rec.cancel_pending, true);
+});
+
+test('livemode must match the secret key mode', async () => {
+  const kv = memoryKv();
+  const event = {
+    id: 'evt_live_1',
+    type: 'checkout.session.completed',
+    livemode: true,
+    created: Math.floor(Date.now() / 1000),
+    data: { object: { id: 'cs_x', mode: 'subscription', payment_status: 'paid', metadata: { unlock_token: 'sub:' + 'ae'.repeat(16), plan: 'monthly' } } },
+  };
+  let r = await signedWebhook({ ...stripeEnv, KV: kv }, event);
+  assert.equal(r.status, 400);
+
+  r = await signedWebhook({ ...stripeEnv, STRIPE_SECRET_KEY: 'sk_live_abc', KV: kv }, event);
+  assert.equal(r.status, 400);
+
+  r = await signedWebhook({ ...stripeEnv, STRIPE_SECRET_KEY: 'sk_live_abc', STRIPE_ALLOW_LIVE: 'true', KV: kv }, event);
+  assert.equal(r.status, 200);
+
+  const testEvent = { ...event, id: 'evt_test_mismatch', livemode: false };
+  r = await signedWebhook({ ...stripeEnv, STRIPE_SECRET_KEY: 'sk_live_abc', STRIPE_ALLOW_LIVE: 'true', KV: kv }, testEvent);
+  assert.equal(r.status, 400);
+});
+
+test('empty event id is rejected; previous webhook secret is accepted', async () => {
+  const kv = memoryKv();
+  let r = await signedWebhook({ ...stripeEnv, KV: kv }, {
+    id: '',
+    type: 'checkout.session.completed',
+    livemode: false,
+    data: { object: {} },
+  });
+  assert.equal(r.status, 400);
+
+  const raw = JSON.stringify({
+    id: 'evt_prev',
+    type: 'ping',
+    livemode: false,
+    data: { object: {} },
+  });
+  const ts = Math.floor(Date.now() / 1000);
+  const sig = await signStripe('whsec_previous', raw, ts);
+  r = await webhookRequest(raw, { ...stripeEnv, STRIPE_WEBHOOK_SECRET_PREV: 'whsec_previous', KV: kv }, sig);
+  assert.equal(r.status, 200);
+  assert.ok(await kv.get('stripe:evt:evt_prev'));
+});
+
+test('oversized webhook is 413; non-POST is 405 without CORS', async () => {
+  const tooBig = await worker.fetch(
+    new Request('https://x.test/api/stripe-webhook', {
+      method: 'POST',
+      headers: { 'Content-Length': '2000000', 'Stripe-Signature': 't=1,v1=ab', 'Content-Type': 'application/json' },
+      body: '{}',
+    }),
+    { ...stripeEnv, KV: memoryKv() },
+    { waitUntil() {} }
+  );
+  assert.equal(tooBig.status, 413);
+
+  const get = await worker.fetch(
+    new Request('https://x.test/api/stripe-webhook', { method: 'GET' }),
+    { ...stripeEnv, KV: memoryKv() },
+    { waitUntil() {} }
+  );
+  assert.equal(get.status, 405);
+  assert.equal(get.headers.get('Allow'), 'POST');
+  assert.equal(get.headers.get('Access-Control-Allow-Origin'), null);
+
+  const opt = await worker.fetch(
+    new Request('https://x.test/api/stripe-webhook', { method: 'OPTIONS' }),
+    { ...stripeEnv, KV: memoryKv() },
+    { waitUntil() {} }
+  );
+  assert.equal(opt.status, 405);
+  assert.equal(opt.headers.get('Access-Control-Allow-Origin'), null);
+});
+
+test('strict digits are required in the Stripe-Signature timestamp', async () => {
+  const secret = 'whsec_test_secret';
+  const raw = '{"id":"evt_1","type":"ping"}';
+  const now = 1700000000;
+  const valid = await signStripe(secret, raw, now);
+  const tampered = valid.replace('t=' + now, 't=1700000000e0');
+  assert.equal(await verifyStripeSignature(raw, tampered, secret, now * 1000), false);
 });

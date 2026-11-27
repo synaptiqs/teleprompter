@@ -142,6 +142,8 @@ Do this in your own Stripe account. Do not put any keys in the repo.
 - `PAYMENT_PROVIDER` (var): `lemonsqueezy` (default) or `stripe`.
 - `STRIPE_SECRET_KEY` (secret): test key starting with `sk_test_`.
 - `STRIPE_WEBHOOK_SECRET` (secret): `whsec_...`.
+- `STRIPE_WEBHOOK_SECRET_PREV` (secret, optional): previous `whsec_...`
+  during signing-secret rotation.
 - `STRIPE_PRICE_ID_MONTHLY`, `STRIPE_PRICE_ID_YEARLY` (or
   `STRIPE_PRICE_ID_ANNUAL`), `STRIPE_PRICE_ID_LIFETIME` (vars).
 - `STRIPE_ALLOW_LIVE` (var, optional): only Tyler may set this to
@@ -169,7 +171,9 @@ Stripe webhooks write the same KV records as Lemon Squeezy:
   10-business-day deletion sequence runs.
 
 License-key redeem stays Lemon Squeezy only, because Stripe Checkout
-does not issue those keys.
+does not issue those keys. Multi-device unlock by license key is
+LS-only. There is no Stripe customer portal yet; Stripe buyers email
+info@lvltdllc.com to cancel.
 
 ### Local tests
 
