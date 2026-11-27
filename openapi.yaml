@@ -122,6 +122,24 @@ paths:
                   enum: [monthly, yearly, lifetime]
                   default: monthly
                   description: Plan to check out ($4.99/mo, $49.99/yr, or $129 one-time).
+                attribution:
+                  type: object
+                  description: >
+                    Optional first-touch attribution captured in the browser
+                    (utm_source, utm_medium, utm_campaign, utm_content,
+                    utm_term, referrer, landing, timestamp). The worker
+                    sanitizes each field and forwards them as Lemon Squeezy
+                    checkout_data.custom strings. Older worker deploys ignore
+                    this field and still create the checkout.
+                  properties:
+                    utm_source: { type: string }
+                    utm_medium: { type: string }
+                    utm_campaign: { type: string }
+                    utm_content: { type: string }
+                    utm_term: { type: string }
+                    referrer: { type: string }
+                    landing: { type: string }
+                    timestamp: { type: string }
       responses:
         '200':
           description: Checkout created.
@@ -142,6 +160,45 @@ paths:
           description: Could not start checkout.
         '503':
           description: Checkout not configured yet.
+
+  /api/launch-notify:
+    post:
+      operationId: launchNotify
+      summary: Join the launch list (notify me when the store goes live)
+      description: |
+        Stores an email plus optional first-touch attribution on the launch
+        list. No confirmation email is sent. A hidden honeypot field
+        named company (or website) is ignored: if it is filled, the
+        response is still { ok: true } and nothing is stored. Repeat
+        signups with the same email return { ok: true, already: true }
+        and keep the original attribution. Uses the existing KV binding
+        (no new namespace required). Returns 503 if KV is not bound.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+                attribution:
+                  type: object
+                  description: Same first-touch record used at checkout.
+                company:
+                  type: string
+                  description: Honeypot. Leave empty.
+      responses:
+        '200':
+          description: Stored, already on the list, or silently ignored honeypot.
+        '400':
+          description: Email was missing or invalid.
+        '429':
+          description: Too many attempts from this network.
+        '503':
+          description: Launch list storage is not bound.
 
   /api/me:
     get:

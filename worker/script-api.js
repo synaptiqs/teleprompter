@@ -74,6 +74,14 @@
  *                               (generated, recording_started, download,
  *                               subscribe). No PII; increments a daily KV
  *                               counter.
+ *   POST /api/launch-notify     { email, attribution?, company? } -> { ok }.
+ *                               Stores an email on the launch list (notify
+ *                               me when the store goes live) with first-touch
+ *                               attribution. "company" is a honeypot: if it
+ *                               is filled in, the request looks successful
+ *                               but nothing is stored. No confirmation email
+ *                               is sent. Uses the existing KV binding, or
+ *                               an optional LAUNCH_KV namespace if bound.
  *
  * Paywalled the same way: saved VOICEOVERS (audio-only recordings).
  * Storage: 100 GB base quota per paid identity (video blobs metered;
@@ -150,6 +158,10 @@
  *   emaillog:<ts>:<rand>  -> { to, subject, text, at } (queued when no
  *                              email provider is configured)
  *   ev:<YYYY-MM-DD>:<event> -> analytics counter (90-day TTL)
+ *   launch:<sha256("launch:"+email)> -> { email, attribution, created_at }
+ *                              (launch-list signup; email is stored
+ *                              lowercase; first signup wins)
+ *   launchthrottle:<hour>:<ip> -> launch-list attempt count (2-hour TTL)
  *
  * Secrets (set via the Workers API):
  *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
@@ -164,8 +176,12 @@
  *   EMAIL_API_KEY + EMAIL_FROM (optional; without them, deletion emails
  *     are logged to KV instead of sent — wire a provider before launch)
  *
- * Bindings: AI (Workers AI), KV (this namespace),
+ * Bindings: AI (Workers AI), KV (this namespace, also used for the
+ *   launch list under the launch: prefix),
+ *   LAUNCH_KV (optional; if bound, launch-list rows go here instead of KV),
  *   VOICEOVER_AUDIO (R2 bucket, optional until R2 is enabled).
+ *   No new namespace is required for the launch list. Do not create
+ *   LAUNCH_KV unless you want those rows isolated later.
  */
 
 // Words per second for natural spoken delivery (~145 wpm).
@@ -298,6 +314,29 @@ async function checkRedeemThrottle(env, request) {
   await env.KV.put(key, String(count + 1), { expirationTtl: 1200 });
 }
 
+// Launch-list signups use the existing KV binding, or a separate
+// LAUNCH_KV namespace if one is bound later. Nothing to create for v1.
+function launchKv(env) {
+  return env.LAUNCH_KV || env.KV;
+}
+
+// Launch-list throttle: 5 attempts per hour per IP, including repeats.
+var LAUNCH_THROTTLE_MAX = 5;
+async function checkLaunchThrottle(env, request) {
+  var kv = launchKv(env);
+  if (!kv || !request) return;
+  var ip = clientIp(request);
+  var key = "launchthrottle:" + Math.floor(Date.now() / 3600000) + ":" + ip;
+  var count = Number(await kv.get(key)) || 0;
+  if (count >= LAUNCH_THROTTLE_MAX) {
+    var err = new Error("Too many signups from this network. Please try again later.");
+    err.status = 429;
+    err.code = "throttled";
+    throw err;
+  }
+  await kv.put(key, String(count + 1), { expirationTtl: 7200 });
+}
+
 // Concurrency pool (thundering-herd §8): best-effort KV semaphore capping
 // simultaneous AI calls. 90s TTL self-heals leaked slots.
 var GEN_POOL_MAX = 5;
@@ -380,6 +419,94 @@ function clean(value, max) {
   return (value === undefined || value === null ? "" : String(value))
     .trim()
     .slice(0, max);
+}
+
+// First-touch attribution rules (keep in sync with attribution.js).
+// UTM values are [a-z0-9_-], max 64 characters. Referrer is a hostname
+// (dots allowed). Landing is a path (slashes allowed). These fields are
+// later copied into Lemon Squeezy checkout_data.custom as strings.
+var ATTR_UTM_KEYS = ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"];
+var ATTR_MAX = 64;
+// Never let client attribution overwrite checkout identity fields.
+var ATTR_RESERVED = { unlock_token: 1, storage_gb: 1 };
+
+function sanitizeUtmValue(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9_-]/g, "").slice(0, ATTR_MAX);
+}
+
+function sanitizeReferrerHost(value) {
+  var raw = String(value || "").trim();
+  if (!raw) return "";
+  var host = raw;
+  try {
+    if (/^https?:\/\//i.test(raw)) host = new URL(raw).hostname;
+    else host = raw.split("/")[0];
+  } catch (e) {
+    host = raw.split("/")[0];
+  }
+  return host.toLowerCase().replace(/[^a-z0-9.-]/g, "").replace(/^\.+|\.+$/g, "").slice(0, ATTR_MAX);
+}
+
+function sanitizeLandingPath(value) {
+  var raw = String(value || "").trim() || "";
+  if (!raw) return "";
+  if (raw.charAt(0) !== "/") raw = "/" + raw;
+  raw = raw.split("?")[0].split("#")[0];
+  return raw.toLowerCase().replace(/[^a-z0-9/_-]/g, "").slice(0, ATTR_MAX) || "";
+}
+
+function sanitizeAttrTimestamp(value) {
+  var raw = String(value || "").trim().slice(0, ATTR_MAX);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(raw)) return "";
+  return raw;
+}
+
+// Accept the frontend record or the flat checkout_data names. Invalid
+// input is ignored so checkout still succeeds if a client sends junk.
+function sanitizeAttribution(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return {};
+  var out = {};
+  ATTR_UTM_KEYS.forEach(function (key) {
+    var value = sanitizeUtmValue(input[key]);
+    if (value) out[key] = value;
+  });
+  var referrer = sanitizeReferrerHost(input.referrer || input.attr_referrer);
+  if (referrer) out.referrer = referrer;
+  var landing = sanitizeLandingPath(input.landing || input.landing_path || input.attr_landing);
+  if (landing) out.landing = landing;
+  var timestamp = sanitizeAttrTimestamp(input.timestamp || input.ts || input.attr_ts);
+  if (timestamp) out.timestamp = timestamp;
+  return out;
+}
+
+// Flatten a sanitized record into Lemon Squeezy custom data (string values only).
+function attributionToCustom(record) {
+  var out = {};
+  if (!record) return out;
+  ATTR_UTM_KEYS.forEach(function (key) {
+    if (record[key]) out[key] = String(record[key]);
+  });
+  if (record.referrer) out.attr_referrer = String(record.referrer);
+  if (record.landing) out.attr_landing = String(record.landing);
+  if (record.timestamp) out.attr_ts = String(record.timestamp);
+  return out;
+}
+
+function applyAttribution(custom, raw) {
+  var flat = attributionToCustom(sanitizeAttribution(raw));
+  Object.keys(flat).forEach(function (key) {
+    if (ATTR_RESERVED[key]) return;
+    custom[key] = flat[key];
+  });
+  return custom;
+}
+
+// Simple email check: one @, a dotted domain, no spaces. Lowercased.
+function normalizeLaunchEmail(value) {
+  var email = clean(value, 254).toLowerCase();
+  if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return "";
+  if (email.indexOf("..") !== -1) return "";
+  return email;
 }
 
 // ---- crypto helpers (WebCrypto, no dependencies) ----
@@ -899,7 +1026,7 @@ function storageTierGb(env) {
   }
 }
 
-async function doCheckout(env, origin, plan, existingToken) {
+async function doCheckout(env, origin, plan, existingToken, attribution) {
   if (
     !env.LEMONSQUEEZY_API_KEY ||
     !env.LEMONSQUEEZY_STORE_ID ||
@@ -918,6 +1045,9 @@ async function doCheckout(env, origin, plan, existingToken) {
   var variantId;
   var token = "sub:" + randomHex(16);
   var custom = { unlock_token: token };
+  // Attach first-touch attribution after identity fields are set so
+  // reserved keys (unlock_token, storage_gb) cannot be overwritten.
+  applyAttribution(custom, attribution);
   var storagePlan = STORAGE_PLANS[plan];
   if (storagePlan) {
     existingToken = clean(existingToken, 64);
@@ -1673,10 +1803,63 @@ async function handleCheckout(request, env, cors) {
     body = {};
   }
   try {
-    return json(await doCheckout(env, body.origin, body.plan, body.token), 200, cors);
+    return json(await doCheckout(env, body.origin, body.plan, body.token, body.attribution), 200, cors);
   } catch (e) {
     return json({ error: e.message || "Could not start checkout." }, e.status || 500, cors);
   }
+}
+
+async function handleLaunchNotify(request, env, cors) {
+  // Store an email on the launch list with first-touch attribution.
+  // No confirmation email is sent. A filled honeypot looks like success
+  // but writes nothing. Existing emails keep their original attribution.
+  var body = {};
+  try {
+    body = await request.json();
+  } catch (e) {
+    body = {};
+  }
+  try {
+    return json(await doLaunchNotify(env, request, body), 200, cors);
+  } catch (e) {
+    return json({ error: e.message || "Could not save that email." }, e.status || 500, cors);
+  }
+}
+
+async function doLaunchNotify(env, request, body) {
+  body = body || {};
+  await checkLaunchThrottle(env, request);
+
+  // Honeypot: bots that fill a hidden "company" or "website" field get a
+  // generic success and we store nothing.
+  var honeypot = clean(body.company, 120) || clean(body.website, 120);
+  if (honeypot) {
+    return { ok: true };
+  }
+
+  var email = normalizeLaunchEmail(body.email);
+  if (!email) {
+    throw ApiError(400, "Please enter a valid email address.");
+  }
+
+  var kv = launchKv(env);
+  if (!kv) {
+    throw ApiError(503, "The launch list is not available yet.");
+  }
+
+  var key = "launch:" + (await sha256Hex("launch:" + email));
+  var existing = await kv.get(key, "json");
+  if (existing && existing.email) {
+    return { ok: true, already: true };
+  }
+
+  var record = {
+    email: email,
+    attribution: sanitizeAttribution(body.attribution),
+    created_at: new Date().toISOString(),
+  };
+  await kv.put(key, JSON.stringify(record));
+  return { ok: true };
 }
 
 async function handleWebhook(request, env, cors) {
@@ -2286,6 +2469,9 @@ export default {
     }
     if (path === "/api/event" && request.method === "POST") {
       return handleEvent(request, env, cors);
+    }
+    if (path === "/api/launch-notify" && request.method === "POST") {
+      return handleLaunchNotify(request, env, cors);
     }
 
     return json({ error: "Not found." }, 404, cors);

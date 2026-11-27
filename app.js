@@ -406,7 +406,15 @@
         subscribeButton.disabled = true;
         paywallStatus.textContent = "Opening secure checkout…";
         try {
-          var data = await apiPost("/api/checkout", { origin: window.location.origin, plan: selectedPlan() });
+          // Include first-touch attribution when we have it. The live
+          // Worker may ignore this field until it is redeployed; checkout
+          // still works either way.
+          var checkoutBody = { origin: window.location.origin, plan: selectedPlan() };
+          if (window.ClickPromptAttribution) {
+            var attr = window.ClickPromptAttribution.get();
+            if (attr) checkoutBody.attribution = attr;
+          }
+          var data = await apiPost("/api/checkout", checkoutBody);
           if (data._ok && data.url && data.token) {
             // Store the unlock token BEFORE leaving: the webhook matches it
             // back via checkout custom data, and /api/me polls it on return.
@@ -1725,6 +1733,57 @@
       codeInput.addEventListener("keydown", function (e) {
         if (e.key === "Enter") redeemCode();
       });
+
+      // Launch-list signup: email plus the first-touch attribution record.
+      // Works from the paywall and from the home-page form.
+      async function submitLaunchSignup(form) {
+        var emailInput = form.querySelector('input[type="email"], input[name="email"]');
+        var honeypotInput = form.querySelector('input[name="company"]');
+        var status = form.querySelector(".launch-status");
+        var button = form.querySelector('button[type="submit"]');
+        var email = emailInput ? emailInput.value.trim() : "";
+        if (status) status.textContent = "";
+        if (!email) {
+          if (status) status.textContent = "Enter your email first.";
+          if (emailInput) emailInput.focus();
+          return;
+        }
+        var body = { email: email, company: honeypotInput ? honeypotInput.value : "" };
+        if (window.ClickPromptAttribution) {
+          var launchAttr = window.ClickPromptAttribution.get();
+          if (launchAttr) body.attribution = launchAttr;
+        }
+        if (button) button.disabled = true;
+        if (status) status.textContent = "Saving…";
+        try {
+          var result = await apiPost("/api/launch-notify", body);
+          if (result._ok && result.ok) {
+            if (status) {
+              status.textContent = result.already
+                ? "You are already on the list. We will email you when the store goes live."
+                : "You are on the list. We will email you when the store goes live.";
+            }
+            if (emailInput) emailInput.value = "";
+          } else if (result._status === 503) {
+            if (status) status.textContent = "The launch list is not available yet. Please try again after the next update.";
+          } else {
+            if (status) status.textContent = result.error || "Could not save that email. Please try again.";
+          }
+        } catch (e) {
+          if (status) status.textContent = "Could not reach the server. Check your connection and try again.";
+        } finally {
+          if (button) button.disabled = false;
+        }
+      }
+      var launchForms = document.querySelectorAll("[data-launch-signup]");
+      for (var li = 0; li < launchForms.length; li++) {
+        (function (form) {
+          form.addEventListener("submit", function (e) {
+            e.preventDefault();
+            submitLaunchSignup(form);
+          });
+        })(launchForms[li]);
+      }
 
       countdownToggle.addEventListener("click", function () { togglePressed(countdownToggle); });
       mirrorToggle.addEventListener("click", function () {

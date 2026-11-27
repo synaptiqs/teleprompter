@@ -86,3 +86,37 @@ A cancelled monthly/yearly plan keeps Pro until the paid period ends.
   email sequence.
 - The frontend keeps one opaque unlock token in `localStorage`
   (`clickprompt_token`): `code:<CODE>`, `sub:<hex>`, or `lic:<license key>`.
+
+## First-touch attribution and the launch list
+
+On every public page, `attribution.js` records the first visit (UTM
+parameters, referrer host, landing path, and timestamp) in
+`localStorage` under `clickprompt_attribution`. Later visits do not
+overwrite that record, so checkout, the launch list, and future
+features can reuse it.
+
+When the app starts a Lemon Squeezy checkout it sends the record as
+`attribution` on `POST /api/checkout`. The Worker sanitizes the fields
+and copies them into `checkout_data.custom` so they show on the order
+and on webhooks. **The Worker must be redeployed by hand for that
+forwarding to work.** Until then the live Worker ignores the extra
+field and checkout still succeeds.
+
+`POST /api/launch-notify` stores an email plus that attribution for
+the "Notify me when the store goes live" form. It uses the existing
+`KV` binding (`clickprompt-data`) with a `launch:` key prefix. No new
+Cloudflare namespace is required. If you later want those rows
+isolated, bind an optional `LAUNCH_KV` namespace and the Worker will
+prefer it. Do not create that binding unless you want the split.
+
+There is no confirmation email. Signups are rate-limited per IP and a
+hidden honeypot field (`company`) is ignored.
+
+## Tests
+
+From the repo root (no network; Lemon Squeezy is faked):
+
+```
+node --test test/*.mjs
+```
+

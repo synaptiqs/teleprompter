@@ -455,6 +455,49 @@
     .text-button:hover { color: var(--ink); text-decoration: underline; }
     .tour-replay { display: inline-block; width: auto; margin: 0; padding: 4px 0; font-size: .85rem; }
 
+    /* Launch-list signup, used on the home setup screen and in the paywall. */
+    .launch-signup {
+      margin: 16px 0 0;
+      padding: 12px 0 0;
+      border-top: 1px solid var(--line);
+    }
+    .launch-signup-title {
+      margin: 0 0 8px;
+      font-size: .92rem;
+      font-weight: 650;
+      color: var(--ink);
+    }
+    .launch-email-label {
+      display: block;
+      font-size: .86rem;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .launch-email-label input {
+      display: block;
+      width: 100%;
+      margin-top: 6px;
+    }
+    .launch-signup .secondary { margin-top: 8px; }
+    .launch-status {
+      min-height: 1.3em;
+      margin: 8px 0 0;
+      font-size: .84rem;
+      color: var(--muted);
+    }
+    .launch-signup-paywall {
+      margin: 16px 0 8px;
+      padding-top: 16px;
+    }
+    /* Hidden honeypot: off-screen so people never see it, still in the form. */
+    .launch-honeypot {
+      position: absolute;
+      left: -9999px;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+    }
+
     /* ---- first-run tour ---- */
     .tour-highlight {
       position: fixed; z-index: 90; pointer-events: none;
