@@ -160,11 +160,13 @@ Do this in your own Stripe account. Do not put any keys in the repo.
 - `STRIPE_PRICE_AMOUNT_MONTHLY`, `STRIPE_PRICE_AMOUNT_YEARLY` (or
   `STRIPE_PRICE_AMOUNT_ANNUAL`), `STRIPE_PRICE_AMOUNT_LIFETIME`
   (optional vars, integer cents). When set, a Checkout grant also
-  requires the line `price.unit_amount` to be present and equal to
-  that catalog amount. `amount_total` is not compared, so a promo
-  or tax-inclusive total can still grant when the catalog unit
-  amount matches. When unset, the grant still requires currency
-  `usd` and quantity `1`, but does not compare amounts.
+  requires the line `price.unit_amount` to be present, to be an
+  integer number (not a string), and to equal that catalog amount.
+  `amount_total` is not compared. Coupons may lower `amount_total`,
+  and tax may raise it; those totals can still grant when the
+  catalog unit amount matches. There is no minimum-total env var.
+  When unset, the grant still requires currency `usd` and quantity
+  `1`, but does not compare amounts.
 - `STRIPE_ALLOW_LIVE` (var, optional): only Tyler may set this to
   `true`. Without it, live `sk_live_` keys are refused.
 
