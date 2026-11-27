@@ -74,24 +74,26 @@
  *                               (generated, recording_started, download,
  *                               subscribe). No PII; increments a daily KV
  *                               counter.
- *   POST /api/launch-notify     { email, attribution?, company?,
+ *   POST /api/launch-notify     { email, attribution?, hp_website_url?,
  *                               cf-turnstile-response? } -> { ok: true }.
  *                               Stores an email on the launch list (notify
  *                               me when the store goes live) with first-touch
  *                               attribution. New signups, repeats, and a
- *                               filled honeypot ("company" / "website") all
+ *                               filled honeypot (hp_website_url) all
  *                               return the same { ok: true }; honeypots are
  *                               not stored and repeats keep the original
  *                               row. No confirmation email is sent. Requires
  *                               a LAUNCH_KV binding (no fallback to KV).
- *                               Optional LAUNCH_RATE_LIMITER binding is
- *                               used when present, otherwise a KV throttle
- *                               on LAUNCH_KV (5/hour, IPv6 /64). Optional
- *                               TURNSTILE_SECRET: when set, a Turnstile
- *                               token is required (same helper as the
- *                               pending generate-script Turnstile PR).
- *                               Body must be application/json, max 8 KB.
- *                               Launch rows expire after about one year.
+ *                               Optional LAUNCH_RATE_LIMITER binding should
+ *                               be bound (with Tyler's OK) before a Worker
+ *                               redeploy; otherwise a KV throttle on
+ *                               LAUNCH_KV is the fallback (5/hour, IPv6 /64).
+ *                               Optional TURNSTILE_SECRET: when set, a
+ *                               Turnstile token is required (same helper as
+ *                               the pending generate-script Turnstile PR).
+ *                               Body must be application/json, max 8 KB,
+ *                               streamed and aborted at 8 KB. Launch rows
+ *                               expire after about one year.
  *
  * Paywalled the same way: saved VOICEOVERS (audio-only recordings).
  * Storage: 100 GB base quota per paid identity (video blobs metered;
@@ -193,7 +195,8 @@
  *   LAUNCH_KV (required for the launch list; no fallback to KV; Tyler
  *     creates and binds this, this code does not),
  *   LAUNCH_RATE_LIMITER (optional Cloudflare Rate Limiting binding;
- *     used when present, otherwise KV throttle on LAUNCH_KV),
+ *     bind with Tyler's OK before a Worker redeploy; KV throttle on
+ *     LAUNCH_KV is the fallback),
  *   VOICEOVER_AUDIO (R2 bucket, optional until R2 is enabled).
  */
 
@@ -348,34 +351,72 @@ function launchThrottleError() {
 
 // IPv6 addresses share a throttle bucket at /64 so one network cannot
 // bypass the limit with a new address per try. IPv4 stays a single IP.
-// IPv4-mapped IPv6 (":ffff:1.2.3.4") is treated as IPv4.
+// A zone index is stripped first, then IPv4-mapped forms
+// (::ffff:a.b.c.d, 0:0:0:0:0:ffff:a.b.c.d, and hex ::ffff:xxxx:yyyy)
+// are treated as IPv4.
+function expandIpv6Groups(ip) {
+  var dotted = ip.match(/:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  var head = ip;
+  var extra = [];
+  if (dotted) {
+    var oct = dotted[1].split(".").map(Number);
+    if (oct.length !== 4 || oct.some(function (n) { return !isFinite(n) || n < 0 || n > 255; })) {
+      return null;
+    }
+    head = ip.slice(0, ip.length - dotted[0].length);
+    extra = [
+      ((oct[0] << 8) | oct[1]).toString(16),
+      ((oct[2] << 8) | oct[3]).toString(16)
+    ];
+  }
+  var parts;
+  if (head.indexOf("::") !== -1) {
+    var sides = head.split("::");
+    if (sides.length !== 2) return null;
+    var left = sides[0] ? sides[0].split(":") : [];
+    var right = sides[1] ? sides[1].split(":") : [];
+    var fill = 8 - left.length - right.length - extra.length;
+    if (fill < 0) return null;
+    parts = left.concat(Array(fill).fill("0"), right, extra);
+  } else {
+    parts = (head ? head.split(":") : []).concat(extra);
+  }
+  if (parts.length !== 8) return null;
+  for (var i = 0; i < 8; i++) {
+    if (!/^[0-9a-f]{0,4}$/.test(parts[i] || "0")) return null;
+    parts[i] = parts[i] || "0";
+  }
+  return parts;
+}
+
 function throttleIpKey(ip) {
   ip = String(ip || "").trim().toLowerCase();
   if (!ip || ip === "unknown") return "unknown";
-  var v4mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-  if (v4mapped) return v4mapped[1];
+  // Strip a zone index (%eth0, %wlan0, %15) before any mapped-IPv4 check.
+  ip = ip.split("%")[0];
+  if (!ip) return "unknown";
   if (ip.indexOf(":") === -1) return ip;
-  var zoneFree = ip.split("%")[0];
-  var parts;
-  if (zoneFree.indexOf("::") !== -1) {
-    var sides = zoneFree.split("::");
-    var left = sides[0] ? sides[0].split(":") : [];
-    var right = sides[1] ? sides[1].split(":") : [];
-    // An IPv4 tail in the last group is one group, not two.
-    var fill = 8 - left.length - right.length;
-    if (fill < 0) return ip;
-    parts = left.concat(Array(fill).fill("0"), right);
-  } else {
-    parts = zoneFree.split(":");
+  var parts = expandIpv6Groups(ip);
+  if (!parts) return ip;
+  function norm(h) { return String(h).replace(/^0+/, "") || "0"; }
+  var n = parts.map(norm);
+  if (n[0] === "0" && n[1] === "0" && n[2] === "0" && n[3] === "0" && n[4] === "0" && n[5] === "ffff") {
+    var hi = parseInt(parts[6], 16);
+    var lo = parseInt(parts[7], 16);
+    if (!isFinite(hi) || !isFinite(lo)) return ip;
+    return [(hi >> 8) & 255, hi & 255, (lo >> 8) & 255, lo & 255].join(".");
   }
-  if (parts.length !== 8) return ip;
-  return parts.slice(0, 4).map(function (h) {
-    return h.replace(/^0+/, "") || "0";
-  }).join(":") + "::/64";
+  return n.slice(0, 4).join(":") + "::/64";
 }
 
 // Launch-list throttle runs before the body is read. Prefer the optional
-// Rate Limiting binding when it is present; otherwise count on LAUNCH_KV.
+// Rate Limiting binding when it is present and result.success is true.
+// Skip the KV fallback only in that case; anything else (including {})
+// falls through to KV. success: false still rejects.
+//
+// The KV counter is a read-then-write, so two requests in the same
+// instant can both pass the cap (best-effort, same as other counters
+// in this Worker). Keys store a hash of the IP bucket, not the raw IP.
 async function checkLaunchThrottle(env, request) {
   if (!request) return;
   var ip = throttleIpKey(clientIp(request));
@@ -383,7 +424,8 @@ async function checkLaunchThrottle(env, request) {
     try {
       var result = await env.LAUNCH_RATE_LIMITER.limit({ key: ip });
       if (result && result.success === false) throw launchThrottleError();
-      return;
+      if (result && result.success === true) return;
+      // Missing, empty, or unexpected result: use the KV throttle.
     } catch (e) {
       if (e && e.status === 429) throw e;
       // Binding failed unexpectedly: fall through to the KV throttle.
@@ -391,7 +433,8 @@ async function checkLaunchThrottle(env, request) {
   }
   var kv = launchKv(env);
   if (!kv) return;
-  var key = "launchthrottle:" + Math.floor(Date.now() / 3600000) + ":" + ip;
+  var bucket = await sha256Hex("throttle:" + ip);
+  var key = "launchthrottle:" + Math.floor(Date.now() / 3600000) + ":" + bucket;
   var count = Number(await kv.get(key)) || 0;
   if (count >= LAUNCH_THROTTLE_MAX) throw launchThrottleError();
   await kv.put(key, String(count + 1), { expirationTtl: LAUNCH_THROTTLE_TTL });
@@ -402,22 +445,54 @@ function isJsonContentType(request) {
   return ct.split(";")[0].trim() === "application/json";
 }
 
-// Reject oversized bodies before JSON.parse. Trust Content-Length when it
-// is present, and also measure the bytes actually read.
+// Reject oversized bodies before JSON.parse. Stream the body with
+// getReader(), count bytes, and cancel as soon as the total exceeds
+// maxBytes, even if Content-Length is missing or lies.
 async function readLimitedJsonBody(request, maxBytes) {
+  function tooBig() {
+    var err = new Error("Request is too large.");
+    err.status = 413;
+    return err;
+  }
   var len = request.headers.get("Content-Length");
   if (len !== null && len !== "" && /^\d+$/.test(String(len).trim()) && Number(len) > maxBytes) {
-    var tooBig = new Error("Request is too large.");
-    tooBig.status = 413;
-    throw tooBig;
+    if (request.body && typeof request.body.cancel === "function") {
+      try { await request.body.cancel(); } catch (e) { /* already closed */ }
+    }
+    throw tooBig();
   }
-  var buf = await request.arrayBuffer();
-  if (buf.byteLength > maxBytes) {
-    var tooBig2 = new Error("Request is too large.");
-    tooBig2.status = 413;
-    throw tooBig2;
+
+  var reader = request.body && typeof request.body.getReader === "function"
+    ? request.body.getReader()
+    : null;
+  var chunks = [];
+  var total = 0;
+  if (reader) {
+    while (true) {
+      var step = await reader.read();
+      if (step.done) break;
+      var value = step.value || new Uint8Array(0);
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch (e) { /* already closed */ }
+        throw tooBig();
+      }
+      chunks.push(value);
+    }
+  } else {
+    var buf = await request.arrayBuffer();
+    if (buf.byteLength > maxBytes) throw tooBig();
+    chunks.push(new Uint8Array(buf));
+    total = buf.byteLength;
   }
-  var text = new TextDecoder("utf-8").decode(buf);
+
+  var bytes = new Uint8Array(total);
+  var offset = 0;
+  for (var i = 0; i < chunks.length; i++) {
+    bytes.set(chunks[i], offset);
+    offset += chunks[i].byteLength;
+  }
+  var text = new TextDecoder("utf-8").decode(bytes);
   try {
     return JSON.parse(text);
   } catch (e) {
@@ -551,6 +626,21 @@ function sanitizeAttrTimestamp(value) {
   return raw;
 }
 
+var ATTR_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+var ATTR_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+
+// Drop the whole attribution object when its timestamp is 90 days old
+// or older, unparseable, or more than one day in the future.
+function attributionTimestampFresh(timestamp) {
+  if (!timestamp) return true;
+  var at = Date.parse(timestamp);
+  if (!isFinite(at)) return false;
+  var now = Date.now();
+  if ((at - now) > ATTR_FUTURE_SKEW_MS) return false;
+  if ((now - at) >= ATTR_MAX_AGE_MS) return false;
+  return true;
+}
+
 // Accept the frontend record or the flat checkout_data names. Invalid
 // input is ignored so checkout still succeeds if a client sends junk.
 function sanitizeAttribution(input) {
@@ -565,6 +655,7 @@ function sanitizeAttribution(input) {
   var landing = sanitizeLandingPath(input.landing || input.landing_path || input.attr_landing);
   if (landing) out.landing = landing;
   var timestamp = sanitizeAttrTimestamp(input.timestamp || input.ts || input.attr_ts);
+  if (timestamp && !attributionTimestampFresh(timestamp)) return {};
   if (timestamp) out.timestamp = timestamp;
   return out;
 }
@@ -593,7 +684,9 @@ function applyAttribution(custom, raw) {
 
 // Simple email check: one @, a dotted domain, no spaces. Lowercased.
 function normalizeLaunchEmail(value) {
-  var email = clean(value, 254).toLowerCase();
+  // Reject (do not truncate) addresses longer than 254 characters.
+  var email = (value === undefined || value === null ? "" : String(value)).trim().toLowerCase();
+  if (!email || email.length > 254) return "";
   if (!/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(email)) return "";
   if (email.indexOf("..") !== -1) return "";
   return email;
@@ -1927,6 +2020,15 @@ async function handleCheckout(request, env, cors) {
 // (#10). Off until TURNSTILE_SECRET is set. Shared so both features can
 // use one secret and one sitekey without drifting.
 var TURNSTILE_VERIFY = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+function isAllowedTurnstileHost(host) {
+  host = String(host || "").toLowerCase();
+  if (host === "clickprompt.app" || host === "www.clickprompt.app") return true;
+  var pages = "teleprompter-5fz.pages.dev";
+  if (host === pages) return true;
+  if (host.length > pages.length && host.slice(-(pages.length + 1)) === "." + pages) return true;
+  return false;
+}
+
 async function turnstileOk(request, env, token) {
   token = String(token || "");
   if (!token || token.length > 2048) return false;
@@ -1936,9 +2038,16 @@ async function turnstileOk(request, env, token) {
   var ip = request.headers.get("CF-Connecting-IP");
   if (ip) form.append("remoteip", ip);
   try {
-    var r = await fetch(TURNSTILE_VERIFY, { method: "POST", body: form });
+    var r = await fetch(TURNSTILE_VERIFY, {
+      method: "POST",
+      body: form,
+      signal: AbortSignal.timeout(5000)
+    });
     var d = await r.json();
-    return !!(d && d.success === true);
+    if (!d || d.success !== true) return false;
+    if (!isAllowedTurnstileHost(d.hostname)) return false;
+    if (d.action !== "launch") return false;
+    return true;
   } catch (e) {
     return false;
   }
@@ -1968,25 +2077,32 @@ async function doLaunchNotify(env, request, body) {
     throw ApiError(503, "The launch list is not available yet.");
   }
 
-  // Honeypot: bots that fill a hidden "company" or "website" field get the
-  // same { ok: true } as a real signup, and we store nothing.
-  var honeypot = clean(body.company, 120) || clean(body.website, 120);
-  if (honeypot) {
-    return { ok: true };
-  }
-
-  var email = normalizeLaunchEmail(body.email);
-  if (!email) {
-    throw ApiError(400, "Please enter a valid email address.");
-  }
-
   // Turnstile is off until TURNSTILE_SECRET is set (same as PR #10).
+  // Honeypot submissions take this path too, so a missing token is 403
+  // whether or not the hidden field was filled.
   if (env.TURNSTILE_SECRET) {
     if (!(await turnstileOk(request, env, body["cf-turnstile-response"]))) {
       var human = ApiError(403, "Please complete the quick human check, then try again.");
       human.code = "human_check";
       throw human;
     }
+  }
+
+  var honeypot = clean(body.hp_website_url, 120);
+  var email = normalizeLaunchEmail(body.email);
+
+  // Always do a KV get before the generic { ok: true } so honeypot
+  // timing matches a real signup. Honeypots are not stored.
+  if (honeypot) {
+    var hpKey = email
+      ? "launch:" + (await sha256Hex("launch:" + email))
+      : "launch:" + (await sha256Hex("launch:honeypot"));
+    await kv.get(hpKey, "json");
+    return { ok: true };
+  }
+
+  if (!email) {
+    throw ApiError(400, "Please enter a valid email address.");
   }
 
   var key = "launch:" + (await sha256Hex("launch:" + email));
@@ -2585,22 +2701,44 @@ export default {
     var url = new URL(request.url);
     var path = url.pathname;
 
+    // Known paths with the wrong method return 405 and an Allow header
+    // instead of a generic 404.
+    var routeMethods = {
+      "/mcp": "POST",
+      "/api/generate-script": "POST",
+      "/api/checkout": "POST",
+      "/api/webhook": "POST",
+      "/api/me": "GET",
+      "/api/redeem": "POST",
+      "/api/scripts": "GET, POST, DELETE",
+      "/api/audio": "GET, POST, DELETE",
+      "/api/event": "POST",
+      "/api/launch-notify": "POST"
+    };
+    var allowed = routeMethods[path];
+    if (allowed) {
+      var methods = allowed.split(",").map(function (m) { return m.trim(); });
+      if (methods.indexOf(request.method) === -1) {
+        return json({ error: "Method not allowed." }, 405, Object.assign({}, cors, { Allow: allowed }));
+      }
+    }
+
     if (path === "/mcp") {
       return handleMcp(request, env, cors);
     }
-    if (path === "/api/generate-script" && request.method === "POST") {
+    if (path === "/api/generate-script") {
       return handleGenerate(request, env, cors);
     }
-    if (path === "/api/checkout" && request.method === "POST") {
+    if (path === "/api/checkout") {
       return handleCheckout(request, env, cors);
     }
-    if (path === "/api/webhook" && request.method === "POST") {
+    if (path === "/api/webhook") {
       return handleWebhook(request, env, cors);
     }
-    if (path === "/api/me" && request.method === "GET") {
+    if (path === "/api/me") {
       return handleMe(request, env, cors);
     }
-    if (path === "/api/redeem" && request.method === "POST") {
+    if (path === "/api/redeem") {
       return handleRedeem(request, env, cors);
     }
     if (path === "/api/scripts") {
@@ -2609,10 +2747,10 @@ export default {
     if (path === "/api/audio") {
       return handleAudio(request, env, cors);
     }
-    if (path === "/api/event" && request.method === "POST") {
+    if (path === "/api/event") {
       return handleEvent(request, env, cors);
     }
-    if (path === "/api/launch-notify" && request.method === "POST") {
+    if (path === "/api/launch-notify") {
       return handleLaunchNotify(request, env, cors);
     }
 
@@ -2624,4 +2762,4 @@ export default {
     ctx.waitUntil(runDeletionCron(env));
   },
 };
-export { turnstileOk as _turnstileOk, throttleIpKey as _throttleIpKey, allowedCheckoutOrigin as _allowedCheckoutOrigin };
+export { turnstileOk as _turnstileOk, throttleIpKey as _throttleIpKey, allowedCheckoutOrigin as _allowedCheckoutOrigin, sanitizeAttribution as _sanitizeAttribution };

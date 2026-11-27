@@ -36,8 +36,11 @@
       // Free-cap identity: a first-party visitor cookie (cp_vid), with the
       // client IP as the server-side fallback. Set once, lasts a year.
       function visitorId() {
-        var m = document.cookie.match(/(?:^|;\s*)cp_vid=([0-9a-f]{32})/);
-        if (m) return m[1];
+        // Cookie access can throw in a locked-down or sandboxed document.
+        try {
+          var m = document.cookie.match(/(?:^|;\s*)cp_vid=([0-9a-f]{32})/);
+          if (m) return m[1];
+        } catch (e) { /* proceed and mint a session id */ }
         var id = "";
         try {
           var bytes = new Uint8Array(16);
@@ -49,7 +52,9 @@
           id = String(Date.now().toString(16)) + String(Math.random()).slice(2, 18);
           id = (id + "00000000000000000000000000000000").slice(0, 32);
         }
-        document.cookie = "cp_vid=" + id + "; max-age=31536000; path=/; SameSite=Lax";
+        try {
+          document.cookie = "cp_vid=" + id + "; max-age=31536000; path=/; SameSite=Lax";
+        } catch (e) { /* still return the id for this session */ }
         return id;
       }
 
@@ -410,10 +415,17 @@
           // Worker may ignore this field until it is redeployed; checkout
           // still works either way.
           var checkoutBody = { origin: window.location.origin, plan: selectedPlan() };
-          if (window.ClickPromptAttribution) {
-            var attr = window.ClickPromptAttribution.get();
-            if (attr) checkoutBody.attribution = attr;
-          }
+          // Attribution is optional. A throwing or blocked store must not break checkout.
+          try {
+            if (window.ClickPromptAttribution) {
+              if (typeof window.ClickPromptAttribution.attachTo === "function") {
+                window.ClickPromptAttribution.attachTo(checkoutBody);
+              } else {
+                var attr = window.ClickPromptAttribution.get();
+                if (attr) checkoutBody.attribution = attr;
+              }
+            }
+          } catch (e) { /* proceed without attribution */ }
           var data = await apiPost("/api/checkout", checkoutBody);
           if (data._ok && data.url && data.token) {
             // Store the unlock token BEFORE leaving: the webhook matches it
@@ -1738,7 +1750,7 @@
       // Works from the paywall and from the home-page form.
       async function submitLaunchSignup(form) {
         var emailInput = form.querySelector('input[type="email"], input[name="email"]');
-        var honeypotInput = form.querySelector('input[name="company"]');
+        var honeypotInput = form.querySelector('input[name="hp_website_url"]');
         var status = form.querySelector(".launch-status");
         var button = form.querySelector('button[type="submit"]');
         var email = emailInput ? emailInput.value.trim() : "";
@@ -1748,20 +1760,20 @@
           if (emailInput) emailInput.focus();
           return;
         }
-        var body = { email: email, company: honeypotInput ? honeypotInput.value : "" };
-        if (window.ClickPromptAttribution) {
-          var launchAttr = window.ClickPromptAttribution.get();
-          if (launchAttr) body.attribution = launchAttr;
-        }
-        // Turnstile token, when the widget is present. The Worker only
-        // checks it if TURNSTILE_SECRET is set (same approach as PR #10).
-        if (window.turnstile) {
-          var widget = form.querySelector(".cf-turnstile");
-          if (widget) {
-            try { body["cf-turnstile-response"] = window.turnstile.getResponse(widget) || ""; } catch (e) {}
-            try { window.turnstile.reset(widget); } catch (e) {}
+        var body = { email: email };
+        if (honeypotInput && honeypotInput.value) body.hp_website_url = honeypotInput.value;
+        // Attribution is optional. A throwing or blocked store must not break signup.
+        // No Turnstile token is sent: the widget is not on the page until Tyler OKs it.
+        try {
+          if (window.ClickPromptAttribution) {
+            if (typeof window.ClickPromptAttribution.attachTo === "function") {
+              window.ClickPromptAttribution.attachTo(body);
+            } else {
+              var launchAttr = window.ClickPromptAttribution.get();
+              if (launchAttr) body.attribution = launchAttr;
+            }
           }
-        }
+        } catch (e) { /* proceed without attribution */ }
         if (button) button.disabled = true;
         if (status) status.textContent = "Saving...";
         try {

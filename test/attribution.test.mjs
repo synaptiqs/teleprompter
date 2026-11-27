@@ -114,3 +114,87 @@ test('no Google Analytics snippets were added, and the Meta Pixel snippet is unc
   assert.ok(index.includes("fbq('init', '1425895313089708')"));
   assert.ok(index.includes("fbq('track', 'PageView')"));
 });
+
+test('throwing localStorage does not break get, capture, captureFromPage, or attachTo', () => {
+  const boom = {
+    getItem() { throw new Error('blocked'); },
+    setItem() { throw new Error('blocked'); },
+    removeItem() { throw new Error('blocked'); }
+  };
+  assert.equal(attr.get(boom), null);
+  assert.equal(attr.capture({ utm_source: 'reddit' }, boom), null);
+  const win = {
+    location: { search: '?utm_source=reddit', pathname: '/' },
+    document: { referrer: '' },
+    localStorage: boom
+  };
+  assert.equal(attr.captureFromPage(win, boom), null);
+  const body = attr.attachTo({ email: 'a@example.com' }, boom);
+  assert.equal(body.email, 'a@example.com');
+  assert.equal(body.attribution, undefined);
+});
+
+test('raw localStorage values larger than 4 KB are discarded before JSON.parse', () => {
+  const storage = memoryStorage();
+  storage.setItem(attr.STORAGE_KEY, '{"utm_source":"' + 'x'.repeat(5000) + '"}');
+  assert.ok(storage.getItem(attr.STORAGE_KEY).length > 4096);
+  assert.equal(attr.get(storage), null);
+});
+
+test('first-touch expires at 90 days; 89 keeps, 90 and 91 replace or clear', () => {
+  const day = 24 * 60 * 60 * 1000;
+  const iso = (offset) => new Date(Date.now() + offset).toISOString();
+
+  const keep = memoryStorage();
+  attr.capture({ utm_source: 'reddit', landing: '/', timestamp: iso(-89 * day) }, keep);
+  const kept = attr.capture({ utm_source: 'tiktok', landing: '/later', timestamp: iso(0) }, keep);
+  assert.equal(kept.utm_source, 'reddit');
+
+  const at90 = memoryStorage();
+  at90.setItem(attr.STORAGE_KEY, JSON.stringify({
+    utm_source: 'reddit', landing: '/', timestamp: iso(-90 * day)
+  }));
+  const replaced = attr.capture({ utm_source: 'tiktok', landing: '/later', timestamp: iso(0) }, at90);
+  assert.equal(replaced.utm_source, 'tiktok');
+
+  const at91 = memoryStorage();
+  at91.setItem(attr.STORAGE_KEY, JSON.stringify({
+    utm_source: 'reddit', landing: '/', timestamp: iso(-91 * day)
+  }));
+  const replaced91 = attr.capture({ utm_source: 'facebook', landing: '/x', timestamp: iso(0) }, at91);
+  assert.equal(replaced91.utm_source, 'facebook');
+
+  const clear = memoryStorage();
+  clear.setItem(attr.STORAGE_KEY, JSON.stringify({
+    utm_source: 'reddit', landing: '/', timestamp: iso(-90 * day)
+  }));
+  const cleared = attr.capture({ landing: '/' }, clear);
+  assert.equal(cleared, null);
+  assert.equal(clear.getItem(attr.STORAGE_KEY), null);
+});
+
+test('missing, invalid, or future timestamps are treated as expired', () => {
+  const storage = memoryStorage();
+  storage.setItem(attr.STORAGE_KEY, JSON.stringify({ utm_source: 'reddit', landing: '/' }));
+  const replaced = attr.capture({ utm_source: 'tiktok', landing: '/', timestamp: new Date().toISOString() }, storage);
+  assert.equal(replaced.utm_source, 'tiktok');
+
+  const future = memoryStorage();
+  future.setItem(attr.STORAGE_KEY, JSON.stringify({
+    utm_source: 'reddit', landing: '/', timestamp: new Date(Date.now() + 60 * 1000).toISOString()
+  }));
+  const replacedFuture = attr.capture({ utm_source: 'linkedin', landing: '/', timestamp: new Date().toISOString() }, future);
+  assert.equal(replacedFuture.utm_source, 'linkedin');
+});
+
+test('captureFromPage reads UTM parameter names case-insensitively', () => {
+  const storage = memoryStorage();
+  const win = {
+    location: { search: '?UTM_SOURCE=Reddit&Utm_Campaign=Spring', pathname: '/' },
+    document: { referrer: '' },
+    localStorage: storage
+  };
+  const rec = attr.captureFromPage(win, storage);
+  assert.equal(rec.utm_source, 'reddit');
+  assert.equal(rec.utm_campaign, 'spring');
+});

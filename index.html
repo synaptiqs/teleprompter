@@ -42,22 +42,21 @@
         <p>Answer five quick questions and we'll draft your script. You can edit every word before you record.</p>
         <button class="text-button tour-replay" id="replayTour" type="button">Take the tour</button>
 
-      <!-- Launch-list signup on the home setup screen. -->
-      <form class="launch-signup" data-launch-signup>
-        <p class="launch-signup-title">Notify me when the store goes live</p>
-        <label class="launch-email-label">Email
-          <input type="email" name="email" autocomplete="email" inputmode="email" required placeholder="you@example.com" />
-        </label>
-        <div class="launch-honeypot" aria-hidden="true">
-          <label>Company
-            <input type="text" name="company" tabindex="-1" autocomplete="off" />
+        <!-- Launch-list signup on the home setup screen. -->
+        <form class="launch-signup" data-launch-signup>
+          <p class="launch-signup-title">Notify me when the store goes live</p>
+          <label class="launch-email-label">Email
+            <input type="email" name="email" autocomplete="email" inputmode="email" required placeholder="you@example.com" />
           </label>
-        </div>
-        <button class="secondary" type="submit">Notify me</button>
-        <div class="cf-turnstile" data-sitekey="0x4AAAAAAFimE5vwGYxq997L" data-action="launch" data-appearance="interaction-only"></div>
-        <p class="launch-notice">We store your email and the marketing source of your first visit. See our <a href="/privacy">Privacy Policy</a>.</p>
-        <p class="launch-status" role="status" aria-live="polite"></p>
-      </form>
+          <div class="launch-honeypot" aria-hidden="true">
+            <label>Website
+              <input type="text" name="hp_website_url" tabindex="-1" autocomplete="off" />
+            </label>
+          </div>
+          <button class="secondary" type="submit">Notify me</button>
+          <p class="launch-notice">We store your email and the marketing source of your first visit. See our <a href="/privacy">Privacy Policy</a>.</p>
+          <p class="launch-status" role="status" aria-live="polite"></p>
+        </form>
       </div>
       <div class="setup-body">
         <div>
@@ -299,12 +298,11 @@
           <input type="email" name="email" autocomplete="email" inputmode="email" required placeholder="you@example.com" />
         </label>
         <div class="launch-honeypot" aria-hidden="true">
-          <label>Company
-            <input type="text" name="company" tabindex="-1" autocomplete="off" />
+          <label>Website
+            <input type="text" name="hp_website_url" tabindex="-1" autocomplete="off" />
           </label>
         </div>
         <button class="secondary" type="submit">Notify me</button>
-        <div class="cf-turnstile" data-sitekey="0x4AAAAAAFimE5vwGYxq997L" data-action="launch" data-appearance="interaction-only"></div>
         <p class="launch-notice">We store your email and the marketing source of your first visit. See our <a href="/privacy">Privacy Policy</a>.</p>
         <p class="launch-status" role="status" aria-live="polite"></p>
       </form>
@@ -334,7 +332,6 @@
     </div>
   </dialog>
 
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
   <script src="app.js?v=20261127a"></script>
 </body>
 </html>

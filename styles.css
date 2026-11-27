@@ -503,7 +503,6 @@
       color: var(--muted);
     }
     .launch-notice a { color: var(--accent-strong); text-underline-offset: 2px; }
-    .launch-signup .cf-turnstile { margin: 8px 0 0; }
 
     /* ---- first-run tour ---- */
     .tour-highlight {

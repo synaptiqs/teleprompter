@@ -168,7 +168,7 @@ paths:
       description: |
         Stores an email plus optional first-touch attribution on the launch
         list. No confirmation email is sent. New signups, repeat signups,
-        and a filled honeypot (company or website) all return { ok: true }
+        and a filled honeypot (hp_website_url) all return { ok: true }
         with no extra flags. Repeats keep the original row; honeypots are
         not stored. Requires the LAUNCH_KV binding (no fallback to the
         main KV namespace) and returns 503 if it is missing. Optional
@@ -191,7 +191,7 @@ paths:
                 attribution:
                   type: object
                   description: Same first-touch record used at checkout.
-                company:
+                hp_website_url:
                   type: string
                   description: Honeypot. Leave empty.
                 cf-turnstile-response:

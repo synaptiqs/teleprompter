@@ -5,12 +5,31 @@ import fs from 'node:fs';
 let sent = [];
 let lastCheckout = null;
 let turnstileSuccess = true;
+let turnstilePayload = { hostname: 'clickprompt.app', action: 'launch' };
+let turnstileHang = false;
 let lastTurnstile = null;
 globalThis.fetch = async (url, init) => {
   const u = String(url);
   if (u === 'https://challenges.cloudflare.com/turnstile/v0/siteverify') {
     lastTurnstile = init;
-    return new Response(JSON.stringify({ success: turnstileSuccess }), { status: 200 });
+    if (turnstileHang) {
+      await new Promise((resolve, reject) => {
+        const abort = () => {
+          const err = new Error('The operation was aborted');
+          err.name = 'AbortError';
+          reject(err);
+        };
+        if (init && init.signal) {
+          if (init.signal.aborted) { abort(); return; }
+          init.signal.addEventListener('abort', abort, { once: true });
+        }
+      });
+    }
+    return new Response(JSON.stringify({
+      success: turnstileSuccess,
+      hostname: turnstilePayload.hostname,
+      action: turnstilePayload.action
+    }), { status: 200 });
   }
   if (u !== 'https://api.lemonsqueezy.com/v1/checkouts') throw new Error('blocked ' + url);
   const b = JSON.parse(init.body);
@@ -59,8 +78,10 @@ test('preview vars map plans to TEST-mode variants', async () => {
 function memoryKv() {
   const data = new Map();
   const ttls = new Map();
-  return {
+  const store = {
+    _gets: 0,
     async get(key, type) {
+      store._gets += 1;
       if (!data.has(key)) return null;
       const v = data.get(key);
       return type === 'json' ? JSON.parse(v) : v;
@@ -73,6 +94,7 @@ function memoryKv() {
     _data: data,
     _ttls: ttls
   };
+  return store;
 }
 
 const checkoutWith = (env, body) => worker.fetch(new Request('https://x.test/api/checkout', { method: 'POST',
@@ -187,10 +209,12 @@ test('launch-notify rejects a bad email and returns {ok:true} for a filled honey
   const kv = memoryKv();
   const bad = await launch({ LAUNCH_KV: kv }, { email: 'not-an-email' }, '203.0.113.11');
   assert.equal(bad.status, 400);
-  const hp = await launch({ LAUNCH_KV: kv }, { email: 'ok@example.com', company: 'Bot Co' }, '203.0.113.12');
+  const getsBefore = kv._gets;
+  const hp = await launch({ LAUNCH_KV: kv }, { email: 'ok@example.com', hp_website_url: 'Bot Co' }, '203.0.113.12');
   assert.equal(hp.status, 200);
   assert.deepEqual(await hp.json(), { ok: true });
   assert.ok(![...kv._data.values()].some((v) => String(v).includes('ok@example.com')));
+  assert.ok(kv._gets > getsBefore, 'honeypot path performs a KV get');
 });
 
 test('launch-notify returns 503 when LAUNCH_KV is missing, including if only main KV is bound', async () => {
@@ -227,6 +251,12 @@ test('launch-notify KV throttle is 5 per hour and buckets IPv6 by /64', async ()
   assert.equal(key(v6a), key(v6b));
   assert.notEqual(key(v6a), key(v6other));
   assert.equal(key('::ffff:203.0.113.10'), '203.0.113.10');
+  for (const k of kv._data.keys()) {
+    if (String(k).startsWith('launchthrottle:')) {
+      assert.equal(/203\.0\.113|2001:db8/.test(k), false, k);
+      assert.match(k, /^launchthrottle:\d+:[0-9a-f]{64}$/);
+    }
+  }
 });
 
 test('LAUNCH_RATE_LIMITER is used when bound, with KV throttle as fallback', async () => {
@@ -286,11 +316,212 @@ test('frontend uses one generic launch success message and handles 404/405', () 
   assert.ok(js.includes('You are on the list. We will email you when the store goes live.'));
   assert.ok(!js.includes('You are already on the list'));
   assert.ok(js.includes('result._status === 404') && js.includes('result._status === 405'));
+  assert.ok(!js.includes('cf-turnstile-response'));
+  assert.ok(!js.includes('window.turnstile'));
   const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  assert.ok(!/challenges\.cloudflare\.com\/turnstile|cf-turnstile|0x4AAAAAAFimE5/.test(html));
+  assert.equal((html.match(/name="hp_website_url"/g) || []).length, 2);
+  assert.ok(!html.includes('name="company"'));
   const notices = html.match(/<p class="launch-notice">[\s\S]*?<\/p>/g) || [];
   assert.equal(notices.length, 2);
   for (const n of notices) {
     assert.ok(n.includes('email and the marketing source'));
     assert.ok(n.includes('href="/privacy"'));
   }
+});
+
+test('LAUNCH_RATE_LIMITER {} falls through to the KV throttle; success:false still rejects', async () => {
+  const kv = memoryKv();
+  const limiterEmpty = { limit: async () => ({}) };
+  const env = { LAUNCH_KV: kv, LAUNCH_RATE_LIMITER: limiterEmpty };
+  for (let i = 0; i < 5; i++) {
+    const r = await launch(env, { email: `empty${i}@example.com` }, '203.0.113.50');
+    assert.equal(r.status, 200, 'empty limiter attempt ' + i);
+  }
+  const blocked = await launch(env, { email: 'empty6@example.com' }, '203.0.113.50');
+  assert.equal(blocked.status, 429);
+  assert.ok([...kv._data.keys()].some((k) => String(k).startsWith('launchthrottle:')));
+});
+
+test('throttleIpKey strips a zone index first and treats dotted, expanded, and hex IPv4-mapped as IPv4', async () => {
+  const { _throttleIpKey: key } = await import('../worker/script-api.js');
+  assert.equal(key('::ffff:203.0.113.10'), '203.0.113.10');
+  assert.equal(key('::ffff:203.0.113.10%eth0'), '203.0.113.10');
+  assert.equal(key('0:0:0:0:0:ffff:203.0.113.10'), '203.0.113.10');
+  assert.equal(key('::ffff:cb00:710a'), '203.0.113.10');
+  assert.equal(key('0:0:0:0:0:ffff:cb00:710a'), '203.0.113.10');
+  assert.equal(key('::FFFF:CB00:710A%wlan0'), '203.0.113.10');
+});
+
+test('20 KB stream with Content-Length 100 is rejected without reading it all', async () => {
+  let produced = 0;
+  let delivered = 0;
+  let cancelled = false;
+  const limit = 20 * 1024;
+  const chunk = 1024;
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (produced >= limit) {
+        controller.close();
+        return;
+      }
+      const buf = new Uint8Array(Math.min(chunk, limit - produced));
+      buf.fill(120);
+      produced += buf.byteLength;
+      controller.enqueue(buf);
+    }
+  }, { highWaterMark: 1 });
+  const headers = new Headers({
+    'Content-Type': 'application/json',
+    'Content-Length': '100',
+    Origin: 'https://clickprompt.app',
+    'CF-Connecting-IP': '203.0.113.99'
+  });
+  const req = {
+    method: 'POST',
+    url: 'https://x.test/api/launch-notify',
+    headers,
+    body: {
+      getReader() {
+        const reader = stream.getReader();
+        return {
+          async read() {
+            const step = await reader.read();
+            if (step.value) delivered += step.value.byteLength;
+            return step;
+          },
+          async cancel() {
+            cancelled = true;
+            return reader.cancel();
+          }
+        };
+      },
+      async cancel() {
+        cancelled = true;
+        try { await stream.cancel(); } catch (e) {}
+      }
+    }
+  };
+  const r = await worker.fetch(req, { LAUNCH_KV: memoryKv() }, { waitUntil() {} });
+  assert.equal(r.status, 413);
+  assert.equal(cancelled, true);
+  assert.ok(delivered <= 8192 + chunk, 'worker read ' + delivered + ' bytes before cancel');
+  assert.ok(delivered > 8192, 'the abort happens once the cap is exceeded');
+  assert.ok(produced < limit, 'must not produce the full 20 KB stream, produced ' + produced);
+});
+
+test('known path with the wrong method returns 405 and Allow', async () => {
+  const r = await worker.fetch(new Request('https://x.test/api/launch-notify', { method: 'GET' }), {}, { waitUntil() {} });
+  assert.equal(r.status, 405);
+  assert.ok((r.headers.get('Allow') || '').includes('POST'));
+  const me = await worker.fetch(new Request('https://x.test/api/me', { method: 'POST' }), {}, { waitUntil() {} });
+  assert.equal(me.status, 405);
+  assert.ok((me.headers.get('Allow') || '').includes('GET'));
+});
+
+test('turnstileOk requires an allowed hostname, action launch, and fails closed on abort', async () => {
+  const { _turnstileOk: turnstileOk } = await import('../worker/script-api.js');
+  const req = new Request('https://x.test/', { headers: { 'CF-Connecting-IP': '203.0.113.70' } });
+  const env = { TURNSTILE_SECRET: 'test-secret' };
+
+  turnstileHang = false;
+  turnstileSuccess = true;
+  turnstilePayload = { hostname: 'clickprompt.app', action: 'launch' };
+  assert.equal(await turnstileOk(req, env, 'tok'), true);
+  assert.ok(lastTurnstile && lastTurnstile.signal, 'AbortSignal is passed to siteverify');
+
+  turnstilePayload = { hostname: 'evil.com', action: 'launch' };
+  assert.equal(await turnstileOk(req, env, 'tok'), false);
+
+  turnstilePayload = { hostname: 'clickprompt.app', action: 'generate' };
+  assert.equal(await turnstileOk(req, env, 'tok'), false);
+
+  turnstilePayload = { hostname: 'abc.teleprompter-5fz.pages.dev', action: 'launch' };
+  assert.equal(await turnstileOk(req, env, 'tok'), true);
+
+  turnstilePayload = { hostname: 'clickprompt.app', action: 'launch' };
+  turnstileHang = true;
+  assert.equal(await turnstileOk(req, env, 'tok'), false);
+  turnstileHang = false;
+});
+
+test('honeypot submissions go through Turnstile and a KV get before {ok:true}', async () => {
+  const kv = memoryKv();
+  const env = { LAUNCH_KV: kv, TURNSTILE_SECRET: 'test-secret' };
+  turnstileSuccess = false;
+  turnstilePayload = { hostname: 'clickprompt.app', action: 'launch' };
+  const denied = await launch(env, { email: 'hp@example.com', hp_website_url: 'https://spam.example', 'cf-turnstile-response': 'bad' }, '203.0.113.60');
+  assert.equal(denied.status, 403);
+  assert.ok(![...kv._data.values()].some((v) => String(v).includes('hp@example.com')));
+
+  turnstileSuccess = true;
+  const getsBefore = kv._gets;
+  const ok = await launch(env, { email: 'hp@example.com', hp_website_url: 'https://spam.example', 'cf-turnstile-response': 'token-ok' }, '203.0.113.61');
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true });
+  assert.ok(kv._gets > getsBefore, 'honeypot performs a KV get');
+  assert.ok(![...kv._data.values()].some((v) => String(v).includes('hp@example.com')));
+});
+
+test('emails longer than 254 characters are rejected with the generic 400, not truncated', async () => {
+  const kv = memoryKv();
+  const local = 'a'.repeat(64);
+  const domain = 'x'.repeat(190) + '.com'; // local@domain > 254
+  const long = local + '@' + domain;
+  assert.ok(long.length > 254);
+  const r = await launch({ LAUNCH_KV: kv }, { email: long }, '203.0.113.80');
+  assert.equal(r.status, 400);
+  const body = await r.json();
+  assert.equal(body.error, 'Please enter a valid email address.');
+  assert.ok(![...kv._data.values()].some((v) => String(v).includes(local)));
+});
+
+test('Worker drops attribution older than 90 days or more than 1 day in the future', async () => {
+  const { _sanitizeAttribution: sanitize } = await import('../worker/script-api.js');
+  const day = 24 * 60 * 60 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const now = Date.now();
+  const fresh = sanitize({ utm_source: 'reddit', timestamp: iso(now - 89 * day) });
+  assert.equal(fresh.utm_source, 'reddit');
+  const at90 = sanitize({ utm_source: 'reddit', timestamp: iso(now - 90 * day) });
+  assert.deepEqual(at90, {});
+  const at91 = sanitize({ utm_source: 'reddit', timestamp: iso(now - 91 * day) });
+  assert.deepEqual(at91, {});
+  const skewed = sanitize({ utm_source: 'reddit', timestamp: iso(now + 12 * 60 * 60 * 1000) });
+  assert.equal(skewed.utm_source, 'reddit');
+  const tooFuture = sanitize({ utm_source: 'reddit', timestamp: iso(now + 25 * 60 * 60 * 1000) });
+  assert.deepEqual(tooFuture, {});
+
+  lastCheckout = null;
+  const r = await checkoutWith(base, {
+    attribution: { utm_source: 'reddit', timestamp: iso(now - 91 * day) }
+  });
+  assert.equal(r.status, 200);
+  assert.equal(lastCheckout.data.attributes.checkout_data.custom.utm_source, undefined);
+});
+
+test('app.js wraps cookie and attribution access in try/catch and uses hp_website_url', () => {
+  const js = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  assert.ok(js.includes('document.cookie.match'));
+  assert.ok(js.indexOf('try {') < js.indexOf('document.cookie.match'));
+  assert.ok(js.includes('input[name="hp_website_url"]'));
+  assert.ok(!js.includes('input[name="company"]'));
+  assert.ok(js.includes('ClickPromptAttribution.attachTo') || js.includes('proceed without attribution'));
+});
+
+test('README documents rate-limiter-before-redeploy, the commented wrangler snippet, and the deletion runbook', () => {
+  const md = fs.readFileSync(new URL('../README.md', import.meta.url), 'utf8');
+  assert.ok(md.includes('LAUNCH_RATE_LIMITER') && md.includes('before the Worker is redeployed') || md.includes('before that redeploy'));
+  assert.ok(md.includes('# [[unsafe.bindings]]') && md.includes('# name = "LAUNCH_RATE_LIMITER"'));
+  assert.ok(md.includes("sha256") || md.includes('SHA-256'));
+  assert.ok(md.includes('wrangler kv key delete'));
+  assert.ok(md.includes('0d3a072d-8d93-45f5-b3f1-70870a445457'));
+  assert.ok(md.includes('56737990-2d7f-4178-a376-8ef429683125'));
+  assert.ok(!fs.existsSync(new URL('../wrangler.toml', import.meta.url)));
+});
+
+test('privacy.html says first-touch source data stays on the device and expires after 90 days', () => {
+  const html = fs.readFileSync(new URL('../privacy.html', import.meta.url), 'utf8');
+  assert.ok(html.includes('First-touch source data stays on the device') || html.includes('first-touch source data stays on the device'));
+  assert.ok(html.includes('expires after 90 days'));
 });
