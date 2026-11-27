@@ -627,8 +627,10 @@ var STRIPE_API = "https://api.stripe.com/v1";
 var STRIPE_API_VERSION = "2025-03-31.basil";
 var STRIPE_SIGNATURE_TOLERANCE_SEC = 300;
 var STRIPE_REQUEST_TIMEOUT_MS = 15000;
+var STRIPE_WEBHOOK_BUDGET_MS = 9000;
 var STRIPE_WEBHOOK_MAX_BYTES = 1048576;
 var STRIPE_EVENT_TTL_SEC = 60 * 86400;
+var STRIPE_LOOKUP_ID_MAX = 255;
 
 var PLAN_PRICE_ENV = {
   monthly: "STRIPE_PRICE_ID_MONTHLY",
@@ -797,22 +799,80 @@ function buildStripeCheckoutForm(opts) {
   return stripeForm(params);
 }
 
+// A webhook may make several Stripe GETs. Cap the total time
+// across those calls at about 9 seconds (overridable in tests
+// via STRIPE_WEBHOOK_BUDGET_MS). If the budget is already gone,
+// throw a transient 500 so the event is not deduped.
+function stripeWebhookDeadlineAt(env) {
+  var req = env && env._stripeReq;
+  return req && req.deadlineAt ? req.deadlineAt : 0;
+}
+
+function assertStripeWebhookBudget(env) {
+  var deadlineAt = stripeWebhookDeadlineAt(env);
+  if (!deadlineAt) return;
+  if (Date.now() >= deadlineAt) {
+    var err = new Error("Could not process event. Try again.");
+    err.status = 500;
+    err.transient = true;
+    err.deadline = true;
+    throw err;
+  }
+}
+
+function stripeRequestTimeoutMs(env) {
+  var timeoutMs = STRIPE_REQUEST_TIMEOUT_MS;
+  var deadlineAt = stripeWebhookDeadlineAt(env);
+  if (!deadlineAt) return timeoutMs;
+  assertStripeWebhookBudget(env);
+  var remaining = deadlineAt - Date.now();
+  if (remaining < 1) remaining = 1;
+  return remaining < timeoutMs ? remaining : timeoutMs;
+}
+
+function stripeFailClosed(message) {
+  var err = new Error(message || "Stripe object refs do not match.");
+  err.failClosed = true;
+  return err;
+}
+
+// Only well-formed Stripe ids are sent to GET lookups. The value
+// must start with an expected prefix, use [A-Za-z0-9_] only, and
+// stay within a bounded length. Anything else is skipped and logged.
+function stripeLookupIdOk(id, prefixes) {
+  var s = String(id || "");
+  if (s.length < 3 || s.length > STRIPE_LOOKUP_ID_MAX) return false;
+  if (!/^[A-Za-z0-9_]+$/.test(s)) return false;
+  prefixes = prefixes || [];
+  for (var i = 0; i < prefixes.length; i++) {
+    if (prefixes[i] && s.indexOf(prefixes[i]) === 0) return true;
+  }
+  return false;
+}
+
+function assertStripeLookupId(id, prefixes) {
+  if (stripeLookupIdOk(id, prefixes)) return true;
+  try { console.log("stripe lookup id refused"); } catch (e) {}
+  return false;
+}
+
 // Call the Stripe REST API with the pinned Basil version, an optional
 // idempotency key (session creates only), and a timeout so a hung
 // request fails cleanly. The secret is sent only as a Bearer header
 // and is never logged.
-async function stripeRequest(secret, method, path, formBody, idempotencyKey) {
+async function stripeRequest(secret, method, path, formBody, idempotencyKey, env) {
   var headers = {
     Authorization: "Bearer " + secret,
     "Content-Type": "application/x-www-form-urlencoded",
     "Stripe-Version": STRIPE_API_VERSION,
   };
   if (idempotencyKey) headers["Idempotency-Key"] = String(idempotencyKey);
+  var timeoutMs = stripeRequestTimeoutMs(env);
   var res = await fetch(STRIPE_API + path, {
     method: method,
     headers: headers,
     body: formBody || undefined,
-    signal: AbortSignal.timeout(STRIPE_REQUEST_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   var data = await res.json().catch(function () { return {}; });
   if (!res.ok) {
@@ -1031,7 +1091,20 @@ async function rememberStripeIds(env, hex, ids) {
   if (!env.KV || !hex || !ids) return;
   if (ids.subscription) await bindStripeSub(env, ids.subscription, hex);
   if (ids.session) await env.KV.put("stripesession:" + ids.session, hex);
-  if (ids.paymentIntent) await env.KV.put("stripepi:" + ids.paymentIntent, hex);
+  // Retried payment attempts can arrive on invoice.paid with a new
+  // PI. stripe:invpi is write-once, so a different PI must not get
+  // a stripepi: mapping. Later refunds and disputes for that retry
+  // are attached through the invoice or subscription refs, not
+  // through stripepi.
+  var paymentIntent = ids.paymentIntent;
+  if (paymentIntent && ids.invoice) {
+    var existingInvpi = await env.KV.get("stripe:invpi:" + ids.invoice);
+    if (existingInvpi && existingInvpi !== paymentIntent) {
+      try { console.log("stripe invoice payment_intent does not match stored mapping"); } catch (e) {}
+      paymentIntent = "";
+    }
+  }
+  if (paymentIntent) await env.KV.put("stripepi:" + paymentIntent, hex);
   if (ids.customer) await env.KV.put("stripecust:" + ids.customer, hex);
   if (ids.invoice) await env.KV.put("stripeinv:" + ids.invoice, hex);
   if (ids.charge) await env.KV.put("stripecharge:" + ids.charge, hex);
@@ -1428,7 +1501,7 @@ async function resolveStripeSubscriptionItems(env, sub) {
   var items = stripeSubscriptionItemList(sub);
   if (items) return { sub: sub, items: items };
   var sid = sub && sub.id;
-  if (!sid) return { sub: sub, items: null };
+  if (!sid || !assertStripeLookupId(sid, ["sub_"])) return { sub: sub, items: null };
   var fetched = await fetchStripeResource(env, "/subscriptions/" + encodeURIComponent(sid));
   if (!fetched) return { sub: sub, items: null };
   return { sub: fetched, items: stripeSubscriptionItemList(fetched) };
@@ -1472,13 +1545,19 @@ async function resolveStripeSessionLineItems(env, session) {
     throw cfg;
   }
   try {
+    if (!assertStripeLookupId(sid, ["cs_"])) {
+      return { items: [], amountTotal: session && session.amount_total };
+    }
     var path = "/checkout/sessions/" + encodeURIComponent(sid) + "?expand[]=line_items";
-    var expanded = await stripeRequest(got.key, "GET", path);
+    var expanded = await fetchStripeResource(env, path);
+    if (!expanded) return { items: [], amountTotal: session && session.amount_total };
     return {
       items: stripeSessionLineItems(expanded) || [],
       amountTotal: expanded.amount_total != null ? expanded.amount_total : (session && session.amount_total),
     };
   } catch (e) {
+    if (e && e.failClosed) throw e;
+    if (e && e.deadline) throw e;
     try { console.log("stripe session expand failed"); } catch (ignore) {}
     if (!isStripeTransientExpandError(e)) {
       return { items: [], amountTotal: session && session.amount_total };
@@ -1703,11 +1782,37 @@ function stripePendingRefKeys(prefix, obj) {
   return keys;
 }
 
-// Fetch a Stripe resource for payment-ref resolution. Transient
-// failures (timeout, network, 429, or 5xx) are rethrown as 500 so
-// the webhook skips the dedupe write. A 4xx other than 429 is a
-// permanent miss: return null and continue with the refs we have.
+function stripeGetCache(env) {
+  var req = env && env._stripeReq;
+  if (!req) return null;
+  if (!req.cache) req.cache = Object.create(null);
+  return req.cache;
+}
+
+function stripeFetchedLivemodeConflicts(env, fetched) {
+  var req = env && env._stripeReq;
+  if (!req || !fetched || typeof fetched.livemode !== "boolean") return false;
+  if (typeof req.livemode !== "boolean") return false;
+  return fetched.livemode !== req.livemode;
+}
+
+// Fetch a Stripe resource for payment-ref resolution. GETs are
+// memoized per webhook event so the same resource is fetched at
+// most once. Transient failures (timeout, network, 429, or 5xx)
+// are rethrown as 500 so the webhook skips the dedupe write. A
+// 4xx other than 429 is a permanent miss: return null and
+// continue with the refs we have. A 404 for a deleted invoice is
+// an accepted permanent miss (the invoice id we already have can
+// still be tombstoned). A livemode mismatch on the fetched
+// object fails closed.
 async function fetchStripeResource(env, path) {
+  var cache = stripeGetCache(env);
+  if (cache && Object.prototype.hasOwnProperty.call(cache, path)) {
+    var hit = cache[path];
+    if (hit.error) throw hit.error;
+    return hit.data;
+  }
+  assertStripeWebhookBudget(env);
   var got = readStripeSecretKey(env);
   if (!got || !got.key || got.hiddenChars) {
     var cfg = new Error("Could not resolve payment references.");
@@ -1716,10 +1821,23 @@ async function fetchStripeResource(env, path) {
     throw cfg;
   }
   try {
-    return await stripeRequest(got.key, "GET", path);
+    var data = await stripeRequest(got.key, "GET", path, undefined, undefined, env);
+    if (stripeFetchedLivemodeConflicts(env, data)) {
+      try { console.log("stripe fetched livemode does not match the event"); } catch (ignore) {}
+      var closed = stripeFailClosed("stripe fetched livemode does not match the event");
+      if (cache) cache[path] = { error: closed };
+      throw closed;
+    }
+    if (cache) cache[path] = { data: data };
+    return data;
   } catch (e) {
+    if (e && e.failClosed) throw e;
+    if (e && (e.deadline || e.transient) && e.status === 500 && e.message === "Could not process event. Try again.") throw e;
     try { console.log("stripe resource lookup failed"); } catch (ignore) {}
-    if (!isStripeTransientFetchError(e)) return null;
+    if (!isStripeTransientFetchError(e)) {
+      if (cache) cache[path] = { data: null };
+      return null;
+    }
     var err = new Error("Could not resolve payment references.");
     err.status = 500;
     err.transient = true;
@@ -1747,6 +1865,107 @@ function mergeStripeRefsFromSource(refs, source) {
   if (!refs.subscription) refs.subscription = stripeRefId(source.subscription);
 }
 
+function copyStripeRefs(refs) {
+  return {
+    payment_intent: (refs && refs.payment_intent) || "",
+    charge: (refs && refs.charge) || "",
+    invoice: (refs && refs.invoice) || "",
+    subscription: (refs && refs.subscription) || "",
+  };
+}
+
+// If the event already carries a pi/charge/invoice/subscription,
+// a fetched object must not name a different value for that field.
+function stripeFetchedRefsConflict(original, fetched) {
+  if (!original || !fetched) return false;
+  var got = stripeRefsFromObject(fetched);
+  var fields = ["payment_intent", "charge", "invoice", "subscription"];
+  for (var i = 0; i < fields.length; i++) {
+    var key = fields[i];
+    if (original[key] && got[key] && original[key] !== got[key]) return true;
+  }
+  return false;
+}
+
+async function acceptFetchedStripeObject(env, original, fetched) {
+  if (!fetched) return;
+  if (stripeFetchedRefsConflict(original, fetched)) {
+    try { console.log("stripe fetched refs do not match the event"); } catch (e) {}
+    throw stripeFailClosed("stripe fetched refs do not match the event");
+  }
+}
+
+// After refs are merged, drop any id already bound to a different
+// hex than the event's original payment_intent or charge mapping.
+// Never revoke or tombstone that other identity.
+async function stripeEventRefsSpanIdentities(env, original) {
+  if (!env || !env.KV || !original) return false;
+  var hexes = [];
+  var fields = [
+    [original.payment_intent, "stripepi:"],
+    [original.charge, "stripecharge:"],
+    [original.invoice, "stripeinv:"],
+    [original.subscription, "stripesub:"],
+  ];
+  for (var i = 0; i < fields.length; i++) {
+    var id = fields[i][0];
+    if (!id) continue;
+    var bound = await env.KV.get(fields[i][1] + id);
+    if (bound && hexes.indexOf(bound) === -1) hexes.push(bound);
+  }
+  return hexes.length > 1;
+}
+
+async function dropCrossBoundStripeRefs(env, original, refs) {
+  if (!env || !env.KV || !refs) return refs;
+  var home = null;
+  if (original && original.payment_intent) {
+    home = await env.KV.get("stripepi:" + original.payment_intent);
+  }
+  if (!home && original && original.charge) {
+    home = await env.KV.get("stripecharge:" + original.charge);
+  }
+  var fields = [
+    ["payment_intent", "stripepi:"],
+    ["charge", "stripecharge:"],
+    ["invoice", "stripeinv:"],
+    ["subscription", "stripesub:"],
+  ];
+  for (var i = 0; i < fields.length; i++) {
+    var field = fields[i][0];
+    var id = refs[field];
+    if (!id) continue;
+    var bound = await env.KV.get(fields[i][1] + id);
+    if (!bound) continue;
+    if (home && bound !== home) {
+      try { console.log("stripe resolved ref is bound to a different identity"); } catch (e) {}
+      refs[field] = "";
+      continue;
+    }
+    // When the event's original PI/charge are unbound, keep those
+    // payment refs and any original invoice/sub, but drop a fetched
+    // invoice or subscription that is already bound to someone.
+    if (!home && (field === "invoice" || field === "subscription")) {
+      var originalId = original && original[field];
+      if (id !== originalId) {
+        try { console.log("stripe resolved ref is bound to a different identity"); } catch (e) {}
+        refs[field] = "";
+      }
+    }
+  }
+  return refs;
+}
+
+async function fetchStripeInvoiceRefs(env, invoiceId) {
+  if (!assertStripeLookupId(invoiceId, ["in_"])) return null;
+  return fetchStripeResource(env, "/invoices/" + encodeURIComponent(invoiceId));
+}
+
+async function fetchStripeChargeRefs(env, chargeId) {
+  if (!assertStripeLookupId(chargeId, ["ch_"])) return null;
+  return fetchStripeResource(env, "/charges/" + encodeURIComponent(chargeId));
+}
+
 // Canonical payment refs (payment_intent, charge, invoice,
 // subscription) for checkout sessions, disputes, and refunds.
 // Real Stripe payloads often do not overlap: a subscription
@@ -1754,10 +1973,19 @@ function mergeStripeRefsFromSource(refs, source) {
 // carries payment_intent and charge. Fill the gaps from an
 // expanded object, from stripe:invpi:<invoice>, by expanding a
 // session invoice, or by fetching the charge (which carries the
-// invoice). Transient fetch errors are thrown; a permanent 4xx
-// keeps the refs already collected.
+// invoice). Do not fetch an invoice solely to fill subscription:
+// a one-time invoice has no subscription. Transient fetch errors
+// are thrown; a permanent 4xx keeps the refs already collected.
+// A fetched object that disagrees with a ref already on the
+// event fails closed. Ids bound to a different identity than the
+// event's original PI or charge are dropped.
 async function resolveStripePaymentRefs(env, obj) {
   var refs = stripeRefsFromObject(obj);
+  var original = copyStripeRefs(refs);
+  if (await stripeEventRefsSpanIdentities(env, original)) {
+    try { console.log("stripe event refs are bound to more than one identity"); } catch (e) {}
+    throw stripeFailClosed("stripe event refs are bound to more than one identity");
+  }
   mergeStripeRefsFromSource(refs, obj && typeof obj.invoice === "object" ? obj.invoice : null);
   mergeStripeRefsFromSource(refs, obj && typeof obj.charge === "object" ? obj.charge : null);
   if (obj && obj.object === "charge") mergeStripeRefsFromSource(refs, obj);
@@ -1770,15 +1998,19 @@ async function resolveStripePaymentRefs(env, obj) {
     if (stored) refs.payment_intent = stored;
   }
 
-  if (refs.invoice && (!refs.payment_intent || !refs.charge || !refs.subscription)) {
-    var fetchedInv = await fetchStripeResource(env, "/invoices/" + encodeURIComponent(refs.invoice));
+  // Fetch the invoice to fill payment_intent or charge, not to
+  // look up a subscription on a one-time invoice.
+  if (refs.invoice && (!refs.payment_intent || !refs.charge)) {
+    var fetchedInv = await fetchStripeInvoiceRefs(env, refs.invoice);
     fetchedInvoice = true;
+    await acceptFetchedStripeObject(env, original, fetchedInv);
     mergeStripeRefsFromSource(refs, fetchedInv);
   }
 
   if (refs.charge && (!refs.payment_intent || !refs.invoice)) {
-    var fetchedCh = await fetchStripeResource(env, "/charges/" + encodeURIComponent(refs.charge));
+    var fetchedCh = await fetchStripeChargeRefs(env, refs.charge);
     fetchedCharge = true;
+    await acceptFetchedStripeObject(env, original, fetchedCh);
     mergeStripeRefsFromSource(refs, fetchedCh);
   }
 
@@ -1787,16 +2019,19 @@ async function resolveStripePaymentRefs(env, obj) {
     if (storedLater) refs.payment_intent = storedLater;
   }
 
-  if (refs.invoice && (!refs.payment_intent || !refs.charge || !refs.subscription) && !fetchedInvoice) {
-    var fetchedInvLater = await fetchStripeResource(env, "/invoices/" + encodeURIComponent(refs.invoice));
+  if (refs.invoice && (!refs.payment_intent || !refs.charge) && !fetchedInvoice) {
+    var fetchedInvLater = await fetchStripeInvoiceRefs(env, refs.invoice);
+    await acceptFetchedStripeObject(env, original, fetchedInvLater);
     mergeStripeRefsFromSource(refs, fetchedInvLater);
   }
 
   if (refs.charge && (!refs.payment_intent || !refs.invoice) && !fetchedCharge) {
-    var fetchedChLater = await fetchStripeResource(env, "/charges/" + encodeURIComponent(refs.charge));
+    var fetchedChLater = await fetchStripeChargeRefs(env, refs.charge);
+    await acceptFetchedStripeObject(env, original, fetchedChLater);
     mergeStripeRefsFromSource(refs, fetchedChLater);
   }
 
+  await dropCrossBoundStripeRefs(env, original, refs);
   return refs;
 }
 
@@ -1804,9 +2039,12 @@ async function resolveStripeRefundRefs(env, obj) {
   return resolveStripePaymentRefs(env, obj);
 }
 
-async function writeStripeRefundTombstones(env, obj) {
+// Write refund tombstones for the given refs. Callers that have
+// already resolved refs should pass them in so this does not
+// resolve (and fetch) a second time in the same webhook.
+async function writeStripeRefundTombstones(env, obj, resolvedRefs) {
   if (!env.KV || !obj) return [];
-  var resolved = await resolveStripePaymentRefs(env, obj);
+  var resolved = resolvedRefs || await resolveStripePaymentRefs(env, obj);
   var probe = applyStripeResolvedRefs(obj, resolved);
   var keys = stripePendingRefKeys("stripe:refunded:", probe);
   for (var i = 0; i < keys.length; i++) {
@@ -2261,10 +2499,22 @@ async function handleStripeWebhook(request, env, cors) {
   var type = String(event.type || "");
   var obj = (event.data && event.data.object) || {};
 
+  var budgetMs = Number(env.STRIPE_WEBHOOK_BUDGET_MS);
+  if (!isFinite(budgetMs) || budgetMs <= 0) budgetMs = STRIPE_WEBHOOK_BUDGET_MS;
+  env = Object.assign({}, env, {
+    _stripeReq: {
+      cache: Object.create(null),
+      deadlineAt: Date.now() + budgetMs,
+      livemode: event.livemode,
+    },
+  });
+
   // Transient failures during processing (expand timeout, 5xx, 429,
   // or network errors) must not write the dedupe key, so Stripe can
-  // retry. Only a completed apply, including a genuine price
-  // mismatch, returns 200 and records the event id.
+  // retry. A fail-closed mismatch is acknowledged and deduped with
+  // no grant, revoke, or tombstone. Only a completed apply,
+  // including a genuine price mismatch, returns 200 and records
+  // the event id.
   try {
     if (type === "checkout.session.completed" || type === "checkout.session.async_payment_succeeded") {
       await applyStripeCheckoutSession(env, obj, eventCreated);
@@ -2278,11 +2528,18 @@ async function handleStripeWebhook(request, env, cors) {
       try { console.log("stripe refund.created ignored"); } catch (e) {}
     } else if (type === "charge.refunded") {
       if (isFullStripeRefund(obj)) {
-        var refundView = applyStripeResolvedRefs(obj, await resolveStripePaymentRefs(env, obj));
-        var refundKeys = await writeStripeRefundTombstones(env, refundView);
+        var refundRefs = await resolveStripePaymentRefs(env, obj);
+        var refundView = applyStripeResolvedRefs(obj, refundRefs);
+        var refundKeys = await writeStripeRefundTombstones(env, refundView, refundRefs);
         await applyStripeRevoke(env, refundView, eventCreated, "refund");
         var refundHex = await hexFromStripeRevokeRefs(env, refundView);
-        if (stripePendingNeedsRetry(obj, refundKeys) && !refundHex) {
+        // If a permanent 4xx left us with no payment_intent and no
+        // identity, do not ack the event. Return 5xx without a
+        // dedupe write so Stripe retries within its retry window,
+        // in case the charge or invoice becomes fetchable or a
+        // mapping appears. The ids we already had (for example a
+        // charge id) are still tombstoned.
+        if ((!refundRefs.payment_intent && !refundHex) || (stripePendingNeedsRetry(obj, refundKeys) && !refundHex)) {
           var refundRetry = new Error("Could not process event. Try again.");
           refundRetry.status = 500;
           refundRetry.transient = true;
@@ -2326,6 +2583,14 @@ async function handleStripeWebhook(request, env, cors) {
     );
     return json({ received: true }, 200, cors);
   } catch (e) {
+    if (e && e.failClosed) {
+      await env.KV.put(
+        dedupeKey,
+        JSON.stringify({ at: Date.now() }),
+        { expirationTtl: STRIPE_EVENT_TTL_SEC }
+      );
+      return json({ received: true }, 200, cors);
+    }
     try { console.log("stripe webhook processing failed"); } catch (ignore) {}
     var status = Number(e && e.status) || 500;
     if (status < 500 || status > 599) status = 500;

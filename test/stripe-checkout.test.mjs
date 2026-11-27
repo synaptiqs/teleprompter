@@ -474,6 +474,7 @@ function wirePaymentRefs({ invoice, charge, paymentIntent, subscription }) {
       payment_intent: paymentIntent,
       charge,
       subscription,
+      livemode: false,
     };
   }
   if (charge) {
@@ -483,6 +484,7 @@ function wirePaymentRefs({ invoice, charge, paymentIntent, subscription }) {
       payment_intent: paymentIntent,
       invoice,
       subscription,
+      livemode: false,
     };
   }
 }
@@ -1583,7 +1585,11 @@ test('revoke does not use customer id when two lifetime purchases share a custom
       },
     },
   });
-  assert.equal(r.status, 200);
+  // No payment_intent and no identity after a permanent charge
+  // lookup miss: 5xx without dedupe. Customer id is still not
+  // used to revoke the other purchase.
+  assert.equal(r.status, 500);
+  assert.equal(await kv.get('stripe:evt:evt_two_customer_only'), null);
   assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'lifetime');
 });
 
@@ -2664,8 +2670,13 @@ test('invoice-only refund tombstones the invoice and a resolved payment_intent',
       },
     },
   });
-  assert.equal(r.status, 200);
+  // Permanent 4xx left no payment_intent and no identity, so the
+  // webhook is 5xx without a dedupe write. The invoice (and charge)
+  // ids we already had are still tombstoned.
+  assert.equal(r.status, 500);
+  assert.equal(await kv.get('stripe:evt:evt_inv_only_refund'), null);
   assert.ok(await kv.get('stripe:refunded:in_inv_only'));
+  assert.ok(await kv.get('stripe:refunded:ch_inv_only'));
   assert.equal(await kv.get('stripe:refunded:pi_inv_only'), null);
 
   r = await paidMonthlyCheckout(env, {
@@ -3167,9 +3178,10 @@ test('invoice fetch for refund refs is transient on 5xx and permanent on 404', a
       },
     },
   });
-  assert.equal(r.status, 200);
-  assert.ok(await kv.get('stripe:evt:evt_inv_fetch_404'));
+  assert.equal(r.status, 500);
+  assert.equal(await kv.get('stripe:evt:evt_inv_fetch_404'), null);
   assert.ok(await kv.get('stripe:refunded:in_fetch_404'));
+  assert.ok(await kv.get('stripe:refunded:ch_inv_fetch_404'));
   assert.equal(await kv.get('stripe:refunded:pi_missing'), null);
 });
 
@@ -3262,4 +3274,394 @@ test('subscription.updated without items is 5xx on a transient fetch and a no-op
   assert.equal(r.status, 200);
   assert.ok(await kv.get('stripe:evt:evt_items_fetch_404'));
   assert.equal((await kv.get('sub:' + hex, 'json')).last_event_created, 47_000);
+});
+
+test('charge-only lifetime refund fetches the charge once and does not look up a subscription', async () => {
+  const kv = memoryKv();
+  const hex = 'a1'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  let r = await signedWebhook(env, {
+    id: 'evt_life_once_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 50_000,
+    data: {
+      object: {
+        id: 'cs_life_once',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_life_once',
+        metadata: { unlock_token: 'sub:' + hex, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'lifetime');
+
+  stripeCalls = [];
+  stripeChargeGets.ch_life_once = {
+    id: 'ch_life_once',
+    object: 'charge',
+    payment_intent: 'pi_life_once',
+    livemode: false,
+  };
+  r = await signedWebhook(env, {
+    id: 'evt_life_once_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 50_001,
+    data: {
+      object: {
+        id: 'ch_life_once',
+        object: 'charge',
+        refunded: true,
+        amount: 5900,
+        amount_refunded: 5900,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  const chargeGets = stripeCalls.filter((c) => c.method === 'GET' && /\/charges\/ch_life_once/.test(c.url));
+  const invoiceGets = stripeCalls.filter((c) => c.method === 'GET' && /\/invoices\//.test(c.url));
+  const subGets = stripeCalls.filter((c) => c.method === 'GET' && /\/subscriptions\//.test(c.url));
+  assert.equal(chargeGets.length, 1);
+  assert.equal(invoiceGets.length, 0);
+  assert.equal(subGets.length, 0);
+  assert.ok(await kv.get('stripe:refunded:ch_life_once'));
+  assert.ok(await kv.get('stripe:refunded:pi_life_once'));
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'refunded');
+});
+
+test('webhook deadline exceeded returns 500 without a dedupe key', async () => {
+  const kv = memoryKv();
+  const env = { ...stripeEnv, KV: kv, STRIPE_WEBHOOK_BUDGET_MS: '20' };
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return origFetch(url, init);
+  };
+  let r;
+  try {
+    r = await signedWebhook(env, {
+      id: 'evt_budget_deadline',
+      type: 'charge.refunded',
+      livemode: false,
+      created: 51_000,
+      data: {
+        object: {
+          id: 'ch_budget_deadline',
+          object: 'charge',
+          refunded: true,
+          amount: 399,
+          amount_refunded: 399,
+          currency: 'usd',
+        },
+      },
+    });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+  assert.equal(r.status, 500);
+  assert.equal(await kv.get('stripe:evt:evt_budget_deadline'), null);
+});
+
+test('charge A linked to invoice B does not touch buyer B', async () => {
+  const kv = memoryKv();
+  const hexA = 'a2'.repeat(16);
+  const hexB = 'a3'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+
+  let r = await signedWebhook(env, {
+    id: 'evt_poison_a_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 52_000,
+    data: {
+      object: {
+        id: 'cs_poison_a',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_poison_a',
+        latest_charge: 'ch_poison_a',
+        metadata: { unlock_token: 'sub:' + hexA, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  r = await paidMonthlyCheckout(env, {
+    hex: hexB,
+    sessionId: 'cs_poison_b',
+    subscription: 'sub_poison_b',
+    paymentIntent: 'pi_poison_b',
+    invoice: 'in_poison_b',
+    charge: 'ch_poison_b',
+    created: 52_001,
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hexA, 'json')).status, 'lifetime');
+  assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
+
+  stripeChargeGets.ch_poison_a = {
+    id: 'ch_poison_a',
+    object: 'charge',
+    payment_intent: 'pi_poison_a',
+    invoice: 'in_poison_b',
+    livemode: false,
+  };
+  r = await signedWebhook(env, {
+    id: 'evt_poison_a_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 52_002,
+    data: {
+      object: {
+        id: 'ch_poison_a',
+        object: 'charge',
+        refunded: true,
+        amount: 5900,
+        amount_refunded: 5900,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hexA, 'json')).status, 'refunded');
+  assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
+  assert.ok(await kv.get('stripe:refunded:ch_poison_a'));
+  assert.ok(await kv.get('stripe:refunded:pi_poison_a'));
+  assert.equal(await kv.get('stripe:refunded:in_poison_b'), null);
+  assert.equal((await me(env, 'sub:' + hexB).then((res) => res.json())).unlocked, true);
+});
+
+test('invoice.paid with a new payment_intent does not write stripepi or touch the buyer', async () => {
+  const kv = memoryKv();
+  const hex = 'a4'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  const logs = [];
+  const orig = console.log;
+  console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+  let r;
+  try {
+    r = await paidMonthlyCheckout(env, {
+      hex,
+      sessionId: 'cs_pi_evil',
+      subscription: 'sub_pi_evil',
+      paymentIntent: 'pi_good',
+      invoice: 'in_pi_evil',
+      created: 53_000,
+    });
+    assert.equal(r.status, 200);
+    assert.equal(await kv.get('stripe:invpi:in_pi_evil'), 'pi_good');
+    assert.equal(await kv.get('stripepi:pi_good'), hex);
+
+    r = await signedWebhook(env, {
+      id: 'evt_pi_evil_paid',
+      type: 'invoice.paid',
+      livemode: false,
+      created: 53_001,
+      data: {
+        object: {
+          id: 'in_pi_evil',
+          object: 'invoice',
+          payment_intent: 'pi_evil',
+        },
+      },
+    });
+    assert.equal(r.status, 200);
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(await kv.get('stripe:invpi:in_pi_evil'), 'pi_good');
+  assert.equal(await kv.get('stripepi:pi_good'), hex);
+  assert.equal(await kv.get('stripepi:pi_evil'), null);
+  assert.ok(logs.some((line) => /invoice payment_intent does not match stored mapping/.test(line)));
+
+  r = await signedWebhook(env, {
+    id: 'evt_pi_evil_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 53_002,
+    data: {
+      object: {
+        id: 'ch_pi_evil',
+        object: 'charge',
+        payment_intent: 'pi_evil',
+        refunded: true,
+        amount: 399,
+        amount_refunded: 399,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'active');
+  assert.equal((await me(env, 'sub:' + hex).then((res) => res.json())).unlocked, true);
+});
+
+test('charge-only 404 refund tombstones the charge and a later checkout with that charge is skipped', async () => {
+  const kv = memoryKv();
+  const hex = 'a5'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  stripeChargeGetErrors.ch_404_later = 404;
+
+  let r = await signedWebhook(env, {
+    id: 'evt_ch_404_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 54_000,
+    data: {
+      object: {
+        id: 'ch_404_later',
+        object: 'charge',
+        refunded: true,
+        amount: 399,
+        amount_refunded: 399,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 500);
+  assert.equal(await kv.get('stripe:evt:evt_ch_404_refund'), null);
+  assert.ok(await kv.get('stripe:refunded:ch_404_later'));
+
+  delete stripeChargeGetErrors.ch_404_later;
+  wirePaymentRefs({
+    invoice: 'in_404_later',
+    charge: 'ch_404_later',
+    paymentIntent: 'pi_404_later',
+    subscription: 'sub_404_later',
+  });
+  r = await subscriptionCheckoutInvoiceOnly(env, {
+    hex,
+    sessionId: 'cs_404_later',
+    invoice: 'in_404_later',
+    subscription: 'sub_404_later',
+    created: 54_001,
+    eventId: 'evt_cs_404_later',
+  });
+  assert.equal(r.status, 200);
+  assert.equal(await kv.get('sub:' + hex, 'json'), null);
+  assert.equal((await me(env, 'sub:' + hex).then((res) => res.json())).unlocked, false);
+});
+
+test('mixed invoice A and charge B event fails closed and touches neither buyer', async () => {
+  const kv = memoryKv();
+  const hexA = 'a6'.repeat(16);
+  const hexB = 'a7'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  wirePaymentRefs({
+    invoice: 'in_mix_a',
+    charge: 'ch_mix_a',
+    paymentIntent: 'pi_mix_a',
+    subscription: 'sub_mix_a',
+  });
+  let r = await subscriptionCheckoutInvoiceOnly(env, {
+    hex: hexA,
+    sessionId: 'cs_mix_a',
+    invoice: 'in_mix_a',
+    subscription: 'sub_mix_a',
+    created: 55_000,
+    eventId: 'evt_cs_mix_a',
+  });
+  assert.equal(r.status, 200);
+  wirePaymentRefs({
+    invoice: 'in_mix_b',
+    charge: 'ch_mix_b',
+    paymentIntent: 'pi_mix_b',
+    subscription: 'sub_mix_b',
+  });
+  r = await subscriptionCheckoutInvoiceOnly(env, {
+    hex: hexB,
+    sessionId: 'cs_mix_b',
+    invoice: 'in_mix_b',
+    subscription: 'sub_mix_b',
+    created: 55_001,
+    eventId: 'evt_cs_mix_b',
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hexA, 'json')).status, 'active');
+  assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
+
+  r = await signedWebhook(env, {
+    id: 'evt_mix_ab_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 55_002,
+    data: {
+      object: {
+        id: 'ch_mix_b',
+        object: 'charge',
+        invoice: 'in_mix_a',
+        refunded: true,
+        amount: 399,
+        amount_refunded: 399,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.ok(await kv.get('stripe:evt:evt_mix_ab_refund'));
+  assert.equal((await kv.get('sub:' + hexA, 'json')).status, 'active');
+  assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
+  assert.equal(await kv.get('stripe:refunded:in_mix_a'), null);
+  assert.equal(await kv.get('stripe:refunded:ch_mix_b'), null);
+  assert.equal(await kv.get('stripe:refunded:pi_mix_a'), null);
+  assert.equal(await kv.get('stripe:refunded:pi_mix_b'), null);
+  assert.equal((await me(env, 'sub:' + hexA).then((res) => res.json())).unlocked, true);
+  assert.equal((await me(env, 'sub:' + hexB).then((res) => res.json())).unlocked, true);
+});
+
+test('fetched livemode mismatch fails closed without a revoke', async () => {
+  const kv = memoryKv();
+  const hex = 'a8'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  let r = await signedWebhook(env, {
+    id: 'evt_lm_grant',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 56_000,
+    data: {
+      object: {
+        id: 'cs_lm',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_lm',
+        latest_charge: 'ch_lm',
+        metadata: { unlock_token: 'sub:' + hex, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+
+  stripeChargeGets.ch_lm = {
+    id: 'ch_lm',
+    object: 'charge',
+    payment_intent: 'pi_lm',
+    livemode: true,
+  };
+  r = await signedWebhook(env, {
+    id: 'evt_lm_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 56_001,
+    data: {
+      object: {
+        id: 'ch_lm',
+        object: 'charge',
+        refunded: true,
+        amount: 5900,
+        amount_refunded: 5900,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.ok(await kv.get('stripe:evt:evt_lm_refund'));
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'lifetime');
+  assert.equal(await kv.get('stripe:refunded:ch_lm'), null);
+  assert.equal((await me(env, 'sub:' + hex).then((res) => res.json())).unlocked, true);
 });
