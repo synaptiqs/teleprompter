@@ -34,16 +34,32 @@
  * Paywalled: script SAVING (ClickPrompt Pro) is $4.99/month, $49.99/year,
  * or $129 lifetime via Lemon Squeezy (Synaptiq HQ store, product 1397885),
  * or free forever with an access code. Everything else stays free.
+ * Stripe Checkout is also implemented, behind PAYMENT_PROVIDER, in TEST
+ * mode only (see below). The live Worker stays on Lemon Squeezy until
+ * Tyler flips the switch and deploys.
  *
- *   POST /api/checkout          { origin, plan, token? } -> { url, token }
- *                               (Lemon Squeezy hosted checkout; plan is
- *                               "monthly" | "yearly" | "lifetime" |
- *                               "storage250" |
- *                               "storage500" | "storage1000". Storage plans
- *                               are add-ons for existing subscribers and
- *                               need their unlock token. Needs
- *                               LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_STORE_ID,
- *                               and the variant ID for the chosen plan.)
+ *   POST /api/checkout          { origin, plan, token?, attribution? }
+ *                               -> { url, token }
+ *                               plan is "monthly" | "yearly" | "lifetime" |
+ *                               "storage250" | "storage500" | "storage1000".
+ *                               Storage plans are add-ons for existing
+ *                               subscribers and need their unlock token.
+ *                               Optional attribution is {source, medium,
+ *                               campaign, content, term, referrer, landing,
+ *                               ts}, each sanitized, for first-touch UTM
+ *                               from a sibling branch. PAYMENT_PROVIDER
+ *                               chooses the path (default lemonsqueezy):
+ *                                 lemonsqueezy: hosted LS checkout; needs
+ *                                 LEMONSQUEEZY_API_KEY, STORE_ID, and the
+ *                                 variant ID for the chosen plan.
+ *                                 stripe: Stripe Checkout Session via REST
+ *                                 (no SDK). Needs STRIPE_SECRET_KEY
+ *                                 (sk_test_... unless STRIPE_ALLOW_LIVE=true,
+ *                                 which only Tyler sets) and the price ID
+ *                                 for the plan. Test catalog: monthly
+ *                                 $3.99, yearly $29, lifetime $59
+ *                                 (payment mode). Success/cancel URLs are
+ *                                 on https://clickprompt.app.
  *   POST /api/webhook           Lemon Squeezy webhook events, verified with
  *                               LEMONSQUEEZY_WEBHOOK_SECRET (HMAC-SHA256 of
  *                               the raw body in the X-Signature header).
@@ -59,6 +75,19 @@
  *                               Cancellation starts the deletion sequence:
  *                               3 emails over 10 business days, then the
  *                               hard-delete cron removes everything.
+ *   POST /api/stripe-webhook    Stripe webhook events, verified with
+ *                               STRIPE_WEBHOOK_SECRET (HMAC-SHA256 of
+ *                               "timestamp.payload" in Stripe-Signature,
+ *                               with a 5-minute timestamp tolerance).
+ *                               checkout.session.completed unlocks Pro
+ *                               the same way order_created /
+ *                               subscription_created do: KV record at
+ *                               sub:<hex>, status "active" or "lifetime".
+ *                               customer.subscription.updated and
+ *                               customer.subscription.deleted keep that
+ *                               record in sync (cancel keeps Pro until
+ *                               current_period_end, then the same
+ *                               deletion sequence).
  *   GET  /api/me?token=...     -> { unlocked, via } where via is
  *                               "subscription" | "lifetime" | "code" | null.
  *   POST /api/redeem            { code } -> { unlocked, token, via }.
@@ -120,9 +149,13 @@
  *   redeemthrottle:<10min>:<ip> -> redeem attempt count (20-min TTL)
  *   sub:<hex>             -> { status, ls_subscription_id, email?,
  *                              storage_tier_gb?, cancel_pending?, ends_at?,
- *                              delete_at?, deleted?, source?, updated_at }
+ *                              delete_at?, deleted?, source?, updated_at,
+ *                              stripe_subscription_id?, stripe_session_id?,
+ *                              provider? }
  *   lssub:<lsSubId>       -> <hex>  (reverse map for later webhook events,
  *                              which may not carry custom_data)
+ *   stripesub:<subId>     -> <hex>  (same reverse map for Stripe
+ *                              subscription events)
  *   evt:<event_id>        -> { at }  (webhook idempotency; LS signs no
  *                              timestamp, so replays are deduped by id)
  *   scripts:<sha256(token)> -> [ { id, title, body, updatedAt } ]
@@ -151,7 +184,10 @@
  *                              email provider is configured)
  *   ev:<YYYY-MM-DD>:<event> -> analytics counter (90-day TTL)
  *
- * Secrets (set via the Workers API):
+ * Secrets and vars (set via the Workers API; never commit values):
+ *   PAYMENT_PROVIDER (var): "lemonsqueezy" | "stripe". Default
+ *     lemonsqueezy, so the live site does not change until Tyler
+ *     flips this and deploys.
  *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
  *   LEMONSQUEEZY_STORE_ID (Synaptiq HQ, 485773),
  *   LEMONSQUEEZY_VARIANT_ID (Pro Monthly $4.99),
@@ -161,6 +197,14 @@
  *     defaults to 1397885),
  *   LEMONSQUEEZY_STORAGE_TIERS (JSON map variantId -> GB, e.g.
  *     {"123":250,"124":500,"125":1000}),
+ *   STRIPE_SECRET_KEY (test key starting with sk_test_; live sk_live_
+ *     keys are refused unless STRIPE_ALLOW_LIVE=true, which only Tyler
+ *     sets),
+ *   STRIPE_WEBHOOK_SECRET (whsec_... from the Stripe test webhook),
+ *   STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY (or _ANNUAL),
+ *     STRIPE_PRICE_ID_LIFETIME (test catalog $3.99 / $29 / $59),
+ *   STRIPE_PRICE_ID_STORAGE_250 / _500 / _1000 (optional add-ons),
+ *   STRIPE_ALLOW_LIVE (optional; only Tyler may set this to "true"),
  *   EMAIL_API_KEY + EMAIL_FROM (optional; without them, deletion emails
  *     are logged to KV instead of sent — wire a provider before launch)
  *
@@ -459,6 +503,484 @@ async function lemonPost(apiKey, path, payload) {
   }
   return data;
 }
+
+
+// ---- payment provider switch ----
+// Default is Lemon Squeezy so the live Worker does not change until
+// Tyler sets PAYMENT_PROVIDER=stripe and deploys. Unknown values also
+// fall back to Lemon Squeezy.
+
+function paymentProvider(env) {
+  var raw = String((env && env.PAYMENT_PROVIDER) || "").trim().toLowerCase();
+  if (raw === "stripe") return "stripe";
+  return "lemonsqueezy";
+}
+
+// First-touch UTM fields accepted on POST /api/checkout. Each value is
+// trimmed to printable ASCII so metadata stays safe to store.
+var ATTRIBUTION_KEYS = [
+  "source", "medium", "campaign", "content", "term",
+  "referrer", "landing", "ts"
+];
+
+function sanitizeAttribution(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  var out = {};
+  var any = false;
+  for (var i = 0; i < ATTRIBUTION_KEYS.length; i++) {
+    var k = ATTRIBUTION_KEYS[i];
+    if (input[k] == null) continue;
+    var v = clean(String(input[k]), 200);
+    if (!v || !/^[\x20-\x7E]+$/.test(v)) continue;
+    out[k] = v;
+    any = true;
+  }
+  return any ? out : null;
+}
+
+function applyAttribution(target, attribution, prefix) {
+  if (!attribution) return target;
+  prefix = prefix || "attr_";
+  Object.keys(attribution).forEach(function (k) {
+    target[prefix + k] = attribution[k];
+  });
+  return target;
+}
+
+// ---- Stripe REST (raw fetch; no SDK in Workers) ----
+// Test-mode only unless Tyler sets STRIPE_ALLOW_LIVE=true.
+
+var STRIPE_API = "https://api.stripe.com/v1";
+var STRIPE_SIGNATURE_TOLERANCE_SEC = 300;
+
+var PLAN_PRICE_ENV = {
+  monthly: "STRIPE_PRICE_ID_MONTHLY",
+  yearly: ["STRIPE_PRICE_ID_YEARLY", "STRIPE_PRICE_ID_ANNUAL"],
+  lifetime: "STRIPE_PRICE_ID_LIFETIME",
+};
+
+var STORAGE_STRIPE_PLANS = {
+  storage250:  { gb: 250,  envVar: "STRIPE_PRICE_ID_STORAGE_250" },
+  storage500:  { gb: 500,  envVar: "STRIPE_PRICE_ID_STORAGE_500" },
+  storage1000: { gb: 1000, envVar: "STRIPE_PRICE_ID_STORAGE_1000" },
+};
+
+function planPriceId(env, plan) {
+  var names = [].concat(PLAN_PRICE_ENV[plan] || []);
+  for (var i = 0; i < names.length; i++) {
+    var v = String(env[names[i]] || "").trim();
+    if (v) return v;
+  }
+  return "";
+}
+
+// Refuse to call Stripe if the secret is a live key, unless Tyler has
+// explicitly set STRIPE_ALLOW_LIVE=true. The key itself is never logged
+// or returned in an error.
+function assertStripeTestMode(env) {
+  var key = String((env && env.STRIPE_SECRET_KEY) || "").trim();
+  if (!key) {
+    throw ApiError(503, "Checkout is not configured yet.");
+  }
+  var allowLive = String((env && env.STRIPE_ALLOW_LIVE) || "").trim().toLowerCase() === "true";
+  if (key.indexOf("sk_test_") !== 0 && !allowLive) {
+    throw ApiError(
+      503,
+      "Stripe live keys are refused unless STRIPE_ALLOW_LIVE=true. Only Tyler sets that."
+    );
+  }
+  return key;
+}
+
+// Success and cancel URLs always land on clickprompt.app, even if the
+// request origin was a preview host.
+function stripeReturnOrigin(origin) {
+  origin = clean(origin, 120) || "https://clickprompt.app";
+  try {
+    var u = new URL(origin);
+    var host = u.hostname.toLowerCase();
+    if (host === "clickprompt.app" || host === "www.clickprompt.app") {
+      return u.protocol + "//" + u.host;
+    }
+  } catch (e) {}
+  return "https://clickprompt.app";
+}
+
+function stripeForm(params) {
+  var body = new URLSearchParams();
+  Object.keys(params).forEach(function (k) {
+    if (params[k] != null && params[k] !== "") body.append(k, String(params[k]));
+  });
+  return body.toString();
+}
+
+// Build the x-www-form-urlencoded body for POST /v1/checkout/sessions.
+// Monthly and yearly are subscriptions; lifetime and storage add-ons are
+// one-time payments. Attribution, when present, is copied into session
+// metadata (and subscription or payment-intent metadata) as attr_* keys.
+function buildStripeCheckoutForm(opts) {
+  var token = opts.token;
+  var plan = opts.plan;
+  var params = {
+    mode: opts.mode,
+    "line_items[0][price]": opts.priceId,
+    "line_items[0][quantity]": "1",
+    success_url: opts.origin + "/?checkout=done",
+    cancel_url: opts.origin + "/?checkout=cancel",
+    client_reference_id: token,
+    "metadata[unlock_token]": token,
+    "metadata[plan]": plan,
+  };
+  if (opts.storageGb) params["metadata[storage_gb]"] = String(opts.storageGb);
+  if (opts.attribution) {
+    Object.keys(opts.attribution).forEach(function (k) {
+      params["metadata[attr_" + k + "]"] = opts.attribution[k];
+    });
+  }
+  if (opts.mode === "subscription") {
+    params["subscription_data[metadata][unlock_token]"] = token;
+    params["subscription_data[metadata][plan]"] = plan;
+    if (opts.attribution) {
+      Object.keys(opts.attribution).forEach(function (k) {
+        params["subscription_data[metadata][attr_" + k + "]"] = opts.attribution[k];
+      });
+    }
+  } else {
+    params["payment_intent_data[metadata][unlock_token]"] = token;
+    params["payment_intent_data[metadata][plan]"] = plan;
+    if (opts.storageGb) {
+      params["payment_intent_data[metadata][storage_gb]"] = String(opts.storageGb);
+    }
+    if (opts.attribution) {
+      Object.keys(opts.attribution).forEach(function (k) {
+        params["payment_intent_data[metadata][attr_" + k + "]"] = opts.attribution[k];
+      });
+    }
+  }
+  return stripeForm(params);
+}
+
+async function stripeRequest(secret, method, path, formBody) {
+  var res = await fetch(STRIPE_API + path, {
+    method: method,
+    headers: {
+      Authorization: "Bearer " + secret,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: formBody || undefined,
+  });
+  var data = await res.json().catch(function () { return {}; });
+  if (!res.ok) {
+    var msg = (data.error && data.error.message) || "stripe error";
+    var err = new Error(msg);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+async function hmacSha256Hex(secret, message) {
+  var key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  var sig = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(message)
+  );
+  return bytesToHex(new Uint8Array(sig));
+}
+
+// Stripe-Signature header is "t=<unix>,v1=<hex>[,v1=...]". The signed
+// payload is "timestamp.rawBody". Reject signatures older (or newer)
+// than toleranceSec (default 300). nowMs is injectable for tests.
+async function verifyStripeSignature(rawBody, header, secret, nowMs, toleranceSec) {
+  if (!header || !secret) return false;
+  var timestamp = "";
+  var signatures = [];
+  String(header).split(",").forEach(function (part) {
+    var cut = part.indexOf("=");
+    if (cut < 1) return;
+    var k = part.slice(0, cut).trim();
+    var v = part.slice(cut + 1).trim();
+    if (k === "t") timestamp = v;
+    else if (k === "v1") signatures.push(v.toLowerCase());
+  });
+  if (!timestamp || !signatures.length) return false;
+  var ts = Number(timestamp);
+  if (!ts) return false;
+  var tolerance = (toleranceSec == null ? STRIPE_SIGNATURE_TOLERANCE_SEC : Number(toleranceSec)) * 1000;
+  var now = nowMs == null ? Date.now() : nowMs;
+  if (Math.abs(now - ts * 1000) > tolerance) return false;
+  var expected = await hmacSha256Hex(secret, timestamp + "." + rawBody);
+  for (var i = 0; i < signatures.length; i++) {
+    if (timingSafeEqual(expected, signatures[i])) return true;
+  }
+  return false;
+}
+
+function stripeSubHex(token) {
+  if (typeof token !== "string") return null;
+  if (token.indexOf("sub:") === 0 && /^[0-9a-f]{32}$/.test(token.slice(4))) {
+    return token.slice(4);
+  }
+  return null;
+}
+
+function stripeStatusFromSubscription(sub) {
+  var status = String((sub && sub.status) || "");
+  if (status === "canceled") return "cancelled";
+  if (status === "trialing") return "on_trial";
+  if (status === "active") {
+    if (sub.cancel_at_period_end) return "cancelled";
+    return "active";
+  }
+  return status || "unknown";
+}
+
+function stripeEndsAt(sub) {
+  var unix = Number((sub && sub.cancel_at) || 0) || Number((sub && sub.current_period_end) || 0);
+  if (!unix) return null;
+  return new Date(unix * 1000).toISOString();
+}
+
+
+async function doStripeCheckout(env, origin, plan, existingToken, attribution) {
+  var secret = assertStripeTestMode(env);
+  origin = stripeReturnOrigin(origin);
+
+  var priceId;
+  var token = "sub:" + randomHex(16);
+  var storageGb = 0;
+  var mode;
+  var storagePlan = STORAGE_STRIPE_PLANS[plan];
+  if (storagePlan) {
+    existingToken = clean(existingToken, 64);
+    var st = await resolveUnlock(env, existingToken);
+    if (!st.unlocked) throw ApiError(403, "Storage add-ons need an active subscription first.");
+    priceId = String(env[storagePlan.envVar] || "").trim();
+    storageGb = storagePlan.gb;
+    token = existingToken;
+    mode = "payment";
+  } else {
+    if (plan === "annual") plan = "yearly";
+    if (!PLAN_PRICE_ENV[plan]) plan = "monthly";
+    priceId = planPriceId(env, plan);
+    mode = plan === "lifetime" ? "payment" : "subscription";
+  }
+  if (!priceId) {
+    throw ApiError(503, "That plan isn't available yet. Try the monthly plan.");
+  }
+
+  var form = buildStripeCheckoutForm({
+    mode: mode,
+    priceId: priceId,
+    origin: origin,
+    token: token,
+    plan: plan,
+    storageGb: storageGb,
+    attribution: attribution,
+  });
+
+  try {
+    var session = await stripeRequest(secret, "POST", "/checkout/sessions", form);
+  } catch (e) {
+    throw ApiError(502, "Could not start checkout. " + (e.message || "Try again."));
+  }
+  if (!session || !session.url) {
+    throw ApiError(502, "Could not start checkout. Try again.");
+  }
+  return { url: session.url, token: token };
+}
+
+async function rememberStripeSub(env, stripeSubId, hex) {
+  if (env.KV && stripeSubId && hex) {
+    await env.KV.put("stripesub:" + stripeSubId, hex);
+  }
+}
+
+async function hexFromStripeSubscription(env, sub, metadata) {
+  var meta = metadata || (sub && sub.metadata) || {};
+  var customToken = meta.unlock_token;
+  var hex = stripeSubHex(customToken);
+  var stripeSubId = String((sub && sub.id) || "");
+  if (hex) {
+    await rememberStripeSub(env, stripeSubId, hex);
+    return hex;
+  }
+  if (stripeSubId && env.KV) {
+    return await env.KV.get("stripesub:" + stripeSubId);
+  }
+  return null;
+}
+
+// Apply a Stripe subscription event to the same KV record shape Lemon
+// Squeezy uses, so resolveUnlock / cancel-keeps-Pro / deletion all work
+// unchanged. Stripe spells it "canceled"; we store "cancelled".
+async function applyStripeSubscription(env, sub) {
+  if (!env.KV || !sub) return;
+  var hex = await hexFromStripeSubscription(env, sub, sub.metadata);
+  if (!hex) return;
+  var effectiveStatus = stripeStatusFromSubscription(sub);
+  var subKey = "sub:" + hex;
+  var prev = (await env.KV.get(subKey, "json")) || {};
+  var rec = {
+    status: effectiveStatus,
+    ls_subscription_id: prev.ls_subscription_id || null,
+    stripe_subscription_id: String(sub.id || prev.stripe_subscription_id || "") || null,
+    email: clean((sub.customer_email || (prev.email || "")), 120) || prev.email || null,
+    storage_tier_gb: prev.storage_tier_gb || 100,
+    cancel_pending: !!prev.cancel_pending,
+    ends_at: stripeEndsAt(sub) || prev.ends_at || null,
+    delete_at: prev.delete_at || null,
+    source: prev.source || "stripe",
+    provider: "stripe",
+    updated_at: Date.now(),
+  };
+  var wasActive = !prev.cancel_pending && (prev.status === "active" || prev.status === "on_trial" || !prev.status);
+  var isCancel = effectiveStatus === "cancelled" || effectiveStatus === "expired";
+  if (isCancel && wasActive) {
+    var accessEndsAt = Math.max(Date.now(), Date.parse(rec.ends_at || "") || 0);
+    var deleteAt = addBusinessDays(accessEndsAt, 10);
+    rec.cancel_pending = true;
+    rec.delete_at = deleteAt;
+    await env.KV.put(subKey, JSON.stringify(rec));
+    try {
+      await scheduleDeletion(env, hex, rec.email, deleteAt, accessEndsAt);
+    } catch (e) {}
+  } else if (!isCancel) {
+    if (rec.cancel_pending) {
+      rec.cancel_pending = false;
+      rec.delete_at = null;
+      try { await cancelDeletion(env, hex); } catch (e) {}
+    }
+    await env.KV.put(subKey, JSON.stringify(rec));
+  } else {
+    await env.KV.put(subKey, JSON.stringify(rec));
+  }
+}
+
+async function applyStripeCheckoutSession(env, session) {
+  if (!env.KV || !session) return;
+  var meta = session.metadata || {};
+  var token = meta.unlock_token || session.client_reference_id || "";
+  var email = clean(
+    ((session.customer_details && session.customer_details.email) || session.customer_email || ""),
+    120
+  ) || null;
+
+  if (session.mode === "subscription") {
+    var hex = stripeSubHex(token);
+    var stripeSubId = typeof session.subscription === "string"
+      ? session.subscription
+      : (session.subscription && session.subscription.id) || "";
+    if (hex) {
+      await rememberStripeSub(env, stripeSubId, hex);
+      var subKey = "sub:" + hex;
+      var prev = (await env.KV.get(subKey, "json")) || {};
+      var rec = {
+        status: "active",
+        stripe_subscription_id: stripeSubId || prev.stripe_subscription_id || null,
+        stripe_session_id: String(session.id || prev.stripe_session_id || "") || null,
+        email: email || prev.email || null,
+        storage_tier_gb: prev.storage_tier_gb || 100,
+        cancel_pending: false,
+        ends_at: prev.ends_at || null,
+        delete_at: null,
+        source: "stripe",
+        provider: "stripe",
+        updated_at: Date.now(),
+      };
+      if (prev.cancel_pending) {
+        try { await cancelDeletion(env, hex); } catch (e) {}
+      }
+      await env.KV.put(subKey, JSON.stringify(rec));
+    }
+    return;
+  }
+
+  if (session.mode === "payment") {
+    if (session.payment_status && session.payment_status !== "paid") return;
+    var payHex = stripeSubHex(token);
+    if (!payHex) return;
+    var orderSubKey = "sub:" + payHex;
+    var orderPrev = (await env.KV.get(orderSubKey, "json")) || {};
+    var storageGb = Number(meta.storage_gb) || 0;
+    if (storageGb >= 250 && storageGb <= 1000) {
+      var newTier = Math.min(1000, Math.max(Number(orderPrev.storage_tier_gb) || 100, storageGb));
+      orderPrev.storage_tier_gb = newTier;
+      orderPrev.updated_at = Date.now();
+      orderPrev.provider = orderPrev.provider || "stripe";
+      await env.KV.put(orderSubKey, JSON.stringify(orderPrev));
+    } else {
+      await env.KV.put(
+        orderSubKey,
+        JSON.stringify({
+          status: "lifetime",
+          stripe_session_id: String(session.id || ""),
+          email: email || orderPrev.email || null,
+          storage_tier_gb: Number(orderPrev.storage_tier_gb) || 100,
+          source: "stripe",
+          provider: "stripe",
+          updated_at: Date.now(),
+        })
+      );
+    }
+  }
+}
+
+async function handleStripeWebhook(request, env, cors) {
+  // Stripe posts events here. Signature-verified; updates the same KV
+  // entitlement records as the Lemon Squeezy webhook.
+  if (!env.STRIPE_WEBHOOK_SECRET) {
+    return json({ error: "Webhook is not configured yet." }, 503, cors);
+  }
+  try {
+    assertStripeTestMode(env);
+  } catch (e) {
+    return json({ error: e.message || "Stripe is not configured." }, e.status || 503, cors);
+  }
+
+  var raw = await request.text();
+  var sig = request.headers.get("Stripe-Signature");
+  if (!(await verifyStripeSignature(raw, sig, env.STRIPE_WEBHOOK_SECRET))) {
+    return json({ error: "Bad signature." }, 401, cors);
+  }
+
+  var event;
+  try {
+    event = JSON.parse(raw);
+  } catch (e) {
+    return json({ error: "Bad payload." }, 400, cors);
+  }
+  if (!env.KV) return json({ error: "KV is not configured." }, 500, cors);
+
+  var eventId = String(event.id || "");
+  if (eventId) {
+    var seen = await env.KV.get("evt:" + eventId);
+    if (seen) return json({ received: true, duplicate: true }, 200, cors);
+  }
+
+  var type = String(event.type || "");
+  var obj = (event.data && event.data.object) || {};
+
+  if (type === "checkout.session.completed") {
+    await applyStripeCheckoutSession(env, obj);
+  } else if (type === "customer.subscription.updated" || type === "customer.subscription.deleted") {
+    await applyStripeSubscription(env, obj);
+  }
+  // All other event types are acknowledged and ignored.
+
+  if (eventId) {
+    await env.KV.put("evt:" + eventId, JSON.stringify({ at: Date.now() }));
+  }
+  return json({ received: true }, 200, cors);
+}
+
 
 // ---- identity / unlock logic ----
 
@@ -899,7 +1421,19 @@ function storageTierGb(env) {
   }
 }
 
-async function doCheckout(env, origin, plan, existingToken) {
+async function doCheckout(env, origin, plan, existingToken, attribution) {
+  // Optional first-touch UTM from the client (same shape the attribution
+  // branch will send). Ignored when missing or invalid.
+  attribution = sanitizeAttribution(attribution);
+  origin = clean(origin, 120) || "https://clickprompt.app";
+  if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
+  plan = clean(plan, 20);
+
+  // Stripe path is off unless PAYMENT_PROVIDER=stripe is set on the Worker.
+  if (paymentProvider(env) === "stripe") {
+    return doStripeCheckout(env, origin, plan, existingToken, attribution);
+  }
+
   if (
     !env.LEMONSQUEEZY_API_KEY ||
     !env.LEMONSQUEEZY_STORE_ID ||
@@ -907,17 +1441,15 @@ async function doCheckout(env, origin, plan, existingToken) {
   ) {
     throw ApiError(503, "Checkout is not configured yet.");
   }
-  origin = clean(origin, 120) || "https://clickprompt.app";
-  if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
 
   // Plan -> variant. Monthly is the default ("annual" is accepted as an
   // alias for yearly). Storage add-ons
   // (storage250/500/1000) are for existing subscribers and resolve
   // through STORAGE_PLANS below.
-  plan = clean(plan, 20);
   var variantId;
   var token = "sub:" + randomHex(16);
   var custom = { unlock_token: token };
+  applyAttribution(custom, attribution);
   var storagePlan = STORAGE_PLANS[plan];
   if (storagePlan) {
     existingToken = clean(existingToken, 64);
@@ -1660,12 +2192,13 @@ async function handleGenerate(request, env, cors) {
 }
 
 async function handleCheckout(request, env, cors) {
-  // Creates a Lemon Squeezy checkout for the requested plan (monthly,
-  // lifetime, or a storage add-on) and returns the hosted URL plus the
-  // opaque unlock token. The frontend stores the token BEFORE redirecting;
-  // the subscription_created / order_created webhook matches it back via
-  // checkout custom_data. Storage add-ons pass the subscriber's existing
-  // token so the quota lands on their identity.
+  // Creates a hosted checkout for the requested plan (monthly, yearly,
+  // lifetime, or a storage add-on) and returns the URL plus the opaque
+  // unlock token. PAYMENT_PROVIDER selects Lemon Squeezy (default) or
+  // Stripe. The frontend stores the token BEFORE redirecting; the
+  // webhook matches it back via custom_data / metadata. Storage add-ons
+  // pass the subscriber's existing token so the quota lands on their
+  // identity. Optional body.attribution is stored on the checkout.
   var body = {};
   try {
     body = await request.json();
@@ -1673,7 +2206,7 @@ async function handleCheckout(request, env, cors) {
     body = {};
   }
   try {
-    return json(await doCheckout(env, body.origin, body.plan, body.token), 200, cors);
+    return json(await doCheckout(env, body.origin, body.plan, body.token, body.attribution), 200, cors);
   } catch (e) {
     return json({ error: e.message || "Could not start checkout." }, e.status || 500, cors);
   }
@@ -2245,6 +2778,17 @@ async function handleEvent(request, env, cors) {
   return json({ ok: true }, 200, cors);
 }
 
+// Named exports are for local unit tests only (node --test test/).
+export {
+  paymentProvider,
+  sanitizeAttribution,
+  assertStripeTestMode,
+  buildStripeCheckoutForm,
+  verifyStripeSignature,
+  stripeReturnOrigin,
+  planPriceId,
+};
+
 export default {
   async fetch(request, env) {
     var cors = {
@@ -2271,6 +2815,9 @@ export default {
     }
     if (path === "/api/webhook" && request.method === "POST") {
       return handleWebhook(request, env, cors);
+    }
+    if (path === "/api/stripe-webhook" && request.method === "POST") {
+      return handleStripeWebhook(request, env, cors);
     }
     if (path === "/api/me" && request.method === "GET") {
       return handleMe(request, env, cors);

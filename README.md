@@ -65,9 +65,11 @@ lifetime, or is free for life with an access code. Buyers can also unlock
 on any device with the Lemon Squeezy license key from their receipt email.
 A cancelled monthly/yearly plan keeps Pro until the paid period ends.
 
-- Worker endpoints: `POST /api/checkout` (Lemon Squeezy hosted checkout,
-  recurring), `POST /api/webhook` (Lemon Squeezy events, X-Signature
-  verified), `GET /api/me`, `POST /api/redeem` (access code or license key),
+- Worker endpoints: `POST /api/checkout` (hosted checkout; Lemon Squeezy
+  by default, or Stripe Checkout when `PAYMENT_PROVIDER=stripe`),
+  `POST /api/webhook` (Lemon Squeezy events, X-Signature verified),
+  `POST /api/stripe-webhook` (Stripe events, Stripe-Signature verified),
+  `GET /api/me`, `POST /api/redeem` (access code or license key),
   `GET/POST/DELETE /api/scripts` (library CRUD, unlocked identities only).
 - Storage: Cloudflare KV namespace `clickprompt-data`. Access codes are
   stored as SHA-256 hashes only (`code:<sha256("code:"+CODE)>`, CODE =
@@ -75,14 +77,113 @@ A cancelled monthly/yearly plan keeps Pro until the paid period ends.
   giveaway batches); subscriptions are keyed by an opaque
   `sub:<hex>` token passed as checkout `custom_data` and written by the
   verified webhook.
-- Secrets the worker expects: `LEMONSQUEEZY_API_KEY`,
-  `LEMONSQUEEZY_WEBHOOK_SECRET`, `LEMONSQUEEZY_STORE_ID` = 485773 (Synaptiq HQ),
+- Secrets the worker expects for the current Lemon Squeezy path:
+  `LEMONSQUEEZY_API_KEY`, `LEMONSQUEEZY_WEBHOOK_SECRET`,
+  `LEMONSQUEEZY_STORE_ID` = 485773 (Synaptiq HQ),
   `LEMONSQUEEZY_VARIANT_ID` (Pro Monthly $4.99),
   `LEMONSQUEEZY_VARIANT_ID_ANNUAL` (Pro Annual $49.99; `_YEARLY` also accepted),
   `LEMONSQUEEZY_VARIANT_ID_LIFETIME` (Pro Lifetime $129), optional
   `LEMONSQUEEZY_PRODUCT_ID` (license-key product check, default 1397885),
   `LEMONSQUEEZY_STORAGE_TIERS` (JSON map of storage add-on variant ID to
   GB), plus optional `EMAIL_API_KEY`/`EMAIL_FROM` for the cancellation
-  email sequence.
+  email sequence. Stripe secrets are listed in the Stripe section below
+  and are not used unless `PAYMENT_PROVIDER=stripe`.
 - The frontend keeps one opaque unlock token in `localStorage`
   (`clickprompt_token`): `code:<CODE>`, `sub:<hex>`, or `lic:<license key>`.
+
+## Stripe Checkout (test mode, do not merge without Tyler's OK)
+
+This is behind a provider switch. The default is Lemon Squeezy, so the
+live site does not change until Tyler sets `PAYMENT_PROVIDER=stripe` on
+the Worker and deploys it. Merging this branch to `main` would publish
+the frontend (legal-page draft wording included) to clickprompt.app, so
+do not merge without Tyler's OK. The Worker is uploaded separately and
+is also not deployed by this PR.
+
+Lemon Squeezy announced on November 16, 2026 that it is winding down:
+new store sign-ups are closed, and it will stop processing payments on
+March 31, 2027. See the "Lemon Squeezy wind-down" notes in the pull
+request. This Stripe path is the test-mode foundation for that move.
+It uses Stripe Checkout (you are the seller; Stripe is the processor),
+not Stripe Managed Payments, unless Tyler later chooses that product.
+
+### What Tyler creates in the Stripe Dashboard (test mode)
+
+Do this in your own Stripe account. Do not put any keys in the repo.
+
+1. Sign in at https://dashboard.stripe.com and turn on **Test mode**
+   (the toggle in the Dashboard). Stay in test mode.
+2. Open **Product catalog** and create three products with these test
+   prices (USD):
+   - ClickPrompt Pro Monthly: $3.99, recurring monthly. Copy the Price
+     ID (`price_...`) into `STRIPE_PRICE_ID_MONTHLY`.
+   - ClickPrompt Pro Yearly: $29, recurring yearly. Copy the Price ID
+     into `STRIPE_PRICE_ID_YEARLY`.
+   - ClickPrompt Pro Lifetime: $59, one-time. Copy the Price ID into
+     `STRIPE_PRICE_ID_LIFETIME`.
+3. Optional storage add-ons (one-time), if you still want them: create
+   prices and set `STRIPE_PRICE_ID_STORAGE_250`,
+   `STRIPE_PRICE_ID_STORAGE_500`, and `STRIPE_PRICE_ID_STORAGE_1000`.
+4. Open **Developers > API keys** and copy the **test** secret key
+   (`sk_test_...`). This is `STRIPE_SECRET_KEY`. Never commit it. A key
+   that does not start with `sk_test_` is refused unless
+   `STRIPE_ALLOW_LIVE=true`. Only Tyler sets that flag, and only when
+   he is ready to take Stripe live.
+5. After the Worker with this code is uploaded (a later, separate step
+   that also needs Tyler's OK), add a webhook in **Developers >
+   Webhooks** for the test endpoint:
+   `https://teleprompter-script-api.synaptiqs.workers.dev/api/stripe-webhook`.
+   Listen for `checkout.session.completed`,
+   `customer.subscription.updated`, and `customer.subscription.deleted`.
+   Copy the signing secret (`whsec_...`) into `STRIPE_WEBHOOK_SECRET`.
+
+### Worker vars and secrets (set on the Worker, not in git)
+
+- `PAYMENT_PROVIDER` (var): `lemonsqueezy` (default) or `stripe`.
+- `STRIPE_SECRET_KEY` (secret): test key starting with `sk_test_`.
+- `STRIPE_WEBHOOK_SECRET` (secret): `whsec_...`.
+- `STRIPE_PRICE_ID_MONTHLY`, `STRIPE_PRICE_ID_YEARLY` (or
+  `STRIPE_PRICE_ID_ANNUAL`), `STRIPE_PRICE_ID_LIFETIME` (vars).
+- `STRIPE_ALLOW_LIVE` (var, optional): only Tyler may set this to
+  `true`. Without it, live `sk_live_` keys are refused.
+
+`POST /api/checkout` accepts an optional `attribution` object
+(`source`, `medium`, `campaign`, `content`, `term`, `referrer`,
+`landing`, `ts`). Each value is sanitized to printable ASCII and, on
+the Stripe path, stored in Checkout Session metadata as `attr_*` keys
+so a later UTM-attribution change can merge cleanly.
+
+### Entitlements
+
+Stripe webhooks write the same KV records as Lemon Squeezy:
+
+- `checkout.session.completed` for a subscription sets `sub:<hex>` to
+  `status: "active"`.
+- `checkout.session.completed` for a lifetime (one-time) payment sets
+  `status: "lifetime"`.
+- Storage add-on payments raise `storage_tier_gb` on the existing
+  identity instead of minting a new one.
+- `customer.subscription.updated` and `customer.subscription.deleted`
+  keep that record in sync. A cancel keeps Pro until
+  `current_period_end` (stored as `ends_at`), then the same
+  10-business-day deletion sequence runs.
+
+License-key redeem stays Lemon Squeezy only, because Stripe Checkout
+does not issue those keys.
+
+### Local tests
+
+```
+node --test test/*.mjs
+```
+
+### Manual test plan (after Tyler sets test secrets on a preview Worker)
+
+Do not point a test webhook at the live Worker until Tyler says to.
+Use Stripe test card `4242 4242 4242 4242`, any future expiry, any
+CVC, and any postal code. Complete a monthly, yearly, and lifetime
+checkout, confirm `/?checkout=done` returns to clickprompt.app, and
+confirm Pro unlocks after the webhook. Cancel a subscription in the
+Stripe test Dashboard and confirm Pro stays on until the paid period
+ends. A declined test card (`4000 0000 0000 0002`) should not unlock
+Pro.

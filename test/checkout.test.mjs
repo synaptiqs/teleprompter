@@ -1,13 +1,19 @@
-// LOCAL TEST ONLY: node --test test/  (no network; Lemon Squeezy faked)
-import test from 'node:test';
+// LOCAL TEST ONLY: node --test test/*.mjs  (no network; Lemon Squeezy faked)
+import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 let sent = [];
-globalThis.fetch = async (url, init) => {
-  if (String(url) !== 'https://api.lemonsqueezy.com/v1/checkouts') throw new Error('blocked ' + url);
-  const b = JSON.parse(init.body); sent.push(b.data.attributes.product_options.enabled_variants[0]);
-  return new Response(JSON.stringify({ data: { attributes: { url: 'https://example.invalid/checkout' } } }), { status: 201 });
-};
+function lemonFetch() {
+  return async (url, init) => {
+    if (String(url) !== 'https://api.lemonsqueezy.com/v1/checkouts') throw new Error('blocked ' + url);
+    const b = JSON.parse(init.body); sent.push(b.data.attributes.product_options.enabled_variants[0]);
+    return new Response(JSON.stringify({ data: { attributes: { url: 'https://example.invalid/checkout' } } }), { status: 201 });
+  };
+}
+beforeEach(() => {
+  sent = [];
+  globalThis.fetch = lemonFetch();
+});
 const worker = (await import('../worker/script-api.js')).default;
 const base = { LEMONSQUEEZY_API_KEY: 'k', LEMONSQUEEZY_STORE_ID: '1', LEMONSQUEEZY_VARIANT_ID: '111', LEMONSQUEEZY_VARIANT_ID_LIFETIME: '333' };
 const checkout = (env, plan) => worker.fetch(new Request('https://x.test/api/checkout', { method: 'POST',
@@ -43,4 +49,16 @@ test('preview vars map plans to TEST-mode variants', async () => {
   const env = { LEMONSQUEEZY_API_KEY: 'k', LEMONSQUEEZY_STORE_ID: '1', ...pv };
   sent = []; for (const p of ['monthly', 'yearly', 'lifetime']) assert.equal((await checkout(env, p)).status, 200);
   assert.deepEqual(sent, ['2287468', '2287471', '2287475']);
+});
+
+test('PAYMENT_PROVIDER defaults to Lemon Squeezy even if Stripe keys are present', async () => {
+  sent = [];
+  const env = {
+    ...base,
+    STRIPE_SECRET_KEY: 'sk_test_abc',
+    STRIPE_PRICE_ID_MONTHLY: 'price_monthly',
+  };
+  const r = await checkout(env, 'monthly');
+  assert.equal(r.status, 200);
+  assert.deepEqual(sent, ['111']);
 });

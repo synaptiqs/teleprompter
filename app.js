@@ -318,9 +318,9 @@
       }
 
       async function refreshUnlock() {
-        // Returning from Lemon Squeezy checkout lands here with
-        // ?checkout=done. The unlock token was stored before redirecting;
-        // the webhook may take a few seconds, so poll briefly.
+        // Returning from hosted checkout lands here with ?checkout=done.
+        // The unlock token was stored before redirecting; the webhook may
+        // take a few seconds, so poll briefly.
         var params = new URLSearchParams(window.location.search);
         if (params.get("checkout") === "done") {
           params.delete("checkout");
