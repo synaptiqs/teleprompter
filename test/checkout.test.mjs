@@ -4,8 +4,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 let sent = [];
 let lastCheckout = null;
+let turnstileSuccess = true;
+let lastTurnstile = null;
 globalThis.fetch = async (url, init) => {
-  if (String(url) !== 'https://api.lemonsqueezy.com/v1/checkouts') throw new Error('blocked ' + url);
+  const u = String(url);
+  if (u === 'https://challenges.cloudflare.com/turnstile/v0/siteverify') {
+    lastTurnstile = init;
+    return new Response(JSON.stringify({ success: turnstileSuccess }), { status: 200 });
+  }
+  if (u !== 'https://api.lemonsqueezy.com/v1/checkouts') throw new Error('blocked ' + url);
   const b = JSON.parse(init.body);
   lastCheckout = b;
   sent.push(b.data.attributes.product_options.enabled_variants[0]);
@@ -48,17 +55,23 @@ test('preview vars map plans to TEST-mode variants', async () => {
   assert.deepEqual(sent, ['2287468', '2287471', '2287475']);
 });
 
+
 function memoryKv() {
   const data = new Map();
+  const ttls = new Map();
   return {
     async get(key, type) {
       if (!data.has(key)) return null;
       const v = data.get(key);
       return type === 'json' ? JSON.parse(v) : v;
     },
-    async put(key, val) { data.set(key, typeof val === 'string' ? val : JSON.stringify(val)); },
-    async delete(key) { data.delete(key); },
-    _data: data
+    async put(key, val, opts) {
+      data.set(key, typeof val === 'string' ? val : JSON.stringify(val));
+      if (opts && opts.expirationTtl) ttls.set(key, opts.expirationTtl);
+    },
+    async delete(key) { data.delete(key); ttls.delete(key); },
+    _data: data,
+    _ttls: ttls
   };
 }
 
@@ -103,25 +116,61 @@ test('checkout still works when attribution is missing or junk (live Worker may 
   assert.equal(r3.status, 200);
 });
 
-const launch = (env, body, ip) => worker.fetch(new Request('https://x.test/api/launch-notify', { method: 'POST',
-  headers: { 'Content-Type': 'application/json', Origin: 'https://clickprompt.app', 'CF-Connecting-IP': ip || '203.0.113.10' },
-  body: JSON.stringify(body) }), env, { waitUntil() {} });
+test('checkout redirect_url allowlists production and Pages previews, otherwise falls back', async () => {
+  const { _allowedCheckoutOrigin: allowed } = await import('../worker/script-api.js');
+  assert.equal(allowed('https://clickprompt.app'), 'https://clickprompt.app');
+  assert.equal(allowed('https://www.clickprompt.app/path'), 'https://www.clickprompt.app');
+  assert.equal(allowed('https://teleprompter-5fz.pages.dev'), 'https://teleprompter-5fz.pages.dev');
+  assert.equal(allowed('https://0d3a072d.teleprompter-5fz.pages.dev'), 'https://0d3a072d.teleprompter-5fz.pages.dev');
+  assert.equal(allowed('http://clickprompt.app'), 'https://clickprompt.app');
+  assert.equal(allowed('https://evil.com'), 'https://clickprompt.app');
+  assert.equal(allowed('https://evil-teleprompter-5fz.pages.dev'), 'https://clickprompt.app');
+  assert.equal(allowed('https://clickprompt.app.evil.com'), 'https://clickprompt.app');
+  assert.equal(allowed('javascript:alert(1)'), 'https://clickprompt.app');
 
-test('launch-notify stores email and attribution, first signup wins', async () => {
+  lastCheckout = null;
+  const r = await checkoutWith(base, { origin: 'https://evil.example' });
+  assert.equal(r.status, 200);
+  assert.equal(lastCheckout.data.attributes.product_options.redirect_url, 'https://clickprompt.app/?checkout=done');
+
+  lastCheckout = null;
+  const r2 = await checkoutWith(base, { origin: 'https://abc.teleprompter-5fz.pages.dev' });
+  assert.equal(r2.status, 200);
+  assert.equal(lastCheckout.data.attributes.product_options.redirect_url, 'https://abc.teleprompter-5fz.pages.dev/?checkout=done');
+});
+
+const launch = (env, body, ip, opts = {}) => {
+  const headers = {
+    Origin: 'https://clickprompt.app',
+    'CF-Connecting-IP': ip || '203.0.113.10',
+    ...(opts.headers || {})
+  };
+  if (opts.contentType !== false && !('Content-Type' in headers)) {
+    headers['Content-Type'] = opts.contentType || 'application/json';
+  }
+  if (opts.contentLength !== undefined) headers['Content-Length'] = String(opts.contentLength);
+  const bodyInit = opts.rawBody !== undefined ? opts.rawBody : JSON.stringify(body);
+  return worker.fetch(new Request('https://x.test/api/launch-notify', {
+    method: 'POST', headers, body: bodyInit
+  }), env, { waitUntil() {} });
+};
+
+test('launch-notify stores email and attribution, first signup wins, always {ok:true}', async () => {
   const kv = memoryKv();
-  const env = { KV: kv };
+  const env = { LAUNCH_KV: kv };
   const r = await launch(env, {
     email: 'Alex@Example.com',
     attribution: { utm_source: 'tiktok', utm_campaign: 'first10', landing: '/' }
   });
   assert.equal(r.status, 200);
   const body = await r.json();
-  assert.deepEqual({ ok: body.ok, already: body.already }, { ok: true, already: undefined });
-  assert.equal(kv._data.size, 2); // launch record + throttle key
-  const rec = JSON.parse([...kv._data.values()].find((v) => v.includes('alex@example.com')));
+  assert.deepEqual(body, { ok: true });
+  assert.equal(Object.keys(body).includes('already'), false);
+  const recKey = [...kv._data.keys()].find((k) => k.startsWith('launch:'));
+  const rec = JSON.parse(kv._data.get(recKey));
   assert.equal(rec.email, 'alex@example.com');
   assert.equal(rec.attribution.utm_source, 'tiktok');
-  assert.equal(rec.attribution.utm_campaign, 'first10');
+  assert.equal(kv._ttls.get(recKey), 365 * 24 * 60 * 60);
 
   const again = await launch(env, {
     email: 'alex@example.com',
@@ -129,39 +178,119 @@ test('launch-notify stores email and attribution, first signup wins', async () =
   });
   const againBody = await again.json();
   assert.equal(again.status, 200);
-  assert.equal(againBody.already, true);
-  const rec2 = JSON.parse([...kv._data.values()].find((v) => v.includes('alex@example.com')));
+  assert.deepEqual(againBody, { ok: true });
+  const rec2 = JSON.parse(kv._data.get(recKey));
   assert.equal(rec2.attribution.utm_source, 'tiktok');
 });
 
-test('launch-notify rejects a bad email and ignores a filled honeypot', async () => {
+test('launch-notify rejects a bad email and returns {ok:true} for a filled honeypot without storing', async () => {
   const kv = memoryKv();
-  const bad = await launch({ KV: kv }, { email: 'not-an-email' }, '203.0.113.11');
+  const bad = await launch({ LAUNCH_KV: kv }, { email: 'not-an-email' }, '203.0.113.11');
   assert.equal(bad.status, 400);
-  const hp = await launch({ KV: kv }, { email: 'ok@example.com', company: 'Bot Co' }, '203.0.113.12');
+  const hp = await launch({ LAUNCH_KV: kv }, { email: 'ok@example.com', company: 'Bot Co' }, '203.0.113.12');
   assert.equal(hp.status, 200);
-  assert.equal((await hp.json()).ok, true);
+  assert.deepEqual(await hp.json(), { ok: true });
   assert.ok(![...kv._data.values()].some((v) => String(v).includes('ok@example.com')));
 });
 
-test('launch-notify returns 503 when no KV is bound, and 429 after too many tries', async () => {
+test('launch-notify returns 503 when LAUNCH_KV is missing, including if only main KV is bound', async () => {
   const none = await launch({}, { email: 'a@example.com' }, '203.0.113.13');
   assert.equal(none.status, 503);
+  const onlyMain = await launch({ KV: memoryKv() }, { email: 'b@example.com' }, '203.0.113.13');
+  assert.equal(onlyMain.status, 503);
+});
+
+test('launch-notify KV throttle is 5 per hour and buckets IPv6 by /64', async () => {
   const kv = memoryKv();
-  const env = { KV: kv };
+  const env = { LAUNCH_KV: kv };
   for (let i = 0; i < 5; i++) {
     const r = await launch(env, { email: `user${i}@example.com` }, '203.0.113.14');
     assert.equal(r.status, 200, 'attempt ' + i);
   }
   const blocked = await launch(env, { email: 'last@example.com' }, '203.0.113.14');
   assert.equal(blocked.status, 429);
+
+  const v6a = '2001:db8:abcd:0012:ffff::1';
+  const v6b = '2001:db8:abcd:12:1::aaaa';
+  const v6other = '2001:db8:abcd:0013::1';
+  for (let i = 0; i < 5; i++) {
+    const ip = i % 2 === 0 ? v6a : v6b;
+    const r = await launch(env, { email: `v6${i}@example.com` }, ip);
+    assert.equal(r.status, 200, 'v6 attempt ' + i);
+  }
+  const v6blocked = await launch(env, { email: 'v6last@example.com' }, v6a);
+  assert.equal(v6blocked.status, 429);
+  const v6ok = await launch(env, { email: 'v6other@example.com' }, v6other);
+  assert.equal(v6ok.status, 200);
+
+  const { _throttleIpKey: key } = await import('../worker/script-api.js');
+  assert.equal(key(v6a), key(v6b));
+  assert.notEqual(key(v6a), key(v6other));
+  assert.equal(key('::ffff:203.0.113.10'), '203.0.113.10');
 });
 
-test('optional LAUNCH_KV binding is used when present', async () => {
-  const launchNs = memoryKv();
-  const mainKv = memoryKv();
-  const r = await launch({ KV: mainKv, LAUNCH_KV: launchNs }, { email: 'iso@example.com' }, '203.0.113.15');
-  assert.equal(r.status, 200);
-  assert.ok([...launchNs._data.values()].some((v) => String(v).includes('iso@example.com')));
-  assert.ok(![...mainKv._data.values()].some((v) => String(v).includes('iso@example.com')));
+test('LAUNCH_RATE_LIMITER is used when bound, with KV throttle as fallback', async () => {
+  const kv = memoryKv();
+  let seen = [];
+  const limiterFail = { limit: async ({ key }) => { seen.push(key); return { success: false }; } };
+  const limited = await launch({ LAUNCH_KV: kv, LAUNCH_RATE_LIMITER: limiterFail }, { email: 'rate@example.com' }, '203.0.113.20');
+  assert.equal(limited.status, 429);
+  assert.deepEqual(seen, ['203.0.113.20']);
+  assert.ok(![...kv._data.values()].some((v) => String(v).includes('rate@example.com')));
+
+  seen = [];
+  const limiterOk = { limit: async ({ key }) => { seen.push(key); return { success: true }; } };
+  const ok = await launch({ LAUNCH_KV: kv, LAUNCH_RATE_LIMITER: limiterOk }, { email: 'rateok@example.com' }, '203.0.113.21');
+  assert.equal(ok.status, 200);
+  assert.deepEqual(seen, ['203.0.113.21']);
+  // Rate limiter handled the throttle, so no launchthrottle key is required.
+  assert.ok([...kv._data.keys()].some((k) => k.startsWith('launch:')));
+});
+
+test('launch-notify requires application/json and rejects bodies over 8 KB', async () => {
+  const env = { LAUNCH_KV: memoryKv() };
+  const noType = await launch(env, { email: 'a@example.com' }, '203.0.113.30', { contentType: false });
+  assert.equal(noType.status, 415);
+  const textType = await launch(env, { email: 'a@example.com' }, '203.0.113.30', { contentType: 'text/plain' });
+  assert.equal(textType.status, 415);
+  const tooLongHeader = await launch(env, { email: 'a@example.com' }, '203.0.113.30', { contentLength: 9000 });
+  assert.equal(tooLongHeader.status, 413);
+  const huge = JSON.stringify({ email: 'a@example.com', pad: 'x'.repeat(9000) });
+  const tooLongBody = await launch(env, {}, '203.0.113.30', { rawBody: huge });
+  assert.equal(tooLongBody.status, 413);
+  const withCharset = await launch(env, { email: 'charset@example.com' }, '203.0.113.30', { contentType: 'application/json; charset=utf-8' });
+  assert.equal(withCharset.status, 200);
+});
+
+test('Turnstile is required only when TURNSTILE_SECRET is set', async () => {
+  const kv = memoryKv();
+  const env = { LAUNCH_KV: kv, TURNSTILE_SECRET: 'test-secret' };
+  turnstileSuccess = false;
+  const missing = await launch(env, { email: 'ts@example.com' }, '203.0.113.40');
+  assert.equal(missing.status, 403);
+  const missingBody = await missing.json();
+  assert.equal(missingBody.code, 'human_check');
+  assert.ok(![...kv._data.values()].some((v) => String(v).includes('ts@example.com')));
+
+  turnstileSuccess = true;
+  const ok = await launch(env, { email: 'ts@example.com', 'cf-turnstile-response': 'token-ok' }, '203.0.113.41');
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ok: true });
+
+  const off = await launch({ LAUNCH_KV: memoryKv() }, { email: 'nots@example.com' }, '203.0.113.42');
+  assert.equal(off.status, 200);
+});
+
+test('frontend uses one generic launch success message and handles 404/405', () => {
+  const js = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  assert.ok(js.includes('You are on the list. We will email you when the store goes live.'));
+  assert.ok(!js.includes('You are already on the list'));
+  assert.ok(js.includes('result._status === 404') && js.includes('result._status === 405'));
+  const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const notices = html.match(/<p class="launch-notice">[\s\S]*?<\/p>/g) || [];
+  assert.equal(notices.length, 2);
+  for (const n of notices) {
+    assert.ok(n.includes('email and the marketing source'));
+    assert.ok(n.includes('href="/privacy"'));
+  }
 });

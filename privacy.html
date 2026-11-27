@@ -58,7 +58,10 @@
       free scripts per day. It contains a random ID, nothing about you.</li>
       <li><strong>IP address.</strong> Used as a fallback for the daily
       free-script count (kept for up to 2 days) and for short-term abuse
-      throttling (kept for a few minutes). Our hosting provider, Cloudflare,
+      throttling: script-generation and redeem attempts are kept for a few
+      minutes, and launch-list signup attempt counts are kept for up to 2
+      hours (IPv6 addresses are grouped by /64). We do not store your IP
+      on the launch-list row itself. Our hosting provider, Cloudflare,
       also processes IP addresses and basic request data to deliver the site
       and protect it from abuse.</li>
       <li><strong>Purchase information.</strong> ClickPrompt Pro is sold
@@ -80,7 +83,8 @@
       <li><strong>Launch list.</strong> If you ask us to notify you when the
       store goes live, we store your email address and the marketing source
       of your first visit (for example, the campaign or site that brought
-      you here). We use this only to email you about the ClickPrompt launch
+      you here). We keep that row for up to one year, or until you ask us
+      to delete it. We use this only to email you about the ClickPrompt launch
       and to see which sources the list came from. We do not send a
       confirmation email when you sign up, and we do not use this list for
       other marketing unless you opt in later. Email

@@ -167,12 +167,16 @@ paths:
       summary: Join the launch list (notify me when the store goes live)
       description: |
         Stores an email plus optional first-touch attribution on the launch
-        list. No confirmation email is sent. A hidden honeypot field
-        named company (or website) is ignored: if it is filled, the
-        response is still { ok: true } and nothing is stored. Repeat
-        signups with the same email return { ok: true, already: true }
-        and keep the original attribution. Uses the existing KV binding
-        (no new namespace required). Returns 503 if KV is not bound.
+        list. No confirmation email is sent. New signups, repeat signups,
+        and a filled honeypot (company or website) all return { ok: true }
+        with no extra flags. Repeats keep the original row; honeypots are
+        not stored. Requires the LAUNCH_KV binding (no fallback to the
+        main KV namespace) and returns 503 if it is missing. Optional
+        LAUNCH_RATE_LIMITER is used when bound, otherwise a KV throttle
+        on LAUNCH_KV (5 per hour, IPv6 /64). Optional TURNSTILE_SECRET:
+        when set, a cf-turnstile-response token is required. Body must be
+        application/json and at most 8 KB. Launch rows expire after about
+        one year.
       requestBody:
         required: true
         content:
@@ -190,15 +194,24 @@ paths:
                 company:
                   type: string
                   description: Honeypot. Leave empty.
+                cf-turnstile-response:
+                  type: string
+                  description: Turnstile token; required only when TURNSTILE_SECRET is set.
       responses:
         '200':
-          description: Stored, already on the list, or silently ignored honeypot.
+          description: Always { ok: true } for a new signup, a repeat, or a honeypot.
         '400':
-          description: Email was missing or invalid.
+          description: Email was missing or invalid, or the body was not JSON.
+        '403':
+          description: Turnstile check failed (only when TURNSTILE_SECRET is set).
+        '413':
+          description: Request body larger than 8 KB.
+        '415':
+          description: Content-Type was not application/json.
         '429':
           description: Too many attempts from this network.
         '503':
-          description: Launch list storage is not bound.
+          description: LAUNCH_KV is not bound; the launch list is not available yet.
 
   /api/me:
     get:

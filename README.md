@@ -103,14 +103,30 @@ forwarding to work.** Until then the live Worker ignores the extra
 field and checkout still succeeds.
 
 `POST /api/launch-notify` stores an email plus that attribution for
-the "Notify me when the store goes live" form. It uses the existing
-`KV` binding (`clickprompt-data`) with a `launch:` key prefix. No new
-Cloudflare namespace is required. If you later want those rows
-isolated, bind an optional `LAUNCH_KV` namespace and the Worker will
-prefer it. Do not create that binding unless you want the split.
+the "Notify me when the store goes live" form. New signups, repeats,
+and honeypot submissions all return `{ ok: true }` with no extra flags.
 
-There is no confirmation email. Signups are rate-limited per IP and a
-hidden honeypot field (`company`) is ignored.
+**Tyler setup (do not create these until he says OK):**
+
+- Create a Cloudflare KV namespace and bind it to the Worker as
+  `LAUNCH_KV`. The launch list stays closed (503) until this binding
+  exists. The Worker will not fall back to the main `KV` namespace.
+- Optional: bind a Cloudflare Rate Limiting binding as
+  `LAUNCH_RATE_LIMITER`. When it is present the Worker uses it; when
+  it is not, a KV throttle on `LAUNCH_KV` applies (5 tries per hour,
+  IPv6 grouped by /64, counts kept for 2 hours).
+- Optional: set a Worker secret `TURNSTILE_SECRET`. When set, launch
+  signup requires a valid Turnstile token (same public sitekey and
+  siteverify helper as the pending free-tier generate PR). Off when
+  unset.
+
+Do not create those Cloudflare resources as part of this PR. The
+Worker must be redeployed by hand for `/api/launch-notify` and
+checkout attribution forwarding to work. Until then the frontend
+treats 404, 405, or 503 from the launch endpoint as "not available
+yet," so Pages can ship first.
+
+Launch-list rows expire after about one year.
 
 ## Tests
 

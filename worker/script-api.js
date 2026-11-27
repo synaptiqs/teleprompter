@@ -74,14 +74,24 @@
  *                               (generated, recording_started, download,
  *                               subscribe). No PII; increments a daily KV
  *                               counter.
- *   POST /api/launch-notify     { email, attribution?, company? } -> { ok }.
+ *   POST /api/launch-notify     { email, attribution?, company?,
+ *                               cf-turnstile-response? } -> { ok: true }.
  *                               Stores an email on the launch list (notify
  *                               me when the store goes live) with first-touch
- *                               attribution. "company" is a honeypot: if it
- *                               is filled in, the request looks successful
- *                               but nothing is stored. No confirmation email
- *                               is sent. Uses the existing KV binding, or
- *                               an optional LAUNCH_KV namespace if bound.
+ *                               attribution. New signups, repeats, and a
+ *                               filled honeypot ("company" / "website") all
+ *                               return the same { ok: true }; honeypots are
+ *                               not stored and repeats keep the original
+ *                               row. No confirmation email is sent. Requires
+ *                               a LAUNCH_KV binding (no fallback to KV).
+ *                               Optional LAUNCH_RATE_LIMITER binding is
+ *                               used when present, otherwise a KV throttle
+ *                               on LAUNCH_KV (5/hour, IPv6 /64). Optional
+ *                               TURNSTILE_SECRET: when set, a Turnstile
+ *                               token is required (same helper as the
+ *                               pending generate-script Turnstile PR).
+ *                               Body must be application/json, max 8 KB.
+ *                               Launch rows expire after about one year.
  *
  * Paywalled the same way: saved VOICEOVERS (audio-only recordings).
  * Storage: 100 GB base quota per paid identity (video blobs metered;
@@ -160,8 +170,9 @@
  *   ev:<YYYY-MM-DD>:<event> -> analytics counter (90-day TTL)
  *   launch:<sha256("launch:"+email)> -> { email, attribution, created_at }
  *                              (launch-list signup; email is stored
- *                              lowercase; first signup wins)
- *   launchthrottle:<hour>:<ip> -> launch-list attempt count (2-hour TTL)
+ *                              lowercase; first signup wins; ~1-year TTL)
+ *   launchthrottle:<hour>:<ip> -> launch-list attempt count (2-hour TTL;
+ *                              IPv6 addresses are bucketed by /64)
  *
  * Secrets (set via the Workers API):
  *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
@@ -174,14 +185,16 @@
  *   LEMONSQUEEZY_STORAGE_TIERS (JSON map variantId -> GB, e.g.
  *     {"123":250,"124":500,"125":1000}),
  *   EMAIL_API_KEY + EMAIL_FROM (optional; without them, deletion emails
- *     are logged to KV instead of sent — wire a provider before launch)
+ *     are logged to KV instead of sent (wire a provider before launch),
+ *   TURNSTILE_SECRET (optional; when set, /api/launch-notify requires a
+ *     valid Turnstile token; off when unset)
  *
- * Bindings: AI (Workers AI), KV (this namespace, also used for the
- *   launch list under the launch: prefix),
- *   LAUNCH_KV (optional; if bound, launch-list rows go here instead of KV),
+ * Bindings: AI (Workers AI), KV (scripts, unlocks, generate caps),
+ *   LAUNCH_KV (required for the launch list; no fallback to KV; Tyler
+ *     creates and binds this, this code does not),
+ *   LAUNCH_RATE_LIMITER (optional Cloudflare Rate Limiting binding;
+ *     used when present, otherwise KV throttle on LAUNCH_KV),
  *   VOICEOVER_AUDIO (R2 bucket, optional until R2 is enabled).
- *   No new namespace is required for the launch list. Do not create
- *   LAUNCH_KV unless you want those rows isolated later.
  */
 
 // Words per second for natural spoken delivery (~145 wpm).
@@ -314,27 +327,104 @@ async function checkRedeemThrottle(env, request) {
   await env.KV.put(key, String(count + 1), { expirationTtl: 1200 });
 }
 
-// Launch-list signups use the existing KV binding, or a separate
-// LAUNCH_KV namespace if one is bound later. Nothing to create for v1.
+// Launch-list storage is a dedicated LAUNCH_KV binding. There is no
+// fallback to the main KV namespace, so a missing binding stays 503
+// ("not available yet") until Tyler creates and binds it.
 function launchKv(env) {
-  return env.LAUNCH_KV || env.KV;
+  return env && env.LAUNCH_KV ? env.LAUNCH_KV : null;
 }
 
-// Launch-list throttle: 5 attempts per hour per IP, including repeats.
 var LAUNCH_THROTTLE_MAX = 5;
+var LAUNCH_THROTTLE_TTL = 7200; // 2 hours, matches the hourly window slack
+var LAUNCH_ROW_TTL = 365 * 24 * 60 * 60; // about one year
+var LAUNCH_BODY_MAX = 8192; // 8 KB
+
+function launchThrottleError() {
+  var err = new Error("Too many signups from this network. Please try again later.");
+  err.status = 429;
+  err.code = "throttled";
+  return err;
+}
+
+// IPv6 addresses share a throttle bucket at /64 so one network cannot
+// bypass the limit with a new address per try. IPv4 stays a single IP.
+// IPv4-mapped IPv6 (":ffff:1.2.3.4") is treated as IPv4.
+function throttleIpKey(ip) {
+  ip = String(ip || "").trim().toLowerCase();
+  if (!ip || ip === "unknown") return "unknown";
+  var v4mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (v4mapped) return v4mapped[1];
+  if (ip.indexOf(":") === -1) return ip;
+  var zoneFree = ip.split("%")[0];
+  var parts;
+  if (zoneFree.indexOf("::") !== -1) {
+    var sides = zoneFree.split("::");
+    var left = sides[0] ? sides[0].split(":") : [];
+    var right = sides[1] ? sides[1].split(":") : [];
+    // An IPv4 tail in the last group is one group, not two.
+    var fill = 8 - left.length - right.length;
+    if (fill < 0) return ip;
+    parts = left.concat(Array(fill).fill("0"), right);
+  } else {
+    parts = zoneFree.split(":");
+  }
+  if (parts.length !== 8) return ip;
+  return parts.slice(0, 4).map(function (h) {
+    return h.replace(/^0+/, "") || "0";
+  }).join(":") + "::/64";
+}
+
+// Launch-list throttle runs before the body is read. Prefer the optional
+// Rate Limiting binding when it is present; otherwise count on LAUNCH_KV.
 async function checkLaunchThrottle(env, request) {
+  if (!request) return;
+  var ip = throttleIpKey(clientIp(request));
+  if (env.LAUNCH_RATE_LIMITER && typeof env.LAUNCH_RATE_LIMITER.limit === "function") {
+    try {
+      var result = await env.LAUNCH_RATE_LIMITER.limit({ key: ip });
+      if (result && result.success === false) throw launchThrottleError();
+      return;
+    } catch (e) {
+      if (e && e.status === 429) throw e;
+      // Binding failed unexpectedly: fall through to the KV throttle.
+    }
+  }
   var kv = launchKv(env);
-  if (!kv || !request) return;
-  var ip = clientIp(request);
+  if (!kv) return;
   var key = "launchthrottle:" + Math.floor(Date.now() / 3600000) + ":" + ip;
   var count = Number(await kv.get(key)) || 0;
-  if (count >= LAUNCH_THROTTLE_MAX) {
-    var err = new Error("Too many signups from this network. Please try again later.");
-    err.status = 429;
-    err.code = "throttled";
-    throw err;
+  if (count >= LAUNCH_THROTTLE_MAX) throw launchThrottleError();
+  await kv.put(key, String(count + 1), { expirationTtl: LAUNCH_THROTTLE_TTL });
+}
+
+function isJsonContentType(request) {
+  var ct = (request.headers.get("Content-Type") || "").toLowerCase();
+  return ct.split(";")[0].trim() === "application/json";
+}
+
+// Reject oversized bodies before JSON.parse. Trust Content-Length when it
+// is present, and also measure the bytes actually read.
+async function readLimitedJsonBody(request, maxBytes) {
+  var len = request.headers.get("Content-Length");
+  if (len !== null && len !== "" && /^\d+$/.test(String(len).trim()) && Number(len) > maxBytes) {
+    var tooBig = new Error("Request is too large.");
+    tooBig.status = 413;
+    throw tooBig;
   }
-  await kv.put(key, String(count + 1), { expirationTtl: 7200 });
+  var buf = await request.arrayBuffer();
+  if (buf.byteLength > maxBytes) {
+    var tooBig2 = new Error("Request is too large.");
+    tooBig2.status = 413;
+    throw tooBig2;
+  }
+  var text = new TextDecoder("utf-8").decode(buf);
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    var bad = new Error("Request body must be JSON.");
+    bad.status = 400;
+    throw bad;
+  }
 }
 
 // Concurrency pool (thundering-herd §8): best-effort KV semaphore capping
@@ -1026,6 +1116,31 @@ function storageTierGb(env) {
   }
 }
 
+// Checkout may only redirect back to the production site or this project's
+// Pages previews. Any other origin, including http, falls back to production
+// so a crafted request cannot send buyers to a third-party host.
+function allowedCheckoutOrigin(origin) {
+  var fallback = "https://clickprompt.app";
+  origin = clean(origin, 120);
+  if (!origin) return fallback;
+  var url;
+  try {
+    url = new URL(origin);
+  } catch (e) {
+    return fallback;
+  }
+  if (url.protocol !== "https:") return fallback;
+  var host = url.hostname.toLowerCase();
+  if (host === "clickprompt.app" || host === "www.clickprompt.app") {
+    return "https://" + host;
+  }
+  var pages = "teleprompter-5fz.pages.dev";
+  if (host === pages || (host.length > pages.length && host.slice(-pages.length - 1) === "." + pages)) {
+    return "https://" + host;
+  }
+  return fallback;
+}
+
 async function doCheckout(env, origin, plan, existingToken, attribution) {
   if (
     !env.LEMONSQUEEZY_API_KEY ||
@@ -1034,8 +1149,7 @@ async function doCheckout(env, origin, plan, existingToken, attribution) {
   ) {
     throw ApiError(503, "Checkout is not configured yet.");
   }
-  origin = clean(origin, 120) || "https://clickprompt.app";
-  if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
+  origin = allowedCheckoutOrigin(origin);
 
   // Plan -> variant. Monthly is the default ("annual" is accepted as an
   // alias for yearly). Storage add-ons
@@ -1809,29 +1923,53 @@ async function handleCheckout(request, env, cors) {
   }
 }
 
-async function handleLaunchNotify(request, env, cors) {
-  // Store an email on the launch list with first-touch attribution.
-  // No confirmation email is sent. A filled honeypot looks like success
-  // but writes nothing. Existing emails keep their original attribution.
-  var body = {};
+// Same Turnstile siteverify helper as the pending free-tier generate PR
+// (#10). Off until TURNSTILE_SECRET is set. Shared so both features can
+// use one secret and one sitekey without drifting.
+var TURNSTILE_VERIFY = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+async function turnstileOk(request, env, token) {
+  token = String(token || "");
+  if (!token || token.length > 2048) return false;
+  var form = new FormData();
+  form.append("secret", env.TURNSTILE_SECRET);
+  form.append("response", token);
+  var ip = request.headers.get("CF-Connecting-IP");
+  if (ip) form.append("remoteip", ip);
   try {
-    body = await request.json();
+    var r = await fetch(TURNSTILE_VERIFY, { method: "POST", body: form });
+    var d = await r.json();
+    return !!(d && d.success === true);
   } catch (e) {
-    body = {};
+    return false;
   }
+}
+
+async function handleLaunchNotify(request, env, cors) {
+  // Throttle first, then require JSON and cap the body, then store.
+  // New, repeat, and honeypot all return { ok: true } with no extra flags.
   try {
+    await checkLaunchThrottle(env, request);
+    if (!isJsonContentType(request)) {
+      return json({ error: "Content-Type must be application/json." }, 415, cors);
+    }
+    var body = await readLimitedJsonBody(request, LAUNCH_BODY_MAX);
     return json(await doLaunchNotify(env, request, body), 200, cors);
   } catch (e) {
-    return json({ error: e.message || "Could not save that email." }, e.status || 500, cors);
+    var out = { error: e.message || "Could not save that email." };
+    if (e.code) out.code = e.code;
+    return json(out, e.status || 500, cors);
   }
 }
 
 async function doLaunchNotify(env, request, body) {
   body = body || {};
-  await checkLaunchThrottle(env, request);
+  var kv = launchKv(env);
+  if (!kv) {
+    throw ApiError(503, "The launch list is not available yet.");
+  }
 
-  // Honeypot: bots that fill a hidden "company" or "website" field get a
-  // generic success and we store nothing.
+  // Honeypot: bots that fill a hidden "company" or "website" field get the
+  // same { ok: true } as a real signup, and we store nothing.
   var honeypot = clean(body.company, 120) || clean(body.website, 120);
   if (honeypot) {
     return { ok: true };
@@ -1842,15 +1980,19 @@ async function doLaunchNotify(env, request, body) {
     throw ApiError(400, "Please enter a valid email address.");
   }
 
-  var kv = launchKv(env);
-  if (!kv) {
-    throw ApiError(503, "The launch list is not available yet.");
+  // Turnstile is off until TURNSTILE_SECRET is set (same as PR #10).
+  if (env.TURNSTILE_SECRET) {
+    if (!(await turnstileOk(request, env, body["cf-turnstile-response"]))) {
+      var human = ApiError(403, "Please complete the quick human check, then try again.");
+      human.code = "human_check";
+      throw human;
+    }
   }
 
   var key = "launch:" + (await sha256Hex("launch:" + email));
   var existing = await kv.get(key, "json");
   if (existing && existing.email) {
-    return { ok: true, already: true };
+    return { ok: true };
   }
 
   var record = {
@@ -1858,7 +2000,7 @@ async function doLaunchNotify(env, request, body) {
     attribution: sanitizeAttribution(body.attribution),
     created_at: new Date().toISOString(),
   };
-  await kv.put(key, JSON.stringify(record));
+  await kv.put(key, JSON.stringify(record), { expirationTtl: LAUNCH_ROW_TTL });
   return { ok: true };
 }
 
@@ -2482,3 +2624,4 @@ export default {
     ctx.waitUntil(runDeletionCron(env));
   },
 };
+export { turnstileOk as _turnstileOk, throttleIpKey as _throttleIpKey, allowedCheckoutOrigin as _allowedCheckoutOrigin };

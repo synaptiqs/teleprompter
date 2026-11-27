@@ -1753,18 +1753,25 @@
           var launchAttr = window.ClickPromptAttribution.get();
           if (launchAttr) body.attribution = launchAttr;
         }
+        // Turnstile token, when the widget is present. The Worker only
+        // checks it if TURNSTILE_SECRET is set (same approach as PR #10).
+        if (window.turnstile) {
+          var widget = form.querySelector(".cf-turnstile");
+          if (widget) {
+            try { body["cf-turnstile-response"] = window.turnstile.getResponse(widget) || ""; } catch (e) {}
+            try { window.turnstile.reset(widget); } catch (e) {}
+          }
+        }
         if (button) button.disabled = true;
-        if (status) status.textContent = "Saving…";
+        if (status) status.textContent = "Saving...";
         try {
           var result = await apiPost("/api/launch-notify", body);
           if (result._ok && result.ok) {
-            if (status) {
-              status.textContent = result.already
-                ? "You are already on the list. We will email you when the store goes live."
-                : "You are on the list. We will email you when the store goes live.";
-            }
+            // One generic message for new signups, repeats, and honeypots.
+            if (status) status.textContent = "You are on the list. We will email you when the store goes live.";
             if (emailInput) emailInput.value = "";
-          } else if (result._status === 503) {
+          } else if (result._status === 503 || result._status === 404 || result._status === 405) {
+            // Live Worker may not have this route yet; Pages can ship first.
             if (status) status.textContent = "The launch list is not available yet. Please try again after the next update.";
           } else {
             if (status) status.textContent = result.error || "Could not save that email. Please try again.";
