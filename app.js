@@ -245,7 +245,7 @@
       var openPrompter = document.getElementById("openPrompter");
       var changeScript = document.getElementById("changeScript");
 
-      // ---- Paywall: script saving (Pro: $4.99/mo, $49.99/yr, $129 lifetime,
+      // ---- Paywall: script saving (Pro: $3.99/mo, $29/yr, $59 lifetime,
       // an access code, or the Lemon Squeezy license key from the receipt) ----
       // Everything else (interview, generation, prompter) stays free.
       var API_BASE = "https://teleprompter-script-api.synaptiqs.workers.dev";
@@ -391,9 +391,9 @@
       }
 
       var PLAN_LABELS = {
-        monthly: "Continue — $4.99/mo",
-        yearly: "Continue — $49.99/yr",
-        lifetime: "Continue — $129 once"
+        monthly: "Continue - $3.99/mo",
+        yearly: "Continue - $29/yr",
+        lifetime: "Continue - $59 once"
       };
       function selectedPlan() {
         var checked = document.querySelector('input[name="plan"]:checked');

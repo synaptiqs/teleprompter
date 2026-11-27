@@ -31,8 +31,8 @@
  *                               redeem_access_code, start_checkout,
  *                               list_scripts, save_script, delete_script.
  *
- * Paywalled: script SAVING (ClickPrompt Pro) is $4.99/month, $49.99/year,
- * or $129 lifetime via Lemon Squeezy (Synaptiq HQ store, product 1397885),
+ * Paywalled: script SAVING (ClickPrompt Pro) is $3.99/month, $29/year,
+ * or $59 lifetime via Lemon Squeezy (Synaptiq HQ store, product 1397885),
  * or free forever with an access code. Everything else stays free.
  * Stripe Checkout is also implemented, behind PAYMENT_PROVIDER, in TEST
  * mode only (see below). The live Worker stays on Lemon Squeezy until
@@ -57,7 +57,7 @@
  *                                 (sk_test_... unless STRIPE_ALLOW_LIVE=true,
  *                                 which only Tyler sets) and the price ID
  *                                 for the plan. Test catalog: monthly
- *                                 $3.99, yearly $29, lifetime $59
+ *                                 $3.99/month, yearly $29, lifetime $59
  *                                 (payment mode). Success/cancel URLs are
  *                                 on https://clickprompt.app.
  *   POST /api/webhook           Lemon Squeezy webhook events, verified with
@@ -201,9 +201,10 @@
  *     flips this and deploys.
  *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
  *   LEMONSQUEEZY_STORE_ID (Synaptiq HQ, 485773),
- *   LEMONSQUEEZY_VARIANT_ID (Pro Monthly $4.99),
- *   LEMONSQUEEZY_VARIANT_ID_ANNUAL (Pro Annual $49.99; _YEARLY also accepted),
- *   LEMONSQUEEZY_VARIANT_ID_LIFETIME (Pro Lifetime $129 one-time),
+ *   LEMONSQUEEZY_VARIANT_ID (Pro Monthly; $3.99/month is set in Tyler's
+ *     Lemon Squeezy dashboard, not in this code),
+ *   LEMONSQUEEZY_VARIANT_ID_ANNUAL (Pro Annual $29/year; _YEARLY also accepted),
+ *   LEMONSQUEEZY_VARIANT_ID_LIFETIME (Pro Lifetime $59 one-time),
  *   LEMONSQUEEZY_PRODUCT_ID (optional; Pro product for license-key checks,
  *     defaults to 1397885),
  *   LEMONSQUEEZY_STORAGE_TIERS (JSON map variantId -> GB, e.g.
@@ -214,7 +215,7 @@
  *   STRIPE_WEBHOOK_SECRET (whsec_... from the Stripe test webhook),
  *   STRIPE_WEBHOOK_SECRET_PREV (optional previous secret, for rotation),
  *   STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY (or _ANNUAL),
- *     STRIPE_PRICE_ID_LIFETIME (test catalog $3.99 / $29 / $59),
+ *     STRIPE_PRICE_ID_LIFETIME (confirmed prices $3.99 / $29 / $59),
  *   STRIPE_PRICE_ID_STORAGE_250 / _500 / _1000 (optional add-ons),
  *   STRIPE_ALLOW_LIVE (optional; only Tyler may set this to "true"),
  *   EMAIL_API_KEY + EMAIL_FROM (optional; without them, deletion emails
@@ -1661,10 +1662,11 @@ async function doGenerate(env, input, request) {
 
 // ---- paywall operations ----
 
-// Pricing (set by Tyler, Oct 2026; supersedes the 2026-09-29 $2.99/$34.99
-// tiers): ClickPrompt Pro is $4.99/month, $49.99/year, or $129 lifetime
-// one-time. All three are variants of product 1397885 in the Synaptiq HQ
-// store; each plan's variant ID comes from the env var in PLAN_VARIANT_ENV.
+// Pricing (confirmed by Tyler, Nov 27, 2026): ClickPrompt Pro is
+// $3.99/month, $29/year, or $59 lifetime one-time. Lemon Squeezy variant
+// prices are set in Tyler's LS dashboard, not in this code. All three
+// are variants of product 1397885 in the Synaptiq HQ store; each plan's
+// variant ID comes from the env var in PLAN_VARIANT_ENV.
 // Storage add-ons (existing subscribers only) raise the 100 GB base quota
 // to 250 GB / 500 GB / 1 TB.
 var PLAN_VARIANT_ENV = {
@@ -2774,7 +2776,7 @@ var MCP_INSTRUCTIONS =
   "point it must land, target length). Script generation is free: 3 scripts " +
   "per day per visitor, no account needed; subscribers get unlimited. " +
   "Saving scripts to a personal library (ClickPrompt Pro) costs " +
-  "$4.99/month, $49.99/year, or $129 lifetime via Lemon Squeezy, or is " +
+  "$3.99/month, $29/year, or $59 lifetime via Lemon Squeezy, or is " +
   "free for life with an access code the user already owns. A buyer can " +
   "also unlock with the license key from their purchase email. To unlock " +
   "saving: call start_checkout and show " +
@@ -2816,7 +2818,7 @@ var MCP_TOOLS = [
   {
     name: "start_checkout",
     description:
-      "Start a ClickPrompt Pro checkout ($4.99/month, $49.99/year, or $129 " +
+      "Start a ClickPrompt Pro checkout ($3.99/month, $29/year, or $59 " +
       "lifetime) to unlock script saving. Returns a hosted checkout URL to show the user plus an " +
       "unlock token. Keep the token and poll check_unlock_status with " +
       "it after the user pays. The user pays Lemon Squeezy (merchant " +
@@ -2833,7 +2835,7 @@ var MCP_TOOLS = [
           enum: ["monthly", "yearly", "lifetime"],
           default: "monthly",
           description:
-            "Plan to check out: monthly ($4.99/mo), yearly ($49.99/yr), or lifetime ($129 one-time).",
+            "Plan to check out: monthly ($3.99/mo), yearly ($29/yr), or lifetime ($59 one-time).",
         },
       },
     },

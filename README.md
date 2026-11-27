@@ -60,7 +60,7 @@ opaque identity tokens as the REST API. Full machine-readable spec:
 The interview and the full prompter (scroll, camera,
 recording) are free forever. Script generation is free at 3 scripts/day
 per visitor (subscribers get unlimited). Saving scripts to a personal
-library (ClickPrompt Pro) costs $4.99/month, $49.99/year, or $129
+library (ClickPrompt Pro) costs $3.99/month, $29/year, or $59
 lifetime, or is free for life with an access code. Buyers can also unlock
 on any device with the Lemon Squeezy license key from their receipt email.
 A cancelled monthly/yearly plan keeps Pro until the paid period ends.
@@ -80,9 +80,10 @@ A cancelled monthly/yearly plan keeps Pro until the paid period ends.
 - Secrets the worker expects for the current Lemon Squeezy path:
   `LEMONSQUEEZY_API_KEY`, `LEMONSQUEEZY_WEBHOOK_SECRET`,
   `LEMONSQUEEZY_STORE_ID` = 485773 (Synaptiq HQ),
-  `LEMONSQUEEZY_VARIANT_ID` (Pro Monthly $4.99),
-  `LEMONSQUEEZY_VARIANT_ID_ANNUAL` (Pro Annual $49.99; `_YEARLY` also accepted),
-  `LEMONSQUEEZY_VARIANT_ID_LIFETIME` (Pro Lifetime $129), optional
+  `LEMONSQUEEZY_VARIANT_ID` (Pro Monthly; the $3.99 price is set in
+  Tyler's Lemon Squeezy dashboard, not in this code),
+  `LEMONSQUEEZY_VARIANT_ID_ANNUAL` (Pro Annual $29/year; `_YEARLY` also accepted),
+  `LEMONSQUEEZY_VARIANT_ID_LIFETIME` (Pro Lifetime $59), optional
   `LEMONSQUEEZY_PRODUCT_ID` (license-key product check, default 1397885),
   `LEMONSQUEEZY_STORAGE_TIERS` (JSON map of storage add-on variant ID to
   GB), plus optional `EMAIL_API_KEY`/`EMAIL_FROM` for the cancellation
@@ -113,8 +114,8 @@ Do this in your own Stripe account. Do not put any keys in the repo.
 
 1. Sign in at https://dashboard.stripe.com and turn on **Test mode**
    (the toggle in the Dashboard). Stay in test mode.
-2. Open **Product catalog** and create three products with these test
-   prices (USD):
+2. Open **Product catalog** and create three products with these
+   confirmed prices (USD):
    - ClickPrompt Pro Monthly: $3.99, recurring monthly. Copy the Price
      ID (`price_...`) into `STRIPE_PRICE_ID_MONTHLY`.
    - ClickPrompt Pro Yearly: $29, recurring yearly. Copy the Price ID

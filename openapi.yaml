@@ -12,7 +12,7 @@ info:
     Free tier: script generation is free at 3 scripts/day per visitor, no
     account or key needed. Subscribers get unlimited generations.
     Paid tier (ClickPrompt Pro): saving scripts to a personal library is
-    $4.99/month, $49.99/year, or $129 lifetime via Lemon Squeezy, or free
+    $3.99/month, $29/year, or $59 lifetime via Lemon Squeezy, or free
     for life with an access code. Buyers can also unlock with the license
     key from their purchase email. The interview, the full prompter, recording, and downloads stay
     free forever.
@@ -100,7 +100,7 @@ paths:
       summary: Start a hosted checkout for script-saving unlock
       description: |
         Creates a hosted checkout for the script-saving unlock (monthly
-        $4.99/mo, yearly $49.99/yr, or lifetime $129 one-time) and returns
+        $3.99/mo, yearly $29/yr, or lifetime $59 one-time) and returns
         the checkout URL plus the opaque unlock token.
         The PAYMENT_PROVIDER worker var selects the path: lemonsqueezy
         (default) or stripe. The agent must keep the token: the verified
@@ -123,7 +123,7 @@ paths:
                   type: string
                   enum: [monthly, yearly, lifetime]
                   default: monthly
-                  description: Plan to check out ($4.99/mo, $49.99/yr, or $129 one-time).
+                  description: Plan to check out ($3.99/mo, $29/yr, or $59 one-time).
                 token:
                   type: string
                   description: Existing unlock token, required for storage add-on plans.
