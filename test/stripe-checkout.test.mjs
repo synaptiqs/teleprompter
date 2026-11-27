@@ -159,14 +159,10 @@ test('session creation: monthly is a subscription on the monthly price', async (
   assert.equal(form.client_reference_id, data.token);
 });
 
-test('session creation: yearly uses the yearly price; annual alias works', async () => {
-  let r = await checkout(stripeEnv, 'yearly');
+test('session creation: yearly uses the yearly price', async () => {
+  const r = await checkout(stripeEnv, 'yearly');
   assert.equal(r.status, 200);
   assert.equal(parseForm(stripeCalls[0].body).mode, 'subscription');
-  assert.equal(parseForm(stripeCalls[0].body)['line_items[0][price]'], 'price_yearly');
-  stripeCalls = [];
-  r = await checkout(stripeEnv, 'annual');
-  assert.equal(r.status, 200);
   assert.equal(parseForm(stripeCalls[0].body)['line_items[0][price]'], 'price_yearly');
 });
 
@@ -211,7 +207,7 @@ test('session creation puts sanitized attribution in metadata', async () => {
   assert.equal(form['metadata[attr_term]'], 'teleprompter');
   assert.equal(form['metadata[attr_referrer]'], 'reddit.com');
   assert.equal(form['metadata[attr_landing]'], '/');
-  assert.equal(form['metadata[attr_ts]'], '2026-11-27T13:00:00.000Z');
+  assert.equal(form['metadata[attr_timestamp]'], '2026-11-27T13:00:00.000Z');
   assert.equal(form['subscription_data[metadata][attr_source]'], 'reddit');
   assert.ok(!form['metadata[attr_extra]']);
   assert.ok(!form['metadata[extra]']);
@@ -670,4 +666,311 @@ test('strict digits are required in the Stripe-Signature timestamp', async () =>
   const valid = await signStripe(secret, raw, now);
   const tampered = valid.replace('t=' + now, 't=1700000000e0');
   assert.equal(await verifyStripeSignature(raw, tampered, secret, now * 1000), false);
+});
+
+test('Stripe plan allowlist is exact and rejects everything else with a generic 400', async () => {
+  const rejected = [
+    'Yearly',
+    'LIFETIME',
+    'annual',
+    'price_x',
+    '',
+    'monthly ',
+    "monthly'; DROP TABLE",
+    'storage250',
+    12,
+    true,
+    { plan: 'monthly' },
+    ['monthly'],
+  ];
+  for (const plan of rejected) {
+    stripeCalls = [];
+    const r = await worker.fetch(
+      new Request('https://x.test/api/checkout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://clickprompt.app' },
+        body: JSON.stringify({ plan, origin: 'https://clickprompt.app' }),
+      }),
+      stripeEnv,
+      { waitUntil() {} }
+    );
+    assert.equal(r.status, 400, String(plan));
+    const body = await r.json();
+    assert.equal(body.error, "That plan isn't available.");
+    assert.doesNotMatch(body.error, /Yearly|LIFETIME|annual|price_x|storage250|DROP TABLE/i);
+    assert.deepEqual(stripeCalls, []);
+  }
+  for (const plan of ['monthly', 'yearly', 'lifetime']) {
+    stripeCalls = [];
+    const r = await checkout(stripeEnv, plan);
+    assert.equal(r.status, 200, plan);
+    assert.equal(stripeCalls.length, 1);
+  }
+});
+
+test('older Stripe events are ignored once a newer created timestamp is stored', async () => {
+  const kv = memoryKv();
+  const hex = 'd'.repeat(32);
+  const token = 'sub:' + hex;
+  const env = { ...stripeEnv, KV: kv };
+  const ends = 1_900_000_000;
+  const newer = await signedWebhook(env, {
+    id: 'evt_sub_newer_cancel',
+    type: 'customer.subscription.updated',
+    livemode: false,
+    created: 2_000,
+    data: {
+      object: {
+        id: 'sub_order_1',
+        status: 'active',
+        cancel_at_period_end: true,
+        items: { data: [{ current_period_end: ends }] },
+        metadata: { unlock_token: token, plan: 'monthly' },
+      },
+    },
+  });
+  assert.equal(newer.status, 200);
+  let rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'cancelled');
+  assert.equal(rec.cancel_pending, true);
+  assert.equal(rec.last_event_created, 2_000);
+
+  const older = await signedWebhook(env, {
+    id: 'evt_sub_older_clear',
+    type: 'customer.subscription.updated',
+    livemode: false,
+    created: 1_000,
+    data: {
+      object: {
+        id: 'sub_order_1',
+        status: 'active',
+        cancel_at_period_end: false,
+        items: { data: [{ current_period_end: ends }] },
+        metadata: { unlock_token: token, plan: 'monthly' },
+      },
+    },
+  });
+  assert.equal(older.status, 200);
+  rec = await kv.get('sub:' + hex, 'json');
+  assert.equal(rec.status, 'cancelled');
+  assert.equal(rec.cancel_pending, true);
+  assert.equal(rec.last_event_created, 2_000);
+
+  const deletedHex = 'e'.repeat(32);
+  await kv.put('sub:' + deletedHex, JSON.stringify({
+    status: 'cancelled',
+    deleted: true,
+    deleted_at: 1,
+    last_event_created: 5_000,
+    stripe_subscription_id: 'sub_deleted_1',
+    provider: 'stripe',
+  }));
+  const afterDelete = await signedWebhook(env, {
+    id: 'evt_checkout_after_delete',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 6_000,
+    data: {
+      object: {
+        id: 'cs_after_delete',
+        mode: 'subscription',
+        payment_status: 'paid',
+        subscription: 'sub_deleted_1',
+        metadata: { unlock_token: 'sub:' + deletedHex, plan: 'monthly' },
+      },
+    },
+  });
+  assert.equal(afterDelete.status, 200);
+  rec = await kv.get('sub:' + deletedHex, 'json');
+  assert.equal(rec.deleted, true);
+  assert.equal(rec.status, 'cancelled');
+  assert.notEqual(rec.status, 'active');
+});
+
+test('bound stripesub mapping is trusted over a disagreeing unlock_token', async () => {
+  const kv = memoryKv();
+  const hexA = 'a'.repeat(32);
+  const hexB = 'b'.repeat(32);
+  const env = { ...stripeEnv, KV: kv };
+  const logs = [];
+  const orig = console.log;
+  console.log = (...args) => { logs.push(args.map(String).join(' ')); };
+  try {
+    const first = await signedWebhook(env, {
+      id: 'evt_bind_first',
+      type: 'customer.subscription.updated',
+      livemode: false,
+      created: 3_000,
+      data: {
+        object: {
+          id: 'sub_bound_1',
+          status: 'active',
+          cancel_at_period_end: false,
+          metadata: { unlock_token: 'sub:' + hexA, plan: 'monthly' },
+        },
+      },
+    });
+    assert.equal(first.status, 200);
+    assert.equal(await kv.get('stripesub:sub_bound_1'), hexA);
+    let recA = await kv.get('sub:' + hexA, 'json');
+    assert.equal(recA.status, 'active');
+
+    const second = await signedWebhook(env, {
+      id: 'evt_bind_retarget',
+      type: 'customer.subscription.updated',
+      livemode: false,
+      created: 4_000,
+      data: {
+        object: {
+          id: 'sub_bound_1',
+          status: 'active',
+          cancel_at_period_end: true,
+          metadata: { unlock_token: 'sub:' + hexB, plan: 'monthly' },
+        },
+      },
+    });
+    assert.equal(second.status, 200);
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(await kv.get('stripesub:sub_bound_1'), hexA);
+  const recA = await kv.get('sub:' + hexA, 'json');
+  assert.equal(recA.status, 'cancelled');
+  assert.equal(recA.cancel_pending, true);
+  assert.equal(await kv.get('sub:' + hexB, 'json'), null);
+  assert.ok(logs.some((line) => /unlock_token does not match stored mapping/.test(line)));
+  assert.ok(logs.every((line) => !line.includes(hexA) && !line.includes(hexB) && !line.includes('sub:')));
+});
+
+test('webhook secret that does not start with whsec_ returns 503 and is not processed', async () => {
+  const kv = memoryKv();
+  const raw = JSON.stringify({
+    id: 'evt_bad_secret',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 1,
+    data: {
+      object: {
+        id: 'cs_bad_secret',
+        mode: 'subscription',
+        payment_status: 'paid',
+        metadata: { unlock_token: 'sub:' + 'f'.repeat(32), plan: 'monthly' },
+      },
+    },
+  });
+  for (const secret of ['', 'sk_test_not_a_webhook', 'whsec', 'WHSEC_test', ' secret_x ']) {
+    const env = { ...stripeEnv, STRIPE_WEBHOOK_SECRET: secret, KV: kv };
+    const r = await worker.fetch(
+      new Request('https://x.test/api/stripe-webhook', {
+        method: 'POST',
+        headers: { 'Stripe-Signature': 't=1,v1=ab', 'Content-Type': 'application/json' },
+        body: raw,
+      }),
+      env,
+      { waitUntil() {} }
+    );
+    assert.equal(r.status, 503, String(secret));
+    const body = await r.json();
+    assert.equal(body.error, 'Webhook is not configured yet.');
+    assert.equal(await kv.get('stripe:evt:evt_bad_secret'), null);
+    assert.equal(await kv.get('sub:' + 'f'.repeat(32)), null);
+  }
+});
+
+test('PR #14 attribution keys map into Stripe metadata and drop illegal UTM characters', async () => {
+  const r = await checkout(stripeEnv, 'monthly', {
+    utm_source: 'reddit',
+    utm_medium: 'cpc',
+    utm_campaign: 'first10',
+    utm_content: 'ad-1',
+    utm_term: 'teleprompter',
+    referrer: 'https://reddit.com/r/something?x=1',
+    landing: 'https://clickprompt.app/pricing?utm_source=reddit',
+    timestamp: '2026-11-27T13:00:00.000Z',
+  });
+  assert.equal(r.status, 200);
+  const form = parseForm(stripeCalls[0].body);
+  assert.equal(form['metadata[attr_source]'], 'reddit');
+  assert.equal(form['metadata[attr_medium]'], 'cpc');
+  assert.equal(form['metadata[attr_campaign]'], 'first10');
+  assert.equal(form['metadata[attr_content]'], 'ad-1');
+  assert.equal(form['metadata[attr_term]'], 'teleprompter');
+  assert.equal(form['metadata[attr_referrer]'], 'reddit.com');
+  assert.equal(form['metadata[attr_landing]'], '/pricing');
+  assert.equal(form['metadata[attr_timestamp]'], '2026-11-27T13:00:00.000Z');
+  assert.ok(!form['metadata[attr_utm_source]']);
+
+  stripeCalls = [];
+  const dropped = sanitizeAttribution({
+    utm_source: 'google ads',
+    utm_medium: 'cpc+foo',
+    utm_campaign: 'ok_campaign',
+    utm_content: 'foo@bar',
+    utm_term: 'a?b',
+  });
+  assert.deepEqual(dropped, { campaign: 'ok_campaign' });
+});
+
+test('customer_email is sent only when the server already has one', async () => {
+  const kv = memoryKv();
+  const hex = '11'.repeat(16);
+  await kv.put('sub:' + hex, JSON.stringify({ status: 'active', email: 'known@example.com', provider: 'stripe' }));
+  let r = await worker.fetch(
+    new Request('https://x.test/api/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://clickprompt.app' },
+      body: JSON.stringify({
+        plan: 'monthly',
+        origin: 'https://clickprompt.app',
+        token: 'sub:' + hex,
+        email: 'client@example.com',
+      }),
+    }),
+    { ...stripeEnv, KV: kv },
+    { waitUntil() {} }
+  );
+  assert.equal(r.status, 200);
+  assert.equal(parseForm(stripeCalls[0].body).customer_email, 'known@example.com');
+
+  stripeCalls = [];
+  r = await worker.fetch(
+    new Request('https://x.test/api/checkout', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Origin: 'https://clickprompt.app' },
+      body: JSON.stringify({
+        plan: 'monthly',
+        origin: 'https://clickprompt.app',
+        email: 'client@example.com',
+      }),
+    }),
+    stripeEnv,
+    { waitUntil() {} }
+  );
+  assert.equal(r.status, 200);
+  assert.equal(parseForm(stripeCalls[0].body).customer_email, undefined);
+});
+
+test('STRIPE_SECRET_KEY with zero-width characters is refused and live-key warning omits the value', async () => {
+  const warnings = [];
+  const orig = console.warn;
+  console.warn = (...args) => { warnings.push(args); };
+  try {
+    assert.throws(
+      () => assertStripeTestMode({ STRIPE_SECRET_KEY: 'sk_test_abc\u200B' }),
+      (e) => e.status === 503 && /not configured/.test(e.message)
+    );
+    assert.throws(
+      () => assertStripeTestMode({ STRIPE_SECRET_KEY: 'sk_live_abc' }),
+      (e) => e.status === 503 && /STRIPE_ALLOW_LIVE=true/.test(e.message)
+    );
+  } finally {
+    console.warn = orig;
+  }
+  assert.equal(assertStripeTestMode({ STRIPE_SECRET_KEY: '  sk_test_abc  ' }), 'sk_test_abc');
+  assert.ok(warnings.some((args) => args[0] === 'stripe secret key refused'));
+  assert.ok(warnings.some((args) => args[0] === 'stripe live key refused'));
+  assert.ok(warnings.every((args) => args.length === 1 && !String(args[0]).includes('sk_') && !String(args[0]).includes('abc')));
+  const r = await checkout({ ...stripeEnv, STRIPE_SECRET_KEY: 'sk_test_abc\u200D' }, 'monthly');
+  assert.equal(r.status, 503);
+  assert.deepEqual(stripeCalls, []);
 });

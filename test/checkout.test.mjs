@@ -62,3 +62,14 @@ test('PAYMENT_PROVIDER defaults to Lemon Squeezy even if Stripe keys are present
   assert.equal(r.status, 200);
   assert.deepEqual(sent, ['111']);
 });
+
+test('unknown Lemon Squeezy plans still silently default to monthly', async () => {
+  sent = [];
+  let r = await checkout(base, 'Yearly');
+  assert.equal(r.status, 200);
+  assert.deepEqual(sent, ['111']);
+  sent = [];
+  r = await checkout(base, 'not-a-plan');
+  assert.equal(r.status, 200);
+  assert.deepEqual(sent, ['111']);
+});

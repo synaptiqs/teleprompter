@@ -529,17 +529,8 @@ function paymentProvider(env) {
   return "lemonsqueezy";
 }
 
-// First-touch UTM fields accepted on POST /api/checkout. Each value is
-// trimmed to printable ASCII so metadata stays safe to store.
-var ATTRIBUTION_KEYS = [
-  "source", "medium", "campaign", "content", "term",
-  "referrer", "landing", "ts"
-];
-
 // Keep referrer as a hostname only, and landing as a path only, so
-// query strings never land in Stripe metadata. The fuller sanitizer
-// (reserved-key guard and tighter rules) lives on the UTM branch and
-// will be unified after that PR settles.
+// query strings never land in Stripe metadata.
 function attributionHost(value) {
   var raw = clean(String(value || ""), 200);
   if (!raw) return "";
@@ -570,22 +561,45 @@ function attributionPath(value) {
   return url.pathname || "/";
 }
 
+// One sanitizer for POST /api/checkout attribution. Accepts the PR #14
+// client shape (utm_source, utm_medium, utm_campaign, utm_content,
+// utm_term, referrer, landing, timestamp) and the shorter aliases.
+// UTM values may only use [A-Za-z0-9_.:/-]. Mapped keys become
+// Stripe metadata attr_source, attr_medium, and so on. A later rebase
+// onto #14 can replace this function with that PR's sanitizer.
+var ATTRIBUTION_UTM_MAP = {
+  utm_source: "source",
+  utm_medium: "medium",
+  utm_campaign: "campaign",
+  utm_content: "content",
+  utm_term: "term",
+  source: "source",
+  medium: "medium",
+  campaign: "campaign",
+  content: "content",
+  term: "term"
+};
+var ATTRIBUTION_UTM_CHARS = /^[A-Za-z0-9_.:/-]+$/;
+
 function sanitizeAttribution(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) return null;
   var out = {};
-  var any = false;
-  for (var i = 0; i < ATTRIBUTION_KEYS.length; i++) {
-    var k = ATTRIBUTION_KEYS[i];
-    if (input[k] == null) continue;
-    var v;
-    if (k === "referrer") v = attributionHost(input[k]);
-    else if (k === "landing") v = attributionPath(input[k]);
-    else v = clean(String(input[k]), 200);
-    if (!v || !/^[\x20-\x7E]+$/.test(v)) continue;
-    out[k] = v;
-    any = true;
+  Object.keys(ATTRIBUTION_UTM_MAP).forEach(function (k) {
+    if (input[k] == null) return;
+    var v = clean(String(input[k]), 200);
+    if (!v || !ATTRIBUTION_UTM_CHARS.test(v)) return;
+    out[ATTRIBUTION_UTM_MAP[k]] = v;
+  });
+  var referrer = attributionHost(input.referrer);
+  if (referrer) out.referrer = referrer;
+  var landing = attributionPath(input.landing);
+  if (landing) out.landing = landing;
+  var ts = input.timestamp != null ? input.timestamp : input.ts;
+  if (ts != null) {
+    var tsv = clean(String(ts), 200);
+    if (tsv && ATTRIBUTION_UTM_CHARS.test(tsv)) out.timestamp = tsv;
   }
-  return any ? out : null;
+  return Object.keys(out).length ? out : null;
 }
 
 function applyAttribution(target, attribution, prefix) {
@@ -628,22 +642,36 @@ function planPriceId(env, plan) {
   return "";
 }
 
+var STRIPE_ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/g;
+
+// Read the Stripe secret, trimming whitespace and dropping zero-width
+// characters. If hidden characters were present, the key is refused.
+function readStripeSecretKey(env) {
+  var raw = String((env && env.STRIPE_SECRET_KEY) || "");
+  var trimmed = raw.trim();
+  var stripped = trimmed.replace(STRIPE_ZERO_WIDTH, "");
+  return { key: stripped, hiddenChars: stripped !== trimmed };
+}
+
 // Refuse to call Stripe if the secret is a live key, unless Tyler has
 // explicitly set STRIPE_ALLOW_LIVE=true. The key itself is never logged
-// or returned in an error.
+// or returned in an error. A live-key refusal is warned with no value.
 function assertStripeTestMode(env) {
-  var key = String((env && env.STRIPE_SECRET_KEY) || "").trim();
-  if (!key) {
+  var got = readStripeSecretKey(env);
+  if (!got.key || got.hiddenChars) {
+    if (got.hiddenChars) {
+      try { console.warn("stripe secret key refused"); } catch (e) {}
+    }
     throw ApiError(503, "Checkout is not configured yet.");
   }
-  var allowLive = String((env && env.STRIPE_ALLOW_LIVE) || "") === "true";
-  if (key.indexOf("sk_test_") !== 0 && !allowLive) {
+  if (got.key.indexOf("sk_test_") !== 0 && !stripeAllowLive(env)) {
+    try { console.warn("stripe live key refused"); } catch (e) {}
     throw ApiError(
       503,
       "Stripe live keys are refused unless STRIPE_ALLOW_LIVE=true. Only Tyler sets that."
     );
   }
-  return key;
+  return got.key;
 }
 
 function stripeAllowLive(env) {
@@ -651,7 +679,13 @@ function stripeAllowLive(env) {
 }
 
 function stripeKeyIsLive(env) {
-  return String((env && env.STRIPE_SECRET_KEY) || "").trim().indexOf("sk_live_") === 0;
+  var got = readStripeSecretKey(env);
+  if (got.hiddenChars || !got.key) return false;
+  return got.key.indexOf("sk_live_") === 0;
+}
+
+function stripeWebhookSecretOk(secret) {
+  return String(secret || "").trim().indexOf("whsec_") === 0;
 }
 
 // A live event is accepted only when the secret key is sk_live_ and
@@ -704,6 +738,9 @@ function buildStripeCheckoutForm(opts) {
     "metadata[unlock_token]": token,
     "metadata[plan]": plan,
   };
+  // Only prefill email when we already have it on the identity.
+  // Never invent an email or take one from the client.
+  if (opts.customerEmail) params.customer_email = opts.customerEmail;
   if (opts.storageGb) params["metadata[storage_gb]"] = String(opts.storageGb);
   if (opts.attribution) {
     Object.keys(opts.attribution).forEach(function (k) {
@@ -858,32 +895,37 @@ function stripeEndsAt(sub) {
 // mode is required unless Tyler sets STRIPE_ALLOW_LIVE to the exact
 // string "true". Client errors stay generic; Stripe's message is
 // logged server-side without the secret or the request body.
+function isStripeCheckoutPlan(plan) {
+  return plan === "monthly" || plan === "yearly" || plan === "lifetime";
+}
+
+async function emailForUnlockToken(env, token) {
+  token = clean(token, 64);
+  if (!env.KV || !token || token.indexOf("sub:") !== 0) return "";
+  var hex = token.slice(4);
+  if (!/^[0-9a-f]{32}$/.test(hex)) return "";
+  var rec = await env.KV.get("sub:" + hex, "json");
+  return clean((rec && rec.email) || "", 120);
+}
+
 async function doStripeCheckout(env, origin, plan, existingToken, attribution) {
   var secret = assertStripeTestMode(env);
   origin = stripeReturnOrigin(origin);
 
-  var priceId;
-  var token = "sub:" + randomHex(16);
-  var storageGb = 0;
-  var mode;
-  var storagePlan = STORAGE_STRIPE_PLANS[plan];
-  if (storagePlan) {
-    existingToken = clean(existingToken, 64);
-    var st = await resolveUnlock(env, existingToken);
-    if (!st.unlocked) throw ApiError(403, "Storage add-ons need an active subscription first.");
-    priceId = String(env[storagePlan.envVar] || "").trim();
-    storageGb = storagePlan.gb;
-    token = existingToken;
-    mode = "payment";
-  } else {
-    if (plan === "annual") plan = "yearly";
-    if (!PLAN_PRICE_ENV[plan]) plan = "monthly";
-    priceId = planPriceId(env, plan);
-    mode = plan === "lifetime" ? "payment" : "subscription";
+  // Exact allowlist only. No case folding, no "annual" alias, and no
+  // silent default to monthly. The Lemon Squeezy path is unchanged.
+  if (!isStripeCheckoutPlan(plan)) {
+    throw ApiError(400, "That plan isn't available.");
   }
+
+  var token = "sub:" + randomHex(16);
+  var priceId = planPriceId(env, plan);
+  var mode = plan === "lifetime" ? "payment" : "subscription";
   if (!priceId) {
     throw ApiError(503, "That plan isn't available yet. Try the monthly plan.");
   }
+
+  var customerEmail = await emailForUnlockToken(env, existingToken);
 
   var form = buildStripeCheckoutForm({
     mode: mode,
@@ -891,8 +933,9 @@ async function doStripeCheckout(env, origin, plan, existingToken, attribution) {
     origin: origin,
     token: token,
     plan: plan,
-    storageGb: storageGb,
+    storageGb: 0,
     attribution: attribution,
+    customerEmail: customerEmail,
   });
 
   try {
@@ -913,17 +956,35 @@ async function doStripeCheckout(env, origin, plan, existingToken, attribution) {
   return { url: session.url, token: token };
 }
 
-async function rememberStripeSub(env, stripeSubId, hex) {
-  if (env.KV && stripeSubId && hex) {
-    await env.KV.put("stripesub:" + stripeSubId, hex);
+// Once a Stripe subscription id is bound to an unlock token, that
+// mapping is permanent. A later metadata.unlock_token that disagrees
+// is ignored (and logged without the token) so a second identity
+// cannot be unlocked.
+async function bindStripeSub(env, stripeSubId, claimedHex) {
+  if (!env.KV || !stripeSubId) return claimedHex || null;
+  var existing = await env.KV.get("stripesub:" + stripeSubId);
+  if (existing) {
+    if (claimedHex && existing !== claimedHex) {
+      try { console.log("stripe unlock_token does not match stored mapping"); } catch (e) {}
+    }
+    return existing;
   }
+  if (claimedHex) {
+    await env.KV.put("stripesub:" + stripeSubId, claimedHex);
+    return claimedHex;
+  }
+  return null;
+}
+
+async function rememberStripeSub(env, stripeSubId, hex) {
+  return bindStripeSub(env, stripeSubId, hex);
 }
 
 // Store reverse maps from Stripe IDs back to our unlock hex so refund
 // and dispute events can find the identity without extra API calls.
 async function rememberStripeIds(env, hex, ids) {
   if (!env.KV || !hex || !ids) return;
-  if (ids.subscription) await env.KV.put("stripesub:" + ids.subscription, hex);
+  if (ids.subscription) await bindStripeSub(env, ids.subscription, hex);
   if (ids.session) await env.KV.put("stripesession:" + ids.session, hex);
   if (ids.paymentIntent) await env.KV.put("stripepi:" + ids.paymentIntent, hex);
   if (ids.customer) await env.KV.put("stripecust:" + ids.customer, hex);
@@ -968,15 +1029,13 @@ async function hexFromStripeSubscription(env, sub, metadata) {
   var customToken = meta.unlock_token;
   var hex = stripeSubHex(customToken);
   var stripeSubId = String((sub && sub.id) || "");
-  if (hex) {
-    await rememberStripeIds(env, hex, {
+  var bound = await bindStripeSub(env, stripeSubId, hex);
+  if (bound) {
+    await rememberStripeIds(env, bound, {
       subscription: stripeSubId,
       customer: stripeRefId(sub && sub.customer),
     });
-    return hex;
-  }
-  if (stripeSubId && env.KV) {
-    return await env.KV.get("stripesub:" + stripeSubId);
+    return bound;
   }
   return null;
 }
@@ -986,16 +1045,33 @@ function isSubscriberRecord(rec) {
   return rec.status === "active" || rec.status === "on_trial" || rec.status === "cancelled" || !!rec.cancel_pending || !!rec.stripe_subscription_id || !!rec.ls_subscription_id;
 }
 
-// Skip a late checkout.session grant when a subscription event has
-// already set status, or when the record is already cancelled.
+// Ignore an event whose Stripe created timestamp is older than the
+// last applied event on this subscription, and ignore grants after
+// the identity has been deleted.
+function shouldIgnoreOlderEvent(prev, eventCreated) {
+  if (!prev) return false;
+  if (prev.deleted) return true;
+  var last = Number(prev.last_event_created) || 0;
+  var incoming = Number(eventCreated) || 0;
+  if (last && incoming && incoming < last) return true;
+  return false;
+}
+
+function stampLastEvent(rec, eventCreated) {
+  var incoming = Number(eventCreated) || 0;
+  if (incoming) rec.last_event_created = incoming;
+  rec.updated_at = Date.now();
+}
+
+// Skip a checkout.session grant when the record is already cancelled,
+// refunded, or deleted, or when a newer event has already been applied.
 function shouldSkipCheckoutGrant(prev, eventCreated) {
   if (!prev || !prev.status) return false;
+  if (prev.deleted) return true;
   if (prev.status === "cancelled" || prev.status === "expired" || prev.status === "refunded" || prev.cancel_pending) {
     return true;
   }
-  var eventMs = Number(eventCreated) ? Number(eventCreated) * 1000 : 0;
-  if (eventMs && prev.updated_at && eventMs < prev.updated_at) return true;
-  return false;
+  return shouldIgnoreOlderEvent(prev, eventCreated);
 }
 
 function storagePlanGb(plan, storageGb) {
@@ -1009,13 +1085,14 @@ function storagePlanGb(plan, storageGb) {
 // Squeezy uses, so resolveUnlock / cancel-keeps-Pro / deletion all work
 // unchanged. Stripe spells it "canceled"; we store "cancelled".
 // Subscription updated/deleted events are the source of truth for status.
-async function applyStripeSubscription(env, sub) {
+async function applyStripeSubscription(env, sub, eventCreated) {
   if (!env.KV || !sub) return;
   var hex = await hexFromStripeSubscription(env, sub, sub.metadata);
   if (!hex) return;
-  var effectiveStatus = stripeStatusFromSubscription(sub);
   var subKey = "sub:" + hex;
   var prev = (await env.KV.get(subKey, "json")) || {};
+  if (shouldIgnoreOlderEvent(prev, eventCreated)) return;
+  var effectiveStatus = stripeStatusFromSubscription(sub);
   var rec = {
     status: effectiveStatus,
     ls_subscription_id: prev.ls_subscription_id || null,
@@ -1029,6 +1106,7 @@ async function applyStripeSubscription(env, sub) {
     provider: "stripe",
     updated_at: Date.now(),
   };
+  stampLastEvent(rec, eventCreated);
   var wasActive = !prev.cancel_pending && (prev.status === "active" || prev.status === "on_trial" || !prev.status);
   var isCancel = effectiveStatus === "cancelled" || effectiveStatus === "expired";
   if (isCancel && wasActive) {
@@ -1079,7 +1157,8 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
   };
 
   if (session.mode === "subscription") {
-    var hex = stripeSubHex(token);
+    var claimed = stripeSubHex(token);
+    var hex = await bindStripeSub(env, ids.subscription, claimed);
     if (hex) {
       await rememberStripeIds(env, hex, ids);
       var subKey = "sub:" + hex;
@@ -1098,6 +1177,7 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
         provider: "stripe",
         updated_at: Date.now(),
       };
+      stampLastEvent(rec, eventCreated);
       if (prev.cancel_pending) {
         try { await cancelDeletion(env, hex); } catch (e) {}
       }
@@ -1120,37 +1200,37 @@ async function applyStripeCheckoutSession(env, session, eventCreated) {
     if (storageGb) {
       var newTier = Math.min(1000, Math.max(Number(orderPrev.storage_tier_gb) || 100, storageGb));
       orderPrev.storage_tier_gb = newTier;
-      orderPrev.updated_at = Date.now();
       orderPrev.provider = orderPrev.provider || "stripe";
+      stampLastEvent(orderPrev, eventCreated);
       await env.KV.put(orderSubKey, JSON.stringify(orderPrev));
       return;
     }
     if (isSubscriberRecord(orderPrev)) return;
-    await env.KV.put(
-      orderSubKey,
-      JSON.stringify({
-        status: "lifetime",
-        stripe_session_id: ids.session || "",
-        email: email || orderPrev.email || null,
-        storage_tier_gb: Number(orderPrev.storage_tier_gb) || 100,
-        source: "stripe",
-        provider: "stripe",
-        updated_at: Date.now(),
-      })
-    );
+    var lifeRec = {
+      status: "lifetime",
+      stripe_session_id: ids.session || "",
+      email: email || orderPrev.email || null,
+      storage_tier_gb: Number(orderPrev.storage_tier_gb) || 100,
+      source: "stripe",
+      provider: "stripe",
+      updated_at: Date.now(),
+    };
+    stampLastEvent(lifeRec, eventCreated);
+    await env.KV.put(orderSubKey, JSON.stringify(lifeRec));
   }
 }
 
 // A refund or dispute ends Pro for that purchase now, matching the
 // refund policy. Saved data then follows the 10-business-day deletion
 // schedule. This does not wait for the paid period to end.
-async function applyStripeRevoke(env, obj) {
+async function applyStripeRevoke(env, obj, eventCreated) {
   if (!env.KV || !obj) return;
   var hex = await hexFromStripeRefs(env, obj);
   if (!hex) return;
   var subKey = "sub:" + hex;
   var prev = (await env.KV.get(subKey, "json")) || {};
   if (!prev.status || prev.status === "refunded" || prev.deleted) return;
+  if (shouldIgnoreOlderEvent(prev, eventCreated)) return;
   var accessEndsAt = Date.now();
   var deleteAt = addBusinessDays(accessEndsAt, 10);
   var rec = {
@@ -1167,6 +1247,7 @@ async function applyStripeRevoke(env, obj) {
     provider: prev.provider || "stripe",
     updated_at: Date.now(),
   };
+  stampLastEvent(rec, eventCreated);
   await env.KV.put(subKey, JSON.stringify(rec));
   try {
     await scheduleDeletion(env, hex, rec.email, deleteAt, accessEndsAt);
@@ -1184,7 +1265,7 @@ async function applyStripeRevoke(env, obj) {
 // on this KV binding.
 async function handleStripeWebhook(request, env, cors) {
   cors = cors || {};
-  if (!env.STRIPE_WEBHOOK_SECRET) {
+  if (!stripeWebhookSecretOk(env.STRIPE_WEBHOOK_SECRET)) {
     return json({ error: "Webhook is not configured yet." }, 503, cors);
   }
 
@@ -1198,10 +1279,10 @@ async function handleStripeWebhook(request, env, cors) {
   }
 
   var sig = request.headers.get("Stripe-Signature");
-  var secrets = [env.STRIPE_WEBHOOK_SECRET, env.STRIPE_WEBHOOK_SECRET_PREV];
+  var secrets = [env.STRIPE_WEBHOOK_SECRET, env.STRIPE_WEBHOOK_SECRET_PREV].filter(stripeWebhookSecretOk);
   var signed = false;
   for (var i = 0; i < secrets.length; i++) {
-    if (secrets[i] && (await verifyStripeSignature(raw, sig, String(secrets[i]).trim()))) {
+    if (await verifyStripeSignature(raw, sig, String(secrets[i]).trim())) {
       signed = true;
       break;
     }
@@ -1239,9 +1320,9 @@ async function handleStripeWebhook(request, env, cors) {
     // must not unlock Pro, and a failed async payment must not take
     // away an already-active entitlement.
   } else if (type === "customer.subscription.updated" || type === "customer.subscription.deleted") {
-    await applyStripeSubscription(env, obj);
+    await applyStripeSubscription(env, obj, event.created);
   } else if (type === "charge.refunded" || type === "refund.created" || type === "charge.dispute.created") {
-    await applyStripeRevoke(env, obj);
+    await applyStripeRevoke(env, obj, event.created);
   } else if (type === "invoice.paid" || type === "invoice.payment_succeeded") {
     var hex = await hexFromStripeRefs(env, obj);
     if (hex) {
@@ -1710,12 +1791,15 @@ async function doCheckout(env, origin, plan, existingToken, attribution) {
   attribution = sanitizeAttribution(attribution);
   origin = clean(origin, 120) || "https://clickprompt.app";
   if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
-  plan = clean(plan, 20);
 
   // Stripe path is off unless PAYMENT_PROVIDER=stripe is set on the Worker.
+  // The plan is checked against the exact allowlist before any cleaning,
+  // so a non-string or unexpected value cannot be coerced into a plan.
   if (paymentProvider(env) === "stripe") {
     return doStripeCheckout(env, origin, plan, existingToken, attribution);
   }
+
+  plan = clean(plan, 20);
 
   if (
     !env.LEMONSQUEEZY_API_KEY ||
