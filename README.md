@@ -153,6 +153,10 @@ Do this in your own Stripe account. Do not put any keys in the repo.
    A PI-only lifetime checkout in that window still grants, because
    the session does not carry the tombstoned charge id.
 
+   Any fully refunded paid payment on an invoice removes Pro. Every
+   paid Invoice Payment on that invoice is bound to the same buyer,
+   so a full refund of any one of those payments ends access.
+
 ### Worker vars and secrets (set on the Worker, not in git)
 
 - `PAYMENT_PROVIDER` (var): `lemonsqueezy` (default) or `stripe`.

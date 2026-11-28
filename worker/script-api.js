@@ -631,6 +631,8 @@ var STRIPE_WEBHOOK_BUDGET_MS = 9000;
 var STRIPE_WEBHOOK_MAX_BYTES = 1048576;
 var STRIPE_EVENT_TTL_SEC = 60 * 86400;
 var STRIPE_LOOKUP_ID_MAX = 255;
+var STRIPE_INVOICE_PAYMENTS_PAGE_LIMIT = 100;
+var STRIPE_INVOICE_PAYMENTS_MAX_PAGES = 5;
 
 var PLAN_PRICE_ENV = {
   monthly: "STRIPE_PRICE_ID_MONTHLY",
@@ -1117,12 +1119,8 @@ async function rememberStripeIds(env, hex, ids) {
   if (ids.paymentsLoaded) {
     bindPis = uniqueStripeRefIds(ids.paidPaymentIntents);
     bindCharges = uniqueStripeRefIds(ids.paidCharges);
-    // An empty list (no invoice, or payments not yet visible)
-    // must not drop a PI or charge the checkout session already
-    // carried. invoice.paid only passes PIs from the payments
-    // list, so a field that is not in that list stays unbound.
-    if (!bindPis.length && ids.paymentIntent) bindPis = [ids.paymentIntent];
-    if (!bindCharges.length && ids.charge) bindCharges = [ids.charge];
+    // If the payments list loaded and has no paid entries, do
+    // not fall back to a PI or charge on the session or event.
   } else {
     if (ids.paymentIntent) bindPis = [ids.paymentIntent];
     if (ids.charge) bindCharges = [ids.charge];
@@ -1818,7 +1816,7 @@ function stripeRefsFromObject(obj) {
   if (obj.object === "invoice" || (obj.payments && obj.payments.data)) {
     if (obj.object === "invoice") refs.invoice = String(obj.id || "");
     else refs.invoice = stripeRefId(obj.invoice) || refs.invoice;
-    refs.subscription = stripeRefId(obj.subscription);
+    refs.subscription = stripeInvoiceSubscription(obj);
     mergeInvoicePaymentsIntoRefs(refs, obj);
     return refs;
   }
@@ -1850,6 +1848,42 @@ function emptyStripeRefs() {
     paid_charges: [],
     paymentsLoaded: false,
   };
+}
+
+// Basil removed top-level Invoice.subscription. Read the
+// subscription from parent.subscription_details.subscription when
+// parent.type is subscription_details. Fall back to the top-level
+// field only for tolerance of older payloads.
+function stripeInvoiceSubscription(obj) {
+  if (!obj || typeof obj !== "object") return "";
+  if (obj.parent && obj.parent.type === "subscription_details") {
+    var fromParent = stripeRefId(obj.parent.subscription_details && obj.parent.subscription_details.subscription);
+    if (fromParent) return fromParent;
+  }
+  return stripeRefId(obj.subscription);
+}
+
+// payment.charge is set only when payment.type is charge.
+// payment.payment_intent is set when type is payment_intent.
+// If a payment_intent object is expanded, latest_charge may
+// also fill the charge id.
+function stripeInvoicePaymentMethodRefs(payment) {
+  var pay = payment || {};
+  var typ = String(pay.type || "");
+  var pi = "";
+  var ch = "";
+  if (typ === "charge") {
+    ch = stripeRefId(pay.charge);
+  } else if (typ === "payment_intent") {
+    pi = stripeRefId(pay.payment_intent);
+    if (pay.payment_intent && typeof pay.payment_intent === "object") {
+      ch = stripeRefId(pay.payment_intent.latest_charge);
+    }
+  } else {
+    pi = stripeRefId(pay.payment_intent);
+    if (!pi) ch = stripeRefId(pay.charge);
+  }
+  return { payment_intent: pi, charge: ch };
 }
 
 // Collect Invoice Payment objects from an invoice, a list, or an
@@ -1884,12 +1918,9 @@ function idsFromInvoicePayments(source) {
   for (var i = 0; i < entries.length; i++) {
     var p = entries[i];
     if (!p || p.object !== "invoice_payment") continue;
-    var pay = p.payment || {};
-    var pi = stripeRefId(pay.payment_intent);
-    var ch = stripeRefId(pay.charge);
-    if (!ch && pay.payment_intent && typeof pay.payment_intent === "object") {
-      ch = stripeRefId(pay.payment_intent.latest_charge);
-    }
+    var ids = stripeInvoicePaymentMethodRefs(p.payment);
+    var pi = ids.payment_intent;
+    var ch = ids.charge;
     var inv = stripeRefId(p.invoice);
     if (pi && pis.indexOf(pi) === -1) pis.push(pi);
     if (ch && charges.indexOf(ch) === -1) charges.push(ch);
@@ -1900,8 +1931,14 @@ function idsFromInvoicePayments(source) {
 
 function mergeInvoicePaymentsIntoRefs(refs, source) {
   if (!refs || !invoicePaymentsArePresent(source)) return;
-  refs.paymentsLoaded = true;
   var entries = invoicePaymentEntries(source);
+  // An empty list from a payment_intent lookup means this PI is
+  // not on an invoice, not that an invoice loaded with no paid
+  // payments. Only mark the list loaded for an invoice object,
+  // invoice.payments, or a non-empty page of invoice payments.
+  var fromInvoice = !!(source && (source.object === "invoice" || source.payments));
+  if (!entries.length && !fromInvoice) return;
+  refs.paymentsLoaded = true;
   var paidPis = [];
   var paidCharges = [];
   var invoiceIds = [];
@@ -1912,12 +1949,9 @@ function mergeInvoicePaymentsIntoRefs(refs, source) {
     var inv = stripeRefId(p.invoice);
     if (inv && invoiceIds.indexOf(inv) === -1) invoiceIds.push(inv);
     if (String(p.status || "") !== "paid") continue;
-    var pay = p.payment || {};
-    var pi = stripeRefId(pay.payment_intent);
-    var ch = stripeRefId(pay.charge);
-    if (!ch && pay.payment_intent && typeof pay.payment_intent === "object") {
-      ch = stripeRefId(pay.payment_intent.latest_charge);
-    }
+    var paidIds = stripeInvoicePaymentMethodRefs(p.payment);
+    var pi = paidIds.payment_intent;
+    var ch = paidIds.charge;
     if (pi && paidPis.indexOf(pi) === -1) paidPis.push(pi);
     if (ch && paidCharges.indexOf(ch) === -1) paidCharges.push(ch);
   }
@@ -1989,6 +2023,18 @@ function stripeFetchedLivemodeConflicts(env, fetched) {
   return fetched.livemode !== req.livemode;
 }
 
+// Each Invoice Payment in a list (or on invoice.payments) must
+// match the event livemode. A mismatch fails closed.
+function assertStripeInvoicePaymentsLivemode(env, source) {
+  var entries = invoicePaymentEntries(source);
+  for (var i = 0; i < entries.length; i++) {
+    if (stripeFetchedLivemodeConflicts(env, entries[i])) {
+      try { console.log("stripe fetched livemode does not match the event"); } catch (ignore) {}
+      throw stripeFailClosed("stripe fetched livemode does not match the event");
+    }
+  }
+}
+
 function expectedStripeObjectType(path) {
   var p = String(path || "");
   var q = p.indexOf("?");
@@ -2053,6 +2099,7 @@ async function fetchStripeResource(env, path) {
   try {
     var data = await stripeRequest(got.key, "GET", path, undefined, undefined, env);
     assertFetchedStripeObjectType(path, data);
+    assertStripeInvoicePaymentsLivemode(env, data);
     if (stripeFetchedLivemodeConflicts(env, data)) {
       try { console.log("stripe fetched livemode does not match the event"); } catch (ignore) {}
       var closed = stripeFailClosed("stripe fetched livemode does not match the event");
@@ -2096,7 +2143,7 @@ function mergeStripeRefsFromSource(refs, source) {
   mergeInvoicePaymentsIntoRefs(refs, source);
   if (source.object === "invoice" || invoicePaymentsArePresent(source)) {
     if (!refs.invoice) refs.invoice = source.object === "invoice" ? String(source.id || "") : stripeRefId(source.invoice);
-    if (!refs.subscription) refs.subscription = stripeRefId(source.subscription);
+    if (!refs.subscription) refs.subscription = stripeInvoiceSubscription(source);
     return;
   }
   if (!refs.payment_intent) refs.payment_intent = stripeRefId(source.payment_intent);
@@ -2138,40 +2185,76 @@ function stripeFetchedRefsDisagree(original, fetched) {
   return false;
 }
 
+async function stripeEventHomeHex(env, original) {
+  if (!env || !env.KV || !original) return null;
+  var home = null;
+  if (original.payment_intent) home = await env.KV.get("stripepi:" + original.payment_intent);
+  if (!home && original.charge) home = await env.KV.get("stripecharge:" + original.charge);
+  if (!home && original.invoice) home = await env.KV.get("stripeinv:" + original.invoice);
+  if (!home && original.subscription) home = await env.KV.get("stripesub:" + original.subscription);
+  return home || null;
+}
+
+// Fail closed when any fetched id, including a PI or charge on
+// invoice.payments, is already bound to a hex other than the
+// event's home hex. This still applies when the event's own
+// payment_intent is unbound: a fetched payment bound to someone
+// else must not grant, revoke, or tombstone that identity.
 async function stripeConflictingIdBoundToOtherHex(env, original, fetched) {
-  if (!env || !env.KV) return false;
+  if (!env || !env.KV || !fetched) return false;
+  var home = await stripeEventHomeHex(env, original);
+  var fetchedRefs = stripeRefsFromObject(fetched);
   var ids = [
-    [original && original.payment_intent, "stripepi:"],
-    [original && original.charge, "stripecharge:"],
-    [original && original.invoice, "stripeinv:"],
-    [original && original.subscription, "stripesub:"],
-    [fetched && stripeRefsFromObject(fetched).payment_intent, "stripepi:"],
-    [fetched && stripeRefsFromObject(fetched).charge, "stripecharge:"],
-    [fetched && stripeRefsFromObject(fetched).invoice, "stripeinv:"],
-    [fetched && stripeRefsFromObject(fetched).subscription, "stripesub:"],
+    [fetchedRefs.payment_intent, "stripepi:"],
+    [fetchedRefs.charge, "stripecharge:"],
+    [fetchedRefs.invoice, "stripeinv:"],
+    [fetchedRefs.subscription, "stripesub:"],
   ];
   var listed = idsFromInvoicePayments(fetched);
   var i;
   for (i = 0; i < listed.payment_intents.length; i++) ids.push([listed.payment_intents[i], "stripepi:"]);
   for (i = 0; i < listed.charges.length; i++) ids.push([listed.charges[i], "stripecharge:"]);
   for (i = 0; i < listed.invoices.length; i++) ids.push([listed.invoices[i], "stripeinv:"]);
-  var hexes = [];
+  var fetchedIdSet = [];
+  var uniqueBound = [];
   for (i = 0; i < ids.length; i++) {
     var id = ids[i][0];
     if (!id) continue;
+    if (fetchedIdSet.indexOf(id) === -1) fetchedIdSet.push(id);
     var bound = await env.KV.get(ids[i][1] + id);
-    if (bound && hexes.indexOf(bound) === -1) hexes.push(bound);
+    if (!bound) continue;
+    if (home && bound !== home) return true;
+    if (!home && uniqueBound.indexOf(bound) === -1) uniqueBound.push(bound);
   }
-  return hexes.length > 1;
+  if (home) return false;
+  // Home is unset: the event's PI or charge is not bound yet.
+  // Discovering one owner through the fetched object is fine when
+  // that object is the event's own payment (a charge lookup that
+  // returns its PI, or a PI lookup that returns its invoice).
+  // Fail closed when the event names a different PI or charge
+  // than the fetched ones, and those fetched ids already belong
+  // to someone else.
+  if (uniqueBound.length === 0) return false;
+  if (uniqueBound.length > 1) return true;
+  var named = [
+    original && original.payment_intent,
+    original && original.charge,
+    original && original.invoice,
+    original && original.subscription,
+  ];
+  for (i = 0; i < named.length; i++) {
+    if (named[i] && fetchedIdSet.indexOf(named[i]) === -1) return true;
+  }
+  return false;
 }
 
 async function acceptFetchedStripeObject(env, original, fetched) {
   if (!fetched) return;
-  if (!stripeFetchedRefsDisagree(original, fetched)) return;
   if (await stripeConflictingIdBoundToOtherHex(env, original, fetched)) {
     try { console.log("stripe fetched refs do not match the event"); } catch (e) {}
     throw stripeFailClosed("stripe fetched refs do not match the event");
   }
+  if (!stripeFetchedRefsDisagree(original, fetched)) return;
   var retry = new Error("Could not process event. Try again.");
   retry.status = 500;
   retry.transient = true;
@@ -2249,35 +2332,183 @@ async function fetchStripeChargeRefs(env, chargeId) {
   return fetchStripeResource(env, "/charges/" + encodeURIComponent(chargeId));
 }
 
-// Only this list shape is used to go from a payment_intent back to
-// its invoice. The PI is allowlisted before it is placed in the
-// query string. The call counts against the 9 second budget and
-// is memoized with the other GETs.
-async function fetchStripeInvoicePaymentsByPaymentIntent(env, paymentIntent) {
+async function fetchStripePaymentIntentRefs(env, paymentIntent) {
   if (!assertStripeLookupId(paymentIntent, ["pi_"])) return null;
-  var path = "/invoice_payments?payment[type]=payment_intent&payment[payment_intent]=" + encodeURIComponent(paymentIntent);
-  return fetchStripeResource(env, path);
+  return fetchStripeResource(env, "/payment_intents/" + encodeURIComponent(paymentIntent));
+}
+
+// List Invoice Payments with a fixed shape: limit=100, and either
+// invoice= or payment[type]=payment_intent and payment[payment_intent]=.
+// Brackets in those query keys are percent-encoded. The PI or
+// invoice id is allowlisted before it is placed in the query.
+// Pages use starting_after and count against the 9 second budget.
+function stripeInvoicePaymentsListPath(opts) {
+  var parts = ["limit=" + STRIPE_INVOICE_PAYMENTS_PAGE_LIMIT];
+  if (opts && opts.invoice) parts.push("invoice=" + encodeURIComponent(opts.invoice));
+  if (opts && opts.paymentIntent) {
+    parts.push("payment%5Btype%5D=payment_intent");
+    parts.push("payment%5Bpayment_intent%5D=" + encodeURIComponent(opts.paymentIntent));
+  }
+  if (opts && opts.startingAfter) parts.push("starting_after=" + encodeURIComponent(opts.startingAfter));
+  return "/invoice_payments?" + parts.join("&");
+}
+
+function invoicePaymentsListHasPaid(entries) {
+  var list = entries || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && list[i].object === "invoice_payment" && String(list[i].status || "") === "paid") return true;
+  }
+  return false;
+}
+
+function invoicePaymentsMissNeeded(entries, needed) {
+  if (!needed) return false;
+  var listed = idsFromInvoicePayments(entries);
+  if (needed.payment_intent && listed.payment_intents.indexOf(needed.payment_intent) === -1) return true;
+  if (needed.charge && listed.charges.indexOf(needed.charge) === -1) return true;
+  return false;
+}
+
+function throwIfInvoicePaymentsTruncated(pages, needed) {
+  if (!pages || !pages.truncated) return;
+  var entries = pages.data || [];
+  if (invoicePaymentsMissNeeded(entries, needed) || !invoicePaymentsListHasPaid(entries)) {
+    throw stripeUnresolvedPaymentRetry();
+  }
+}
+
+// Page through invoice.payments or GET /v1/invoice_payments using
+// has_more and starting_after, up to 5 pages of 100. If the cap
+// or budget is hit with has_more still true and a needed PI is
+// still unresolved, or no paid payment is visible, return 5xx
+// without a dedupe write.
+async function fetchStripeInvoicePaymentPages(env, opts, needed) {
+  var all = [];
+  var startingAfter = "";
+  var pages = 0;
+  var hasMore = false;
+  if (opts && opts.seed && invoicePaymentsArePresent(opts.seed)) {
+    var seedEntries = invoicePaymentEntries(opts.seed);
+    assertStripeInvoicePaymentsLivemode(env, seedEntries);
+    all = all.concat(seedEntries);
+    hasMore = !!(opts.seed.has_more || (opts.seed.payments && opts.seed.payments.has_more));
+    if (opts.seed.payments && typeof opts.seed.payments.has_more === "boolean") hasMore = !!opts.seed.payments.has_more;
+    if (seedEntries.length) startingAfter = String(seedEntries[seedEntries.length - 1].id || "");
+    pages = 1;
+  } else {
+    hasMore = true;
+  }
+  while (hasMore) {
+    if (pages >= STRIPE_INVOICE_PAYMENTS_MAX_PAGES) {
+      return { object: "list", data: all, has_more: true, truncated: true };
+    }
+    var path = stripeInvoicePaymentsListPath({
+      invoice: opts && opts.invoice,
+      paymentIntent: opts && opts.paymentIntent,
+      startingAfter: startingAfter,
+    });
+    var page = await fetchStripeResource(env, path);
+    if (!page) break;
+    await acceptFetchedStripeObject(env, opts && opts.original, page);
+    var entries = invoicePaymentEntries(page);
+    for (var i = 0; i < entries.length; i++) all.push(entries[i]);
+    pages += 1;
+    hasMore = !!page.has_more;
+    if (entries.length) startingAfter = String(entries[entries.length - 1].id || "");
+    else hasMore = false;
+  }
+  return { object: "list", data: all, has_more: false, truncated: false };
+}
+
+async function fetchStripeInvoiceWithPayments(env, invoiceId, original) {
+  var inv = await fetchStripeInvoiceRefs(env, invoiceId);
+  if (!inv) return null;
+  await acceptFetchedStripeObject(env, original, inv);
+  var pages = await fetchStripeInvoicePaymentPages(env, {
+    invoice: invoiceId,
+    seed: inv.payments || inv,
+    original: original,
+  }, original);
+  throwIfInvoicePaymentsTruncated(pages, original);
+  var out = {};
+  Object.keys(inv).forEach(function (k) { out[k] = inv[k]; });
+  out.payments = { object: "list", data: pages.data, has_more: !!pages.has_more };
+  return out;
+}
+
+async function fetchStripeInvoicePaymentsByPaymentIntent(env, paymentIntent, original) {
+  if (!assertStripeLookupId(paymentIntent, ["pi_"])) return null;
+  var pages = await fetchStripeInvoicePaymentPages(env, {
+    paymentIntent: paymentIntent,
+    original: original,
+  }, original && original.payment_intent ? original : { payment_intent: paymentIntent });
+  throwIfInvoicePaymentsTruncated(pages, { payment_intent: paymentIntent });
+  return pages;
+}
+
+// When a PI lookup finds a paid payment on an invoice already
+// bound to this buyer, bind that PI and charge to the same hex
+// so a later refund or dispute can find the identity.
+async function bindStripePaymentsIfInvoiceOwned(env, refs) {
+  if (!env || !env.KV || !refs || !refs.invoice) return;
+  var hex = await env.KV.get("stripeinv:" + refs.invoice);
+  if (!hex && refs.subscription) hex = await env.KV.get("stripesub:" + refs.subscription);
+  if (!hex) return;
+  var pis = refs.paid_payment_intents || [];
+  var charges = refs.paid_charges || [];
+  var i;
+  for (i = 0; i < pis.length; i++) {
+    await bindStripePaymentRef(env, "stripepi:" + pis[i], hex);
+  }
+  for (i = 0; i < charges.length; i++) {
+    await bindStripePaymentRef(env, "stripecharge:" + charges[i], hex);
+  }
+}
+
+async function fillStripeChargesFromPaymentIntents(env, refs, original) {
+  if (!refs) return;
+  var pis = refs.paid_payment_intents && refs.paid_payment_intents.length
+    ? refs.paid_payment_intents
+    : (refs.payment_intent ? [refs.payment_intent] : []);
+  var i;
+  for (i = 0; i < pis.length; i++) {
+    if (refs.charge && refs.paid_charges && refs.paid_charges.length >= pis.length) break;
+    var pi = pis[i];
+    if (!pi) continue;
+    var fetchedPi = await fetchStripePaymentIntentRefs(env, pi);
+    if (!fetchedPi) continue;
+    await acceptFetchedStripeObject(env, original, fetchedPi);
+    var ch = stripeRefId(fetchedPi.latest_charge);
+    if (ch) {
+      if (!refs.charge) refs.charge = ch;
+      if (refs.paid_charges.indexOf(ch) === -1) refs.paid_charges.push(ch);
+    }
+  }
 }
 
 // Canonical payment refs (payment_intent, charge, invoice,
 // subscription) for checkout sessions, disputes, and refunds.
 // On the pinned Basil API, Invoice no longer has payment_intent
 // or charge, and Charge and PaymentIntent no longer have invoice.
-// Invoice to PI or charge: GET /v1/invoices/{id}?expand[]=payments
-// and read payments.data[].payment.payment_intent (and .charge).
-// PI or charge to invoice: GET the charge first when we only have
-// a charge, then GET /v1/invoice_payments?payment[type]=payment_intent
-// &payment[payment_intent]={pi}. Webhook payloads use the same
-// Basil shape, so event objects are read the same way. An invoice
-// may have several payments; paid payments on the same invoice
-// share the same hex. Do not fetch an invoice solely to fill
-// subscription: a one-time invoice has no subscription. Transient
-// fetch errors are thrown; a permanent 4xx keeps the refs already
-// collected. A fetched object that disagrees with a ref already
-// on the event fails closed only when a conflicting id is already
-// bound to a different hex; otherwise the webhook returns 5xx
-// without a dedupe write. Ids bound to a different identity than
-// the event's original PI or charge are dropped.
+// Invoice.subscription moved to parent.subscription_details.subscription
+// when parent.type is subscription_details. Invoice to PI or
+// charge: GET /v1/invoices/{id}?expand[]=payments and page
+// /v1/invoice_payments with limit=100 and starting_after.
+// payments.data[].payment is a payment_intent or a charge,
+// depending on payment.type. PI or charge to invoice: GET the
+// charge first when we only have a charge, then page
+// /v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]={pi}.
+// Webhook payloads use the same Basil shape. Paid payments on
+// the same invoice share the same hex. Do not fetch an invoice
+// solely to fill subscription: a one-time invoice has no
+// subscription. Transient fetch errors are thrown; a permanent
+// 4xx keeps the refs already collected. A fetched object that
+// disagrees with a ref already on the event fails closed only
+// when a conflicting id is already bound to a different hex
+// (including when the event PI is unbound); otherwise the
+// webhook returns 5xx without a dedupe write. Ids bound to a
+// different identity than the event's original PI or charge
+// are dropped.
 async function resolveStripePaymentRefs(env, obj) {
   var refs = stripeRefsFromObject(obj);
   var original = copyStripeRefs(refs);
@@ -2300,11 +2531,15 @@ async function resolveStripePaymentRefs(env, obj) {
 
   // Fetch the invoice to fill payment_intent or charge from its
   // payments list, not to look up a subscription on a one-time
-  // invoice.
-  if (refs.invoice && (!refs.payment_intent || !refs.charge || !refs.paymentsLoaded)) {
-    var fetchedInv = await fetchStripeInvoiceRefs(env, refs.invoice);
+  // invoice. Page through remaining payments when has_more.
+  // Fetch the invoice when its payments list is not already on
+  // the event. Do not refetch just to fill a charge: use GET
+  // /v1/payment_intents/{pi} for latest_charge instead, so an
+  // invoice.paid payload is not mixed with a stored invoice
+  // whose canonical PI is a different paid payment.
+  if (refs.invoice && !refs.paymentsLoaded) {
+    var fetchedInv = await fetchStripeInvoiceWithPayments(env, refs.invoice, original);
     fetchedInvoice = true;
-    await acceptFetchedStripeObject(env, original, fetchedInv);
     mergeStripeRefsFromSource(refs, fetchedInv);
   }
 
@@ -2316,9 +2551,8 @@ async function resolveStripePaymentRefs(env, obj) {
   }
 
   if (refs.payment_intent && !refs.invoice) {
-    var fetchedPays = await fetchStripeInvoicePaymentsByPaymentIntent(env, refs.payment_intent);
+    var fetchedPays = await fetchStripeInvoicePaymentsByPaymentIntent(env, refs.payment_intent, original);
     fetchedInvoicePayments = true;
-    await acceptFetchedStripeObject(env, original, fetchedPays);
     mergeStripeRefsFromSource(refs, fetchedPays);
   }
 
@@ -2327,9 +2561,8 @@ async function resolveStripePaymentRefs(env, obj) {
     if (storedLater) refs.payment_intent = storedLater;
   }
 
-  if (refs.invoice && (!refs.payment_intent || !refs.charge || !refs.paymentsLoaded) && !fetchedInvoice) {
-    var fetchedInvLater = await fetchStripeInvoiceRefs(env, refs.invoice);
-    await acceptFetchedStripeObject(env, original, fetchedInvLater);
+  if (refs.invoice && !refs.paymentsLoaded && !fetchedInvoice) {
+    var fetchedInvLater = await fetchStripeInvoiceWithPayments(env, refs.invoice, original);
     mergeStripeRefsFromSource(refs, fetchedInvLater);
   }
 
@@ -2340,12 +2573,16 @@ async function resolveStripePaymentRefs(env, obj) {
   }
 
   if (refs.payment_intent && !refs.invoice && !fetchedInvoicePayments) {
-    var fetchedPaysLater = await fetchStripeInvoicePaymentsByPaymentIntent(env, refs.payment_intent);
-    await acceptFetchedStripeObject(env, original, fetchedPaysLater);
+    var fetchedPaysLater = await fetchStripeInvoicePaymentsByPaymentIntent(env, refs.payment_intent, original);
     mergeStripeRefsFromSource(refs, fetchedPaysLater);
   }
 
+  if ((refs.payment_intent || (refs.paid_payment_intents && refs.paid_payment_intents.length)) && !refs.charge) {
+    await fillStripeChargesFromPaymentIntents(env, refs, original);
+  }
+
   await dropCrossBoundStripeRefs(env, original, refs);
+  await bindStripePaymentsIfInvoiceOwned(env, refs);
   return refs;
 }
 
@@ -2888,7 +3125,7 @@ async function handleStripeWebhook(request, env, cors) {
           paymentIntent: invRefs.payment_intent,
           invoice: invRefs.invoice || String(obj.id || ""),
           charge: invRefs.charge,
-          subscription: invRefs.subscription || stripeRefId(obj.subscription),
+          subscription: invRefs.subscription || stripeInvoiceSubscription(obj),
           customer: stripeRefId(obj.customer),
           paidPaymentIntents: invRefs.paid_payment_intents,
           paidCharges: invRefs.paid_charges,
