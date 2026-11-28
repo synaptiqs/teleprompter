@@ -157,6 +157,9 @@ Do this in your own Stripe account. Do not put any keys in the repo.
    paid Invoice Payment on that invoice is bound to the same buyer,
    so a full refund of any one of those payments ends access.
 
+   A checkout whose payment_intent is past the 5-page invoice
+   payments cap never grants.
+
 ### Worker vars and secrets (set on the Worker, not in git)
 
 - `PAYMENT_PROVIDER` (var): `lemonsqueezy` (default) or `stripe`.

@@ -3590,11 +3590,11 @@ test('charge A linked to invoice B does not touch buyer B', async () => {
   });
   assert.equal(r.status, 200);
   assert.ok(await kv.get('stripe:evt:evt_poison_a_refund'));
-  assert.equal((await kv.get('sub:' + hexA, 'json')).status, 'lifetime');
+  assert.equal((await kv.get('sub:' + hexA, 'json')).status, 'refunded');
   assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
-  assert.equal(await kv.get('stripe:refunded:ch_poison_a'), null);
+  assert.ok(await kv.get('stripe:refunded:ch_poison_a'));
   assert.equal(await kv.get('stripe:refunded:in_poison_b'), null);
-  assert.equal((await me(env, 'sub:' + hexA).then((res) => res.json())).unlocked, true);
+  assert.equal((await me(env, 'sub:' + hexA).then((res) => res.json())).unlocked, false);
   assert.equal((await me(env, 'sub:' + hexB).then((res) => res.json())).unlocked, true);
 });
 
@@ -4174,6 +4174,9 @@ test('invoice payment pages hitting the cap with a needed PI unresolved return 5
     eventId: 'evt_cs_cap',
   });
   assert.equal(r.status, 500);
+  const listGets = stripeCalls.filter((c) => c.method === 'GET' && /\/invoice_payments\?/.test(c.url));
+  // Seed is page 1 from the invoice expand; 4 list GETs reach the 5-page cap.
+  assert.equal(listGets.length, 4);
   assert.equal(await kv.get('stripe:evt:evt_cs_cap'), null);
   assert.equal(await kv.get('sub:' + hex, 'json'), null);
 });
@@ -4326,7 +4329,7 @@ test('invoice_payment livemode mismatch fails closed', async () => {
   assert.equal((await me(env, 'sub:' + hex).then((res) => res.json())).unlocked, false);
 });
 
-test('loaded invoice payments with no paid entries do not bind the session PI', async () => {
+test('paid session with no paid invoice payment visible yet returns 5xx without granting', async () => {
   const kv = memoryKv();
   const hex = 'c5'.repeat(16);
   const env = { ...stripeEnv, KV: kv };
@@ -4354,10 +4357,12 @@ test('loaded invoice payments with no paid entries do not bind the session PI', 
     created: 67_000,
     eventId: 'evt_cs_open',
   });
-  assert.equal(r.status, 200);
-  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'active');
+  assert.equal(r.status, 500);
+  assert.equal(await kv.get('stripe:evt:evt_cs_open'), null);
+  assert.equal(await kv.get('sub:' + hex, 'json'), null);
   assert.equal(await kv.get('stripepi:pi_session_open'), null);
   assert.equal(await kv.get('stripepi:pi_open'), null);
+  assert.equal(await kv.get('stripe:invpi:in_open'), null);
 });
 
 test('fetched payments bound to another buyer fail closed when the event PI is unbound', async () => {
@@ -4410,5 +4415,305 @@ test('fetched payments bound to another buyer fail closed when the event PI is u
   assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
   assert.equal(await kv.get('stripepi:pi_unbound_a'), null);
   assert.equal(await kv.get('stripeinv:in_home_b'), hexB);
+  assert.equal((await me(env, 'sub:' + hexB).then((res) => res.json())).unlocked, true);
+});
+
+test('page-6 pi_cap_needed/ch_needed refund revokes after a grant on earlier pages', async () => {
+  const kv = memoryKv();
+  const hex = 'd0'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  const pages = [];
+  for (let i = 0; i < 6; i++) {
+    pages.push(basilInvoicePayment({
+      invoice: 'in_cap_bind',
+      paymentIntent: i === 5 ? 'pi_cap_needed' : ('pi_cap_bind_' + i),
+      charge: i === 5 ? 'ch_needed' : ('ch_cap_bind_' + i),
+      id: 'inpay_cap_bind_' + i,
+    }));
+  }
+  stripeInvoiceGets.in_cap_bind = {
+    id: 'in_cap_bind',
+    object: 'invoice',
+    livemode: false,
+    parent: basilInvoiceParent('sub_cap_bind'),
+    payments: { object: 'list', data: [pages[0]], has_more: true },
+  };
+  stripeInvoicePaymentsByInvoice.in_cap_bind = pages;
+  stripeInvoicePaymentsPageSize.in_cap_bind = 1;
+  stripeInvoicePaymentsByPi.pi_cap_bind_0 = [pages[0]];
+  stripeInvoicePaymentsByPi.pi_cap_needed = [pages[5]];
+  stripePaymentIntentGets.pi_cap_needed = {
+    id: 'pi_cap_needed',
+    object: 'payment_intent',
+    latest_charge: 'ch_needed',
+    livemode: false,
+  };
+  stripePaymentIntentGets.pi_cap_bind_0 = {
+    id: 'pi_cap_bind_0',
+    object: 'payment_intent',
+    latest_charge: 'ch_cap_bind_0',
+    livemode: false,
+  };
+
+  let r = await paidMonthlyCheckout(env, {
+    hex,
+    sessionId: 'cs_cap_bind',
+    subscription: 'sub_cap_bind',
+    paymentIntent: 'pi_cap_bind_0',
+    invoice: 'in_cap_bind',
+    created: 70_000,
+    eventId: 'evt_cs_cap_bind',
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'active');
+  assert.equal(await kv.get('stripeinv:in_cap_bind'), hex);
+  assert.equal(await kv.get('stripepi:pi_cap_needed'), null);
+  assert.equal(await kv.get('stripecharge:ch_needed'), null);
+
+  r = await signedWebhook(env, {
+    id: 'evt_cap_needed_refund',
+    type: 'charge.refunded',
+    livemode: false,
+    created: 70_001,
+    data: {
+      object: {
+        object: 'charge',
+        payment_intent: 'pi_cap_needed',
+        refunded: true,
+        amount: 399,
+        amount_refunded: 399,
+        currency: 'usd',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.ok(await kv.get('stripe:evt:evt_cap_needed_refund'));
+  assert.equal(await kv.get('stripepi:pi_cap_needed'), hex);
+  assert.equal(await kv.get('stripecharge:ch_needed'), hex);
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'refunded');
+  assert.equal((await me(env, 'sub:' + hex).then((res) => res.json())).unlocked, false);
+});
+
+test('session PI on page 2 of invoice payments grants when page 1 shows a different paid PI', async () => {
+  const kv = memoryKv();
+  const hex = 'd1'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  const page1 = [
+    basilInvoicePayment({
+      invoice: 'in_seed_page',
+      paymentIntent: 'pi_seed_page_1',
+      charge: 'ch_seed_page_1',
+      id: 'inpay_seed_page_1',
+    }),
+  ];
+  const page2 = [
+    basilInvoicePayment({
+      invoice: 'in_seed_page',
+      paymentIntent: 'pi_seed_page_2',
+      charge: 'ch_seed_page_2',
+      id: 'inpay_seed_page_2',
+    }),
+  ];
+  stripeInvoiceGets.in_seed_page = {
+    id: 'in_seed_page',
+    object: 'invoice',
+    livemode: false,
+    parent: basilInvoiceParent('sub_seed_page'),
+    payments: { object: 'list', data: page1, has_more: true },
+  };
+  stripeInvoicePaymentsByInvoice.in_seed_page = page1.concat(page2);
+  stripeInvoicePaymentsPageSize.in_seed_page = 1;
+  stripeInvoicePaymentsByPi.pi_seed_page_2 = page2;
+  stripePaymentIntentGets.pi_seed_page_1 = {
+    id: 'pi_seed_page_1', object: 'payment_intent', latest_charge: 'ch_seed_page_1', livemode: false,
+  };
+  stripePaymentIntentGets.pi_seed_page_2 = {
+    id: 'pi_seed_page_2', object: 'payment_intent', latest_charge: 'ch_seed_page_2', livemode: false,
+  };
+
+  const r = await paidMonthlyCheckout(env, {
+    hex,
+    sessionId: 'cs_seed_page',
+    subscription: 'sub_seed_page',
+    paymentIntent: 'pi_seed_page_2',
+    invoice: 'in_seed_page',
+    created: 71_000,
+    eventId: 'evt_cs_seed_page',
+  });
+  assert.equal(r.status, 200);
+  assert.ok(await kv.get('stripe:evt:evt_cs_seed_page'));
+  assert.equal((await kv.get('sub:' + hex, 'json')).status, 'active');
+  assert.equal(await kv.get('stripepi:pi_seed_page_1'), hex);
+  assert.equal(await kv.get('stripepi:pi_seed_page_2'), hex);
+});
+
+test('starting_after must be an allowlisted inpay_ id or paging stops', async () => {
+  const kv = memoryKv();
+  const hex = 'd2'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  const pages = [
+    basilInvoicePayment({
+      invoice: 'in_cursor',
+      paymentIntent: 'pi_cursor_1',
+      id: 'bad-cursor-id',
+    }),
+    basilInvoicePayment({
+      invoice: 'in_cursor',
+      paymentIntent: 'pi_cursor_needed',
+      id: 'inpay_cursor_needed',
+    }),
+  ];
+  stripeInvoiceGets.in_cursor = {
+    id: 'in_cursor',
+    object: 'invoice',
+    livemode: false,
+    parent: basilInvoiceParent('sub_cursor'),
+    payments: { object: 'list', data: [pages[0]], has_more: true },
+  };
+  stripeInvoicePaymentsByInvoice.in_cursor = pages;
+  stripeInvoicePaymentsPageSize.in_cursor = 1;
+
+  const r = await paidMonthlyCheckout(env, {
+    hex,
+    sessionId: 'cs_cursor',
+    subscription: 'sub_cursor',
+    paymentIntent: 'pi_cursor_needed',
+    invoice: 'in_cursor',
+    created: 72_000,
+    eventId: 'evt_cs_cursor',
+  });
+  assert.equal(r.status, 500);
+  assert.equal(await kv.get('stripe:evt:evt_cs_cursor'), null);
+  assert.equal(await kv.get('sub:' + hex, 'json'), null);
+  const listGets = stripeCalls.filter((c) => c.method === 'GET' && /\/invoice_payments\?/.test(c.url));
+  assert.equal(listGets.length, 0);
+  assert.equal(listGets.some((c) => String(c.url).includes('starting_after=bad-cursor-id') || decodeURIComponent(c.url).includes('starting_after=bad-cursor-id')), false);
+});
+
+test('latest_charge fill bound to another buyer fails closed when the event PI is unbound', async () => {
+  const kv = memoryKv();
+  const hexA = 'd3'.repeat(16);
+  const hexB = 'd4'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  wirePaymentRefs({
+    invoice: 'in_fill_b',
+    charge: 'ch_fill_b',
+    paymentIntent: 'pi_fill_b',
+    subscription: 'sub_fill_b',
+  });
+  let r = await subscriptionCheckoutInvoiceOnly(env, {
+    hex: hexB,
+    sessionId: 'cs_fill_b',
+    invoice: 'in_fill_b',
+    subscription: 'sub_fill_b',
+    created: 73_000,
+    eventId: 'evt_cs_fill_b',
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
+  assert.equal(await kv.get('stripecharge:ch_fill_b'), hexB);
+
+  stripePaymentIntentGets.pi_fill_a = {
+    id: 'pi_fill_a',
+    object: 'payment_intent',
+    latest_charge: 'ch_fill_b',
+    livemode: false,
+  };
+  stripeInvoicePaymentsByPi.pi_fill_a = [];
+
+  r = await signedWebhook(env, {
+    id: 'evt_cs_fill_a',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 73_001,
+    data: {
+      object: {
+        id: 'cs_fill_a',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_fill_a',
+        metadata: { unlock_token: 'sub:' + hexA, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.ok(await kv.get('stripe:evt:evt_cs_fill_a'));
+  assert.equal(await kv.get('sub:' + hexA, 'json'), null);
+  assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
+  assert.equal(await kv.get('stripepi:pi_fill_a'), null);
+  assert.equal(await kv.get('stripecharge:ch_fill_b'), hexB);
+});
+
+test('dispute whose PI is bound to A drops a fetched invoice bound to B and pauses A', async () => {
+  const kv = memoryKv();
+  const hexA = 'd5'.repeat(16);
+  const hexB = 'd6'.repeat(16);
+  const env = { ...stripeEnv, KV: kv };
+  let r = await signedWebhook(env, {
+    id: 'evt_dp_home_a',
+    type: 'checkout.session.completed',
+    livemode: false,
+    created: 74_000,
+    data: {
+      object: {
+        id: 'cs_dp_home_a',
+        mode: 'payment',
+        payment_status: 'paid',
+        payment_intent: 'pi_dp_home_a',
+        metadata: { unlock_token: 'sub:' + hexA, plan: 'lifetime' },
+        line_items: catalogLineItems('lifetime'),
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  wirePaymentRefs({
+    invoice: 'in_dp_foreign_b',
+    charge: 'ch_dp_foreign_b',
+    paymentIntent: 'pi_dp_foreign_b',
+    subscription: 'sub_dp_foreign_b',
+  });
+  r = await subscriptionCheckoutInvoiceOnly(env, {
+    hex: hexB,
+    sessionId: 'cs_dp_foreign_b',
+    invoice: 'in_dp_foreign_b',
+    subscription: 'sub_dp_foreign_b',
+    created: 74_001,
+    eventId: 'evt_cs_dp_foreign_b',
+  });
+  assert.equal(r.status, 200);
+  assert.equal((await kv.get('sub:' + hexA, 'json')).status, 'lifetime');
+  assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
+
+  stripeInvoicePaymentsByPi.pi_dp_home_a = [
+    basilInvoicePayment({
+      invoice: 'in_dp_foreign_b',
+      paymentIntent: 'pi_dp_foreign_b',
+      charge: 'ch_dp_foreign_b',
+    }),
+  ];
+
+  r = await signedWebhook(env, {
+    id: 'evt_dp_home_a_created',
+    type: 'charge.dispute.created',
+    livemode: false,
+    created: 74_002,
+    data: {
+      object: {
+        id: 'dp_home_a',
+        object: 'dispute',
+        payment_intent: 'pi_dp_home_a',
+        status: 'needs_response',
+      },
+    },
+  });
+  assert.equal(r.status, 200);
+  assert.ok(await kv.get('stripe:evt:evt_dp_home_a_created'));
+  const recA = await kv.get('sub:' + hexA, 'json');
+  assert.equal(recA.status, 'refunded');
+  assert.equal(recA.revoke_reason, 'dispute');
+  assert.equal((await kv.get('sub:' + hexB, 'json')).status, 'active');
+  assert.equal(await kv.get('stripeinv:in_dp_foreign_b'), hexB);
+  assert.equal((await me(env, 'sub:' + hexA).then((res) => res.json())).unlocked, false);
   assert.equal((await me(env, 'sub:' + hexB).then((res) => res.json())).unlocked, true);
 });
