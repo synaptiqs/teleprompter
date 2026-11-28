@@ -30,7 +30,8 @@
 <body>
   <main class="legal-page">
     <h1>Privacy Policy</h1>
-    <p class="legal-updated">Last updated: October 28, 2026</p>
+    <p class="legal-updated">Last updated: November 27, 2026</p>
+    <p><strong>DRAFT for Tyler review.</strong> The payments wording was updated to name Stripe as the payment processor when Stripe checkout is turned on. It is not live until you approve it.</p>
 
     <p>ClickPrompt (clickprompt.app) is a teleprompter for recording videos,
     operated by Lagniappe Ventures Ltd, a Nevada series limited liability company ("we", "us"). This policy explains what we
@@ -62,11 +63,16 @@
       also processes IP addresses and basic request data to deliver the site
       and protect it from abuse.</li>
       <li><strong>Purchase information.</strong> ClickPrompt Pro is sold
-      through <a href="https://www.lemonsqueezy.com" rel="noopener">Lemon Squeezy</a>, our merchant of record. Lemon Squeezy collects your name,
-      email, billing details, and payment information. We receive your email
-      and your order or subscription status so we can unlock Pro, manage your
-      subscription, and send account notices such as cancellation and
-      deletion reminders. We never see or store your full card number.</li>
+      through the payment provider used at checkout. Today that is
+      <a href="https://www.lemonsqueezy.com" rel="noopener">Lemon Squeezy</a>,
+      our merchant of record. If Stripe checkout is turned on,
+      <a href="https://stripe.com" rel="noopener">Stripe</a> is the payment
+      processor and Lagniappe Ventures Ltd is the seller. The provider
+      collects your name, email, billing details, and payment information.
+      We receive your email and your order or subscription status so we can
+      unlock Pro, manage your subscription, and send account notices such as
+      cancellation and deletion reminders. We never see or store your full
+      card number.</li>
       <li><strong>Unlock token.</strong> When you check out or redeem an
       access code, the app stores one random unlock token in your browser's
       local storage. Our checkout and redeem APIs link that token to your
@@ -108,10 +114,11 @@
     <h2>Who sees your data</h2>
     <p>Cloudflare (hosting, the script API, Workers AI script generation, and
     storage for your saved library), Lemon Squeezy (payments, taxes, refunds,
-    and license keys), our email delivery provider (only to send account
-    notices to subscribers), and Meta (the Facebook Pixel, which receives a
-    PageView when you load a page so we can measure our ads). We do not sell
-    your data.</p>
+    and license keys, when that checkout is used), Stripe (payments, invoices,
+    and refunds, when Stripe checkout is used), our email delivery provider
+    (only to send account notices to subscribers), and Meta (the Facebook
+    Pixel, which receives a PageView when you load a page so we can measure
+    our ads). We do not sell your data.</p>
 
     <h2>Deletion</h2>
     <p>Delete any saved script or voiceover any time from your library —

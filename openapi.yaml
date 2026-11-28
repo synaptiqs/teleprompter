@@ -12,7 +12,7 @@ info:
     Free tier: script generation is free at 3 scripts/day per visitor, no
     account or key needed. Subscribers get unlimited generations.
     Paid tier (ClickPrompt Pro): saving scripts to a personal library is
-    $4.99/month, $49.99/year, or $129 lifetime via Lemon Squeezy, or free
+    $3.99/month, $29/year, or $59 lifetime via Lemon Squeezy, or free
     for life with an access code. Buyers can also unlock with the license
     key from their purchase email. The interview, the full prompter, recording, and downloads stay
     free forever.
@@ -97,16 +97,19 @@ paths:
   /api/checkout:
     post:
       operationId: startCheckout
-      summary: Start a Lemon Squeezy checkout for script-saving unlock
+      summary: Start a hosted checkout for script-saving unlock
       description: |
-        Creates a Lemon Squeezy hosted checkout for the script-saving
-        unlock (monthly $4.99/mo, yearly $49.99/yr, or lifetime $129
-        one-time) and returns
+        Creates a hosted checkout for the script-saving unlock (monthly
+        $3.99/mo, yearly $29/yr, or lifetime $59 one-time) and returns
         the checkout URL plus the opaque unlock token.
-        The agent must keep the token: the subscription_created webhook matches
-        it back via checkout custom_data, and the agent polls /api/me with it.
-        The user pays Lemon Squeezy (merchant of record) in their browser.
-        Returns 503 until Lemon Squeezy is configured on the worker.
+        The PAYMENT_PROVIDER worker var selects the path: lemonsqueezy
+        (default) or stripe. The agent must keep the token: the verified
+        webhook matches it back via custom_data or metadata, and the agent
+        polls /api/me with it. Optional attribution (utm_source,
+        utm_medium, utm_campaign, utm_content, utm_term, referrer,
+        landing, timestamp) is stored on the checkout when present. The
+        user pays in their browser.
+        Returns 503 until the active provider is configured on the worker.
       requestBody:
         required: false
         content:
@@ -121,7 +124,13 @@ paths:
                   type: string
                   enum: [monthly, yearly, lifetime]
                   default: monthly
-                  description: Plan to check out ($4.99/mo, $49.99/yr, or $129 one-time).
+                  description: Plan to check out ($3.99/mo, $29/yr, or $59 one-time).
+                token:
+                  type: string
+                  description: Existing unlock token. Required for Lemon Squeezy storage add-on plans. On the Stripe path it only prefills a known email.
+                attribution:
+                  type: object
+                  description: Optional first-touch UTM fields stored on the checkout (utm_source, utm_medium, utm_campaign, utm_content, utm_term, referrer, landing, timestamp).
       responses:
         '200':
           description: Checkout created.
@@ -142,6 +151,44 @@ paths:
           description: Could not start checkout.
         '503':
           description: Checkout not configured yet.
+
+  /api/stripe-webhook:
+    post:
+      operationId: stripeWebhook
+      summary: Receive Stripe webhook events
+      description: |
+        Server-to-server only. No CORS. Verifies Stripe-Signature against
+        STRIPE_WEBHOOK_SECRET, and STRIPE_WEBHOOK_SECRET_PREV during
+        rotation. Grants Pro from checkout.session.completed and
+        checkout.session.async_payment_succeeded when payment_status is
+        paid or no_payment_required, and the line-item price matches the
+        env catalog for metadata.plan. customer.subscription.updated and
+        customer.subscription.deleted are the source of truth for
+        subscription status. A full charge.refunded, or
+        charge.dispute.created, ends Pro immediately. Partial refunds
+        keep access. charge.dispute.closed with status won restores Pro
+        only when that dispute revoked it. Pin the endpoint API version
+        to 2025-03-31.basil. Live events are accepted only when
+        STRIPE_SECRET_KEY is a live key (sk_live_ or rk_live_) and
+        STRIPE_ALLOW_LIVE is the exact string "true".
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Stripe event payload.
+      responses:
+        '200':
+          description: Event received.
+        '400':
+          description: Bad signature, missing event id, or event mode refused.
+        '405':
+          description: Method not allowed. Only POST is accepted.
+        '413':
+          description: Payload larger than 1 MB.
+        '503':
+          description: Webhook secret is not configured.
 
   /api/me:
     get:

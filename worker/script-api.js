@@ -31,19 +31,36 @@
  *                               redeem_access_code, start_checkout,
  *                               list_scripts, save_script, delete_script.
  *
- * Paywalled: script SAVING (ClickPrompt Pro) is $4.99/month, $49.99/year,
- * or $129 lifetime via Lemon Squeezy (Synaptiq HQ store, product 1397885),
+ * Paywalled: script SAVING (ClickPrompt Pro) is $3.99/month, $29/year,
+ * or $59 lifetime via Lemon Squeezy (Synaptiq HQ store, product 1397885),
  * or free forever with an access code. Everything else stays free.
+ * Stripe Checkout is also implemented, behind PAYMENT_PROVIDER, in TEST
+ * mode only (see below). The live Worker stays on Lemon Squeezy until
+ * Tyler flips the switch and deploys.
  *
- *   POST /api/checkout          { origin, plan, token? } -> { url, token }
- *                               (Lemon Squeezy hosted checkout; plan is
- *                               "monthly" | "yearly" | "lifetime" |
- *                               "storage250" |
- *                               "storage500" | "storage1000". Storage plans
- *                               are add-ons for existing subscribers and
- *                               need their unlock token. Needs
- *                               LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_STORE_ID,
- *                               and the variant ID for the chosen plan.)
+ *   POST /api/checkout          { origin, plan, token?, attribution? }
+ *                               -> { url, token }
+ *                               plan is "monthly" | "yearly" | "lifetime".
+ *                               Lemon Squeezy also accepts storage add-on
+ *                               plans (storage250/500/1000) for existing
+ *                               subscribers; the Stripe path does not.
+ *                               Optional attribution is {utm_source,
+ *                               utm_medium, utm_campaign, utm_content,
+ *                               utm_term, referrer, landing, timestamp},
+ *                               each sanitized, for first-touch UTM
+ *                               from a sibling branch. PAYMENT_PROVIDER
+ *                               chooses the path (default lemonsqueezy):
+ *                                 lemonsqueezy: hosted LS checkout; needs
+ *                                 LEMONSQUEEZY_API_KEY, STORE_ID, and the
+ *                                 variant ID for the chosen plan.
+ *                                 stripe: Stripe Checkout Session via REST
+ *                                 (no SDK). Needs STRIPE_SECRET_KEY
+ *                                 (sk_test_... unless STRIPE_ALLOW_LIVE=true,
+ *                                 which only Tyler sets) and the price ID
+ *                                 for the plan. Test catalog: monthly
+ *                                 $3.99/month, yearly $29, lifetime $59
+ *                                 (payment mode). Success/cancel URLs are
+ *                                 on https://clickprompt.app.
  *   POST /api/webhook           Lemon Squeezy webhook events, verified with
  *                               LEMONSQUEEZY_WEBHOOK_SECRET (HMAC-SHA256 of
  *                               the raw body in the X-Signature header).
@@ -59,6 +76,39 @@
  *                               Cancellation starts the deletion sequence:
  *                               3 emails over 10 business days, then the
  *                               hard-delete cron removes everything.
+ *   POST /api/stripe-webhook    Stripe webhook events, verified with
+ *                               STRIPE_WEBHOOK_SECRET (HMAC-SHA256 of
+ *                               "timestamp.payload" in Stripe-Signature,
+ *                               with a 5-minute timestamp tolerance).
+ *                               checkout.session.completed unlocks Pro
+ *                               the same way order_created /
+ *                               subscription_created do: KV record at
+ *                               sub:<hex>, status "active" or "lifetime".
+ *                               customer.subscription.updated and
+ *                               customer.subscription.deleted keep that
+ *                               record in sync (cancel keeps Pro until
+ *                               current_period_end, then the same
+ *                               deletion sequence). Grants only when
+ *                               payment_status is "paid" or
+ *                               "no_payment_required". Also handles
+ *                               checkout.session.async_payment_succeeded
+ *                               (grant) and async_payment_failed (no
+ *                               grant, no revoke). Refunds and disputes
+ *                               (full charge.refunded, and
+ *                               charge.dispute.created) end Pro now, in
+ *                               line with the refund policy. Partial
+ *                               refunds keep access. A won or
+ *                               warning_closed charge.dispute.closed
+ *                               restores Pro when that dispute revoked
+ *                               it, or applies a deferred checkout grant
+ *                               if the paid session was skipped because
+ *                               the dispute was already open. Any other
+ *                               closed status, including lost or an
+ *                               unknown value, leaves access ended and
+ *                               starts the deletion clock. Live events
+ *                               are accepted only when the secret key is
+ *                               sk_live_ and STRIPE_ALLOW_LIVE is the
+ *                               exact string "true".
  *   GET  /api/me?token=...     -> { unlocked, via } where via is
  *                               "subscription" | "lifetime" | "code" | null.
  *   POST /api/redeem            { code } -> { unlocked, token, via }.
@@ -120,9 +170,13 @@
  *   redeemthrottle:<10min>:<ip> -> redeem attempt count (20-min TTL)
  *   sub:<hex>             -> { status, ls_subscription_id, email?,
  *                              storage_tier_gb?, cancel_pending?, ends_at?,
- *                              delete_at?, deleted?, source?, updated_at }
+ *                              delete_at?, deleted?, source?, updated_at,
+ *                              stripe_subscription_id?, stripe_session_id?,
+ *                              provider? }
  *   lssub:<lsSubId>       -> <hex>  (reverse map for later webhook events,
  *                              which may not carry custom_data)
+ *   stripesub:<subId>     -> <hex>  (same reverse map for Stripe
+ *                              subscription events)
  *   evt:<event_id>        -> { at }  (webhook idempotency; LS signs no
  *                              timestamp, so replays are deduped by id)
  *   scripts:<sha256(token)> -> [ { id, title, body, updatedAt } ]
@@ -151,16 +205,28 @@
  *                              email provider is configured)
  *   ev:<YYYY-MM-DD>:<event> -> analytics counter (90-day TTL)
  *
- * Secrets (set via the Workers API):
+ * Secrets and vars (set via the Workers API; never commit values):
+ *   PAYMENT_PROVIDER (var): "lemonsqueezy" | "stripe". Default
+ *     lemonsqueezy, so the live site does not change until Tyler
+ *     flips this and deploys.
  *   LEMONSQUEEZY_API_KEY, LEMONSQUEEZY_WEBHOOK_SECRET,
  *   LEMONSQUEEZY_STORE_ID (Synaptiq HQ, 485773),
- *   LEMONSQUEEZY_VARIANT_ID (Pro Monthly $4.99),
- *   LEMONSQUEEZY_VARIANT_ID_ANNUAL (Pro Annual $49.99; _YEARLY also accepted),
- *   LEMONSQUEEZY_VARIANT_ID_LIFETIME (Pro Lifetime $129 one-time),
+ *   LEMONSQUEEZY_VARIANT_ID (Pro Monthly; $3.99/month is set in Tyler's
+ *     Lemon Squeezy dashboard, not in this code),
+ *   LEMONSQUEEZY_VARIANT_ID_ANNUAL (Pro Annual $29/year; _YEARLY also accepted),
+ *   LEMONSQUEEZY_VARIANT_ID_LIFETIME (Pro Lifetime $59 one-time),
  *   LEMONSQUEEZY_PRODUCT_ID (optional; Pro product for license-key checks,
  *     defaults to 1397885),
  *   LEMONSQUEEZY_STORAGE_TIERS (JSON map variantId -> GB, e.g.
  *     {"123":250,"124":500,"125":1000}),
+ *   STRIPE_SECRET_KEY (test key starting with sk_test_; live sk_live_
+ *     keys are refused unless STRIPE_ALLOW_LIVE=true, which only Tyler
+ *     sets),
+ *   STRIPE_WEBHOOK_SECRET (whsec_... from the Stripe test webhook),
+ *   STRIPE_WEBHOOK_SECRET_PREV (optional previous secret, for rotation),
+ *   STRIPE_PRICE_ID_MONTHLY, STRIPE_PRICE_ID_YEARLY (or _ANNUAL),
+ *     STRIPE_PRICE_ID_LIFETIME (confirmed prices $3.99 / $29 / $59),
+ *   STRIPE_ALLOW_LIVE (optional; only Tyler may set this to "true"),
  *   EMAIL_API_KEY + EMAIL_FROM (optional; without them, deletion emails
  *     are logged to KV instead of sent — wire a provider before launch)
  *
@@ -458,6 +524,2742 @@ async function lemonPost(apiKey, path, payload) {
     throw err;
   }
   return data;
+}
+
+
+// ---- payment provider switch ----
+// Default is Lemon Squeezy so the live Worker does not change until
+// Tyler sets PAYMENT_PROVIDER=stripe and deploys. Unknown values also
+// fall back to Lemon Squeezy.
+
+function paymentProvider(env) {
+  var raw = String((env && env.PAYMENT_PROVIDER) || "").trim().toLowerCase();
+  if (raw === "stripe") return "stripe";
+  return "lemonsqueezy";
+}
+
+// Keep referrer as a hostname only, and landing as a path only, so
+// query strings never land in Stripe metadata.
+function attributionHost(value) {
+  var raw = clean(String(value || ""), 200);
+  if (!raw) return "";
+  var url;
+  try {
+    url = new URL(raw);
+  } catch (e) {
+    try { url = new URL("https://" + raw); } catch (e2) { return ""; }
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+  return url.hostname.toLowerCase();
+}
+
+function attributionPath(value) {
+  var raw = clean(String(value || ""), 200);
+  if (!raw) return "";
+  var url;
+  try {
+    url = new URL(raw);
+  } catch (e) {
+    if (raw.charAt(0) === "/") {
+      try { url = new URL("https://clickprompt.app" + raw); } catch (e2) { return ""; }
+    } else {
+      return "";
+    }
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+  return url.pathname || "/";
+}
+
+// One sanitizer for POST /api/checkout attribution. Accepts the PR #14
+// client shape (utm_source, utm_medium, utm_campaign, utm_content,
+// utm_term, referrer, landing, timestamp) and the shorter aliases.
+// UTM values may only use [A-Za-z0-9_.:/-]. Mapped keys become
+// Stripe metadata attr_source, attr_medium, and so on. A later rebase
+// onto #14 can replace this function with that PR's sanitizer.
+var ATTRIBUTION_UTM_MAP = {
+  utm_source: "source",
+  utm_medium: "medium",
+  utm_campaign: "campaign",
+  utm_content: "content",
+  utm_term: "term",
+  source: "source",
+  medium: "medium",
+  campaign: "campaign",
+  content: "content",
+  term: "term"
+};
+var ATTRIBUTION_UTM_CHARS = /^[A-Za-z0-9_.:/-]+$/;
+
+function sanitizeAttribution(input) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  var out = {};
+  Object.keys(ATTRIBUTION_UTM_MAP).forEach(function (k) {
+    if (input[k] == null) return;
+    var v = clean(String(input[k]), 200);
+    if (!v || !ATTRIBUTION_UTM_CHARS.test(v)) return;
+    out[ATTRIBUTION_UTM_MAP[k]] = v;
+  });
+  var referrer = attributionHost(input.referrer);
+  if (referrer) out.referrer = referrer;
+  var landing = attributionPath(input.landing);
+  if (landing) out.landing = landing;
+  var ts = input.timestamp != null ? input.timestamp : input.ts;
+  if (ts != null) {
+    var tsv = clean(String(ts), 200);
+    if (tsv && ATTRIBUTION_UTM_CHARS.test(tsv)) out.timestamp = tsv;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function applyAttribution(target, attribution, prefix) {
+  if (!attribution) return target;
+  prefix = prefix || "attr_";
+  Object.keys(attribution).forEach(function (k) {
+    target[prefix + k] = attribution[k];
+  });
+  return target;
+}
+
+// ---- Stripe REST (raw fetch; no SDK in Workers) ----
+// Test-mode only unless Tyler sets STRIPE_ALLOW_LIVE=true.
+
+var STRIPE_API = "https://api.stripe.com/v1";
+var STRIPE_API_VERSION = "2025-03-31.basil";
+var STRIPE_SIGNATURE_TOLERANCE_SEC = 300;
+var STRIPE_REQUEST_TIMEOUT_MS = 15000;
+var STRIPE_WEBHOOK_BUDGET_MS = 9000;
+var STRIPE_WEBHOOK_MAX_BYTES = 1048576;
+var STRIPE_EVENT_TTL_SEC = 60 * 86400;
+var STRIPE_LOOKUP_ID_MAX = 255;
+var STRIPE_INVOICE_PAYMENTS_PAGE_LIMIT = 100;
+var STRIPE_INVOICE_PAYMENTS_MAX_PAGES = 5;
+var STRIPE_LATEST_CHARGE_PI_LOOKUP_MAX = 10;
+
+var PLAN_PRICE_ENV = {
+  monthly: "STRIPE_PRICE_ID_MONTHLY",
+  yearly: ["STRIPE_PRICE_ID_YEARLY", "STRIPE_PRICE_ID_ANNUAL"],
+  lifetime: "STRIPE_PRICE_ID_LIFETIME",
+};
+
+function planPriceId(env, plan) {
+  var names = [].concat(PLAN_PRICE_ENV[plan] || []);
+  for (var i = 0; i < names.length; i++) {
+    var v = String(env[names[i]] || "").trim();
+    if (v) return v;
+  }
+  return "";
+}
+
+var STRIPE_ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/g;
+
+// Read the Stripe secret, trimming whitespace and dropping zero-width
+// characters. If hidden characters were present, the key is refused.
+function readStripeSecretKey(env) {
+  var raw = String((env && env.STRIPE_SECRET_KEY) || "");
+  var trimmed = raw.trim();
+  var stripped = trimmed.replace(STRIPE_ZERO_WIDTH, "");
+  return { key: stripped, hiddenChars: stripped !== trimmed };
+}
+
+// Classify the secret: sk_live_/rk_live_ are live, sk_test_/rk_test_
+// are test, and any other prefix is invalid and fails closed.
+function stripeKeyMode(env) {
+  var got = readStripeSecretKey(env);
+  if (got.hiddenChars || !got.key) return "invalid";
+  if (got.key.indexOf("sk_live_") === 0 || got.key.indexOf("rk_live_") === 0) return "live";
+  if (got.key.indexOf("sk_test_") === 0 || got.key.indexOf("rk_test_") === 0) return "test";
+  return "invalid";
+}
+
+// Refuse to call Stripe if the secret is a live key, unless Tyler has
+// explicitly set STRIPE_ALLOW_LIVE=true. Unknown prefixes and hidden
+// characters fail closed. The key itself is never logged or returned
+// in an error. A live-key refusal is warned with no value.
+function assertStripeTestMode(env) {
+  var got = readStripeSecretKey(env);
+  var mode = stripeKeyMode(env);
+  if (mode === "invalid") {
+    if (got.hiddenChars) {
+      try { console.warn("stripe secret key refused"); } catch (e) {}
+    }
+    throw ApiError(503, "Checkout is not configured yet.");
+  }
+  if (mode === "live" && !stripeAllowLive(env)) {
+    try { console.warn("stripe live key refused"); } catch (e) {}
+    throw ApiError(
+      503,
+      "Stripe live keys are refused unless STRIPE_ALLOW_LIVE=true. Only Tyler sets that."
+    );
+  }
+  return got.key;
+}
+
+function stripeAllowLive(env) {
+  return String((env && env.STRIPE_ALLOW_LIVE) || "") === "true";
+}
+
+function stripeKeyIsLive(env) {
+  return stripeKeyMode(env) === "live";
+}
+
+// Read a webhook signing secret, trimming whitespace and dropping
+// zero-width characters. Hidden characters fail closed.
+function readStripeWebhookSecret(secret) {
+  var trimmed = String(secret || "").trim();
+  var stripped = trimmed.replace(STRIPE_ZERO_WIDTH, "");
+  return { secret: stripped, hiddenChars: stripped !== trimmed };
+}
+
+function stripeWebhookSecretOk(secret) {
+  var got = readStripeWebhookSecret(secret);
+  if (got.hiddenChars || !got.secret) return false;
+  return got.secret.indexOf("whsec_") === 0;
+}
+
+// A live event is accepted only when the secret key is live
+// (sk_live_ or rk_live_) and Tyler has set STRIPE_ALLOW_LIVE to the
+// exact string "true". A test event (livemode false) is required when
+// the key is sk_test_ or rk_test_. Any other key mode fails closed.
+function stripeLivemodeAllowed(env, livemode) {
+  var mode = stripeKeyMode(env);
+  if (mode === "invalid") return false;
+  if (livemode === true) return mode === "live" && stripeAllowLive(env);
+  if (livemode === false) return mode === "test";
+  return false;
+}
+
+// Success and cancel URLs always land on clickprompt.app, even if the
+// request origin was a preview host.
+function stripeReturnOrigin(origin) {
+  origin = clean(origin, 120) || "https://clickprompt.app";
+  try {
+    var u = new URL(origin);
+    var host = u.hostname.toLowerCase();
+    if (host === "clickprompt.app" || host === "www.clickprompt.app") {
+      return u.protocol + "//" + u.host;
+    }
+  } catch (e) {}
+  return "https://clickprompt.app";
+}
+
+// Encode Checkout Session fields as application/x-www-form-urlencoded
+// for the Stripe REST API. Empty values are omitted.
+function stripeForm(params) {
+  var body = new URLSearchParams();
+  Object.keys(params).forEach(function (k) {
+    if (params[k] != null && params[k] !== "") body.append(k, String(params[k]));
+  });
+  return body.toString();
+}
+
+// Build the x-www-form-urlencoded body for POST /v1/checkout/sessions.
+// Monthly and yearly are subscriptions; lifetime and storage add-ons are
+// one-time payments. Attribution, when present, is copied into session
+// metadata (and subscription or payment-intent metadata) as attr_* keys.
+function buildStripeCheckoutForm(opts) {
+  var token = opts.token;
+  var plan = opts.plan;
+  var params = {
+    mode: opts.mode,
+    "line_items[0][price]": opts.priceId,
+    "line_items[0][quantity]": "1",
+    "payment_method_types[0]": "card",
+    success_url: opts.origin + "/?checkout=done",
+    cancel_url: opts.origin + "/?checkout=cancel",
+    client_reference_id: token,
+    "metadata[unlock_token]": token,
+    "metadata[plan]": plan,
+  };
+  // Only prefill email when we already have it on the identity.
+  // Never invent an email or take one from the client.
+  if (opts.customerEmail) params.customer_email = opts.customerEmail;
+  if (opts.storageGb) params["metadata[storage_gb]"] = String(opts.storageGb);
+  if (opts.attribution) {
+    Object.keys(opts.attribution).forEach(function (k) {
+      params["metadata[attr_" + k + "]"] = opts.attribution[k];
+    });
+  }
+  if (opts.mode === "subscription") {
+    params["subscription_data[metadata][unlock_token]"] = token;
+    params["subscription_data[metadata][plan]"] = plan;
+    if (opts.attribution) {
+      Object.keys(opts.attribution).forEach(function (k) {
+        params["subscription_data[metadata][attr_" + k + "]"] = opts.attribution[k];
+      });
+    }
+  } else {
+    params["payment_intent_data[metadata][unlock_token]"] = token;
+    params["payment_intent_data[metadata][plan]"] = plan;
+    if (opts.storageGb) {
+      params["payment_intent_data[metadata][storage_gb]"] = String(opts.storageGb);
+    }
+    if (opts.attribution) {
+      Object.keys(opts.attribution).forEach(function (k) {
+        params["payment_intent_data[metadata][attr_" + k + "]"] = opts.attribution[k];
+      });
+    }
+  }
+  return stripeForm(params);
+}
+
+// A webhook may make several Stripe GETs. Cap the total time
+// across those calls at 9 seconds. Tests may lower this via
+// STRIPE_WEBHOOK_BUDGET_MS; any value above 9 seconds is clamped
+// back to 9 seconds. If the budget is already gone, throw a
+// transient 500 so the event is not deduped.
+function stripeWebhookBudgetMs(env) {
+  var budgetMs = Number(env && env.STRIPE_WEBHOOK_BUDGET_MS);
+  if (!isFinite(budgetMs) || budgetMs <= 0) budgetMs = STRIPE_WEBHOOK_BUDGET_MS;
+  if (budgetMs > STRIPE_WEBHOOK_BUDGET_MS) budgetMs = STRIPE_WEBHOOK_BUDGET_MS;
+  return budgetMs;
+}
+
+function stripeWebhookDeadlineAt(env) {
+  var req = env && env._stripeReq;
+  return req && req.deadlineAt ? req.deadlineAt : 0;
+}
+
+function assertStripeWebhookBudget(env) {
+  var deadlineAt = stripeWebhookDeadlineAt(env);
+  if (!deadlineAt) return;
+  if (Date.now() >= deadlineAt) {
+    var err = new Error("Could not process event. Try again.");
+    err.status = 500;
+    err.transient = true;
+    err.deadline = true;
+    throw err;
+  }
+}
+
+function stripeRequestTimeoutMs(env) {
+  var timeoutMs = STRIPE_REQUEST_TIMEOUT_MS;
+  var deadlineAt = stripeWebhookDeadlineAt(env);
+  if (!deadlineAt) return timeoutMs;
+  assertStripeWebhookBudget(env);
+  var remaining = deadlineAt - Date.now();
+  if (remaining < 1) remaining = 1;
+  return remaining < timeoutMs ? remaining : timeoutMs;
+}
+
+function stripeFailClosed(message) {
+  var err = new Error(message || "Stripe object refs do not match.");
+  err.failClosed = true;
+  return err;
+}
+
+function stripeUnresolvedPaymentRetry() {
+  var err = new Error("Could not process event. Try again.");
+  err.status = 500;
+  err.transient = true;
+  return err;
+}
+
+// Only well-formed Stripe ids are sent to GET lookups. The value
+// must start with an expected prefix, use [A-Za-z0-9_] only, and
+// stay within a bounded length. Anything else is skipped and logged.
+function stripeLookupIdOk(id, prefixes) {
+  var s = String(id || "");
+  if (s.length < 3 || s.length > STRIPE_LOOKUP_ID_MAX) return false;
+  if (!/^[A-Za-z0-9_]+$/.test(s)) return false;
+  prefixes = prefixes || [];
+  for (var i = 0; i < prefixes.length; i++) {
+    if (prefixes[i] && s.indexOf(prefixes[i]) === 0) return true;
+  }
+  return false;
+}
+
+function assertStripeLookupId(id, prefixes) {
+  if (stripeLookupIdOk(id, prefixes)) return true;
+  try { console.log("stripe lookup id refused"); } catch (e) {}
+  return false;
+}
+
+// Call the Stripe REST API with the pinned Basil version, an optional
+// idempotency key (session creates only), and a timeout so a hung
+// request fails cleanly. The secret is sent only as a Bearer header
+// and is never logged.
+async function stripeRequest(secret, method, path, formBody, idempotencyKey, env) {
+  var headers = {
+    Authorization: "Bearer " + secret,
+    "Content-Type": "application/x-www-form-urlencoded",
+    "Stripe-Version": STRIPE_API_VERSION,
+  };
+  if (idempotencyKey) headers["Idempotency-Key"] = String(idempotencyKey);
+  var timeoutMs = stripeRequestTimeoutMs(env);
+  var res = await fetch(STRIPE_API + path, {
+    method: method,
+    headers: headers,
+    body: formBody || undefined,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  var data = await res.json().catch(function () { return {}; });
+  if (!res.ok) {
+    var msg = (data.error && data.error.message) || "stripe error";
+    var err = new Error(msg);
+    err.status = res.status;
+    err.stripeCode = data.error && data.error.code;
+    throw err;
+  }
+  return data;
+}
+
+// HMAC-SHA-256 of a message, returned as lowercase hex. Used to
+// verify the Stripe-Signature header. The message may be a string
+// or a Uint8Array of raw body bytes; webhook verification always
+// signs the raw bytes, never a decoded string.
+async function hmacSha256Hex(secret, message) {
+  var key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  var data = message instanceof Uint8Array
+    ? message
+    : new TextEncoder().encode(String(message || ""));
+  var sig = await crypto.subtle.sign("HMAC", key, data);
+  return bytesToHex(new Uint8Array(sig));
+}
+
+// Stripe-Signature header is "t=<unix>,v1=<hex>[,v1=...]". The signed
+// payload is "timestamp.rawBody". Reject signatures older (or newer)
+// than toleranceSec (default 300). nowMs is injectable for tests.
+async function verifyStripeSignature(rawBody, header, secret, nowMs, toleranceSec) {
+  if (!header || !secret) return false;
+  var timestamp = "";
+  var signatures = [];
+  String(header).split(",").forEach(function (part) {
+    var cut = part.indexOf("=");
+    if (cut < 1) return;
+    var k = part.slice(0, cut).trim();
+    var v = part.slice(cut + 1).trim();
+    if (k === "t") timestamp = v;
+    else if (k === "v1") signatures.push(v.toLowerCase());
+  });
+  if (!timestamp || !signatures.length) return false;
+  if (!/^[0-9]+$/.test(timestamp)) return false;
+  var ts = Number(timestamp);
+  if (!ts) return false;
+  var tolerance = (toleranceSec == null ? STRIPE_SIGNATURE_TOLERANCE_SEC : Number(toleranceSec)) * 1000;
+  var now = nowMs == null ? Date.now() : nowMs;
+  if (Math.abs(now - ts * 1000) > tolerance) return false;
+  // Sign timestamp + "." + raw body bytes. If the caller passed a
+  // string (unit tests), encode it as UTF-8; live webhooks pass the
+  // unread-decoded body bytes from readLimitedBody.
+  var bodyBytes = rawBody instanceof Uint8Array
+    ? rawBody
+    : new TextEncoder().encode(String(rawBody || ""));
+  var prefix = new TextEncoder().encode(timestamp + ".");
+  var signed = new Uint8Array(prefix.length + bodyBytes.length);
+  signed.set(prefix, 0);
+  signed.set(bodyBytes, prefix.length);
+  var expected = await hmacSha256Hex(secret, signed);
+  for (var i = 0; i < signatures.length; i++) {
+    if (timingSafeEqual(expected, signatures[i])) return true;
+  }
+  return false;
+}
+
+function stripeSubHex(token) {
+  if (typeof token !== "string") return null;
+  if (token.indexOf("sub:") === 0 && /^[0-9a-f]{32}$/.test(token.slice(4))) {
+    return token.slice(4);
+  }
+  return null;
+}
+
+function stripeStatusFromSubscription(sub) {
+  var status = String((sub && sub.status) || "");
+  if (status === "canceled") return "cancelled";
+  if (status === "trialing") return "on_trial";
+  if (status === "active") {
+    if (sub.cancel_at_period_end) return "cancelled";
+    return "active";
+  }
+  return status || "unknown";
+}
+
+// Billing-period end for a subscription. API version 2025-03-31.basil
+// removed current_period_end from the Subscription object and added it
+// on each SubscriptionItem; see
+// https://docs.stripe.com/changelog/basil/2025-03-31/deprecate-subscription-current-period-start-and-end
+// We still honor a top-level value if an older webhook sends one, then
+// fall back to the latest item current_period_end. cancel_at wins when
+// Stripe will stop access earlier.
+function stripePeriodEndUnix(sub) {
+  var cancelAt = Number((sub && sub.cancel_at) || 0);
+  if (cancelAt) return cancelAt;
+  var top = Number((sub && sub.current_period_end) || 0);
+  if (top) return top;
+  var items = sub && sub.items && sub.items.data;
+  if (!items || !items.length) return 0;
+  var max = 0;
+  for (var i = 0; i < items.length; i++) {
+    var end = Number(items[i] && items[i].current_period_end) || 0;
+    if (end > max) max = end;
+  }
+  return max;
+}
+
+function stripeEndsAt(sub) {
+  var unix = stripePeriodEndUnix(sub);
+  if (!unix) return null;
+  return new Date(unix * 1000).toISOString();
+}
+
+
+// Build and send a Stripe Checkout Session for the chosen plan. Test
+// mode is required unless Tyler sets STRIPE_ALLOW_LIVE to the exact
+// string "true". Client errors stay generic; Stripe's message is
+// logged server-side without the secret or the request body.
+function isStripeCheckoutPlan(plan) {
+  return plan === "monthly" || plan === "yearly" || plan === "lifetime";
+}
+
+async function emailForUnlockToken(env, token) {
+  token = clean(token, 64);
+  if (!env.KV || !token || token.indexOf("sub:") !== 0) return "";
+  var hex = token.slice(4);
+  if (!/^[0-9a-f]{32}$/.test(hex)) return "";
+  var rec = await env.KV.get("sub:" + hex, "json");
+  return clean((rec && rec.email) || "", 120);
+}
+
+// Build and send a Stripe Checkout Session for an exact plan
+// (monthly, yearly, or lifetime). Test mode is required unless
+// Tyler sets STRIPE_ALLOW_LIVE to the exact string "true". Client
+// errors stay generic; Stripe's message is logged server-side
+// without the secret or the request body.
+async function doStripeCheckout(env, origin, plan, existingToken, attribution) {
+  var secret = assertStripeTestMode(env);
+  origin = stripeReturnOrigin(origin);
+
+  // Exact allowlist only. No case folding, no "annual" alias, and no
+  // silent default to monthly. The Lemon Squeezy path is unchanged.
+  if (!isStripeCheckoutPlan(plan)) {
+    throw ApiError(400, "That plan isn't available.");
+  }
+
+  var token = "sub:" + randomHex(16);
+  var priceId = planPriceId(env, plan);
+  var mode = plan === "lifetime" ? "payment" : "subscription";
+  if (!priceId) {
+    throw ApiError(503, "That plan isn't available yet. Try the monthly plan.");
+  }
+
+  var customerEmail = await emailForUnlockToken(env, existingToken);
+
+  var form = buildStripeCheckoutForm({
+    mode: mode,
+    priceId: priceId,
+    origin: origin,
+    token: token,
+    plan: plan,
+    storageGb: 0,
+    attribution: attribution,
+    customerEmail: customerEmail,
+  });
+
+  try {
+    var session = await stripeRequest(secret, "POST", "/checkout/sessions", form, "cp_checkout_" + token);
+  } catch (e) {
+    try {
+      console.log("stripe checkout failed", {
+        status: e && e.status,
+        code: e && e.stripeCode,
+        message: e && e.message,
+      });
+    } catch (ignore) {}
+    throw ApiError(502, "Could not start checkout. Try again.");
+  }
+  if (!session || !session.url) {
+    throw ApiError(502, "Could not start checkout. Try again.");
+  }
+  return { url: session.url, token: token };
+}
+
+// Once a Stripe subscription id is bound to an unlock token, that
+// mapping is permanent. A later metadata.unlock_token that disagrees
+// is ignored (and logged without the token) so a second identity
+// cannot be unlocked.
+async function bindStripeSub(env, stripeSubId, claimedHex) {
+  if (!env.KV || !stripeSubId) return claimedHex || null;
+  var existing = await env.KV.get("stripesub:" + stripeSubId);
+  if (existing) {
+    if (claimedHex && existing !== claimedHex) {
+      try { console.log("stripe unlock_token does not match stored mapping"); } catch (e) {}
+    }
+    return existing;
+  }
+  if (claimedHex) {
+    await env.KV.put("stripesub:" + stripeSubId, claimedHex);
+    return claimedHex;
+  }
+  return null;
+}
+
+async function rememberStripeSub(env, stripeSubId, hex) {
+  return bindStripeSub(env, stripeSubId, hex);
+}
+
+// Store reverse maps from Stripe IDs back to our unlock hex so refund
+// and dispute events can find the identity without extra API calls.
+// When the invoice's payments list is loaded, only paid PIs and
+// charges from that list are bound. Extra paid payments on the
+// same invoice are bound to this hex unless they are already bound
+// to a different one. A PI or charge that is not in that list
+// (for example a field on an invoice.paid event that Basil no
+// longer uses) is not bound. stripe:invpi stays write-once.
+async function rememberStripeIds(env, hex, ids) {
+  if (!env.KV || !hex || !ids) return;
+  if (ids.subscription) await bindStripeSub(env, ids.subscription, hex);
+  if (ids.session) await env.KV.put("stripesession:" + ids.session, hex);
+  var bindPis = [];
+  var bindCharges = [];
+  if (ids.paymentsLoaded) {
+    bindPis = uniqueStripeRefIds(ids.paidPaymentIntents);
+    bindCharges = uniqueStripeRefIds(ids.paidCharges);
+    // If the payments list loaded and has no paid entries, do
+    // not fall back to a PI or charge on the session or event.
+  } else {
+    if (ids.paymentIntent) bindPis = [ids.paymentIntent];
+    if (ids.charge) bindCharges = [ids.charge];
+  }
+  var i;
+  for (i = 0; i < bindPis.length; i++) {
+    await bindStripePaymentRef(env, "stripepi:" + bindPis[i], hex);
+  }
+  for (i = 0; i < bindCharges.length; i++) {
+    await bindStripePaymentRef(env, "stripecharge:" + bindCharges[i], hex);
+  }
+  if (ids.customer) await env.KV.put("stripecust:" + ids.customer, hex);
+  if (ids.invoice) await env.KV.put("stripeinv:" + ids.invoice, hex);
+  if (ids.invoice) {
+    // When the payments list loaded and has no paid entries, leave
+    // stripe:invpi unset. Do not fall back to a session or event PI.
+    var canonicalPi = bindPis[0] || "";
+    if (!ids.paymentsLoaded) canonicalPi = canonicalPi || ids.paymentIntent || "";
+    if (canonicalPi) await rememberStripeInvoicePaymentIntent(env, ids.invoice, canonicalPi);
+  }
+}
+
+function uniqueStripeRefIds(list) {
+  var out = [];
+  if (!list) return out;
+  for (var i = 0; i < list.length; i++) {
+    var id = stripeRefId(list[i]);
+    if (id && out.indexOf(id) === -1) out.push(id);
+  }
+  return out;
+}
+
+// Write a PI or charge mapping if it is free or already points at
+// this hex. Never steal a mapping that belongs to someone else.
+async function bindStripePaymentRef(env, key, hex) {
+  if (!env.KV || !key || !hex) return;
+  var existing = await env.KV.get(key);
+  if (existing && existing !== hex) {
+    try { console.log("stripe payment ref is bound to a different identity"); } catch (e) {}
+    return;
+  }
+  await env.KV.put(key, hex);
+}
+
+// stripe:invpi:<invoice> maps an invoice to its payment_intent so
+// a later invoice-only refund can tombstone the PI. The mapping is
+// write-once: a different PI is refused and logged, and the stored
+// value is kept. It expires after 60 days, matching other pending
+// Stripe keys.
+async function rememberStripeInvoicePaymentIntent(env, invoiceId, paymentIntent) {
+  if (!env.KV || !invoiceId || !paymentIntent) return;
+  var key = "stripe:invpi:" + invoiceId;
+  var existing = await env.KV.get(key);
+  if (existing) {
+    if (existing !== paymentIntent) {
+      try { console.log("stripe invoice payment_intent does not match stored mapping"); } catch (e) {}
+    }
+    return;
+  }
+  await env.KV.put(key, paymentIntent, { expirationTtl: STRIPE_EVENT_TTL_SEC });
+}
+
+function stripeRefId(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && value.id) return String(value.id);
+  return "";
+}
+
+// Look up our unlock hex from IDs on a Stripe object (payment_intent,
+// charge, invoice, subscription, session, or customer). Used for
+// non-revoke events such as invoice.paid. Customer mappings are
+// stored but are not used to revoke access.
+async function hexFromStripeRefs(env, obj) {
+  if (!env.KV || !obj) return null;
+  var meta = obj.metadata || {};
+  var hex = stripeSubHex(meta.unlock_token);
+  if (hex) return hex;
+  var keys = [];
+  var refs = stripeRefsFromObject(obj);
+  var sess = obj.object === "checkout.session" ? String(obj.id || "") : "";
+  var cus = stripeRefId(obj.customer);
+  if (refs.payment_intent) keys.push("stripepi:" + refs.payment_intent);
+  if (refs.charge) keys.push("stripecharge:" + refs.charge);
+  if (refs.invoice) keys.push("stripeinv:" + refs.invoice);
+  if (refs.subscription) keys.push("stripesub:" + refs.subscription);
+  if (sess) keys.push("stripesession:" + sess);
+  if (cus) keys.push("stripecust:" + cus);
+  for (var i = 0; i < keys.length; i++) {
+    var found = await env.KV.get(keys[i]);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Look up our unlock hex for a refund or dispute. Charge,
+// payment_intent, invoice, session, and subscription mappings are
+// used. Customer id is never authoritative for a revoke, so two
+// purchases on the same customer cannot revoke each other.
+async function hexFromStripeRevokeRefs(env, obj) {
+  if (!env.KV || !obj) return null;
+  var keys = [];
+  var refs = stripeRefsFromObject(obj);
+  var sess = stripeRefId(obj.checkout_session) || (obj.object === "checkout.session" ? String(obj.id || "") : "");
+  if (refs.payment_intent) keys.push("stripepi:" + refs.payment_intent);
+  if (refs.charge) keys.push("stripecharge:" + refs.charge);
+  if (refs.invoice) keys.push("stripeinv:" + refs.invoice);
+  if (sess) keys.push("stripesession:" + sess);
+  if (refs.subscription) keys.push("stripesub:" + refs.subscription);
+  for (var i = 0; i < keys.length; i++) {
+    var found = await env.KV.get(keys[i]);
+    if (found) return found;
+  }
+  return null;
+}
+
+// A full refund is a charge with refunded === true, or with
+// amount_refunded at least as large as amount. Partial refunds
+// keep access. When currency is present it must be usd. When
+// currency is missing and amount fields are present, those
+// amounts are compared as usd. When currency and amount fields
+// are all missing, refunded === true is still enough to revoke.
+function isFullStripeRefund(charge) {
+  if (!charge) return false;
+  var currency = String(charge.currency || "").toLowerCase();
+  if (currency && currency !== "usd") return false;
+  var hasAmount = charge.amount != null && charge.amount !== "";
+  var hasRefunded = charge.amount_refunded != null && charge.amount_refunded !== "";
+  if (hasAmount || hasRefunded) {
+    var amount = Number(charge.amount);
+    var refundedAmt = Number(charge.amount_refunded);
+    if (!isFinite(amount) || amount <= 0 || !isFinite(refundedAmt)) return false;
+    return refundedAmt >= amount;
+  }
+  return charge.refunded === true;
+}
+
+async function hexFromStripeSubscription(env, sub, metadata) {
+  var meta = metadata || (sub && sub.metadata) || {};
+  var customToken = meta.unlock_token;
+  var hex = stripeSubHex(customToken);
+  var stripeSubId = String((sub && sub.id) || "");
+  var existing = (env.KV && stripeSubId) ? await env.KV.get("stripesub:" + stripeSubId) : null;
+  if (existing) {
+    if (hex && existing !== hex) {
+      try { console.log("stripe unlock_token does not match stored mapping"); } catch (e) {}
+    }
+    await rememberStripeIds(env, existing, {
+      subscription: stripeSubId,
+      customer: stripeRefId(sub && sub.customer),
+    });
+    return existing;
+  }
+  // Do not bind a new stripesub:<id> here. Only a paid checkout
+  // that already passed payment and catalog checks may create
+  // that mapping. Return the token hex so a later paid bind, or
+  // a cancel/delete against an existing record, can still find
+  // the identity.
+  return hex || null;
+}
+
+function isSubscriberRecord(rec) {
+  if (!rec || !rec.status) return false;
+  return rec.status === "active" || rec.status === "on_trial" || rec.status === "cancelled" || !!rec.cancel_pending || !!rec.stripe_subscription_id || !!rec.ls_subscription_id;
+}
+
+// Ignore an event whose Stripe created timestamp is older than the
+// last applied event on this subscription, and ignore grants after
+// the identity has been deleted. Events that would clear a cancel
+// or restore access also lose on a created-timestamp tie, so a
+// revoke at the same second wins.
+function shouldIgnoreOlderEvent(prev, eventCreated, restoresAccess) {
+  if (!prev) return false;
+  if (prev.deleted) return true;
+  var last = Number(prev.last_event_created) || 0;
+  var incoming = Number(eventCreated) || 0;
+  if (!last || !incoming) return false;
+  if (restoresAccess) return incoming <= last;
+  return incoming < last;
+}
+
+// A full refund, an open or lost dispute, or a deleted subscription
+// is terminal. A later subscription.updated must not restore Pro
+// unless the subscription id is genuinely new.
+function stripeRecordIsTerminal(prev) {
+  if (!prev) return false;
+  if (prev.subscription_deleted) return true;
+  if (prev.status === "refunded" && (prev.revoke_reason === "refund" || prev.revoke_reason === "dispute")) {
+    return true;
+  }
+  return false;
+}
+
+// A subscription id counts as new only when stripesub:<id> is already
+// bound to this hex by a paid checkout.session.completed (payment and
+// catalog checks passed). A missing previous subscription id is not
+// treated as new, so a refunded lifetime cannot be restored by a
+// loose subscription.updated.
+async function isPaidBoundNewSubscription(env, prev, sub, hex) {
+  var incoming = String((sub && sub.id) || "");
+  if (!incoming || !hex || !env.KV) return false;
+  var bound = await env.KV.get("stripesub:" + incoming);
+  if (bound !== hex) return false;
+  var prevId = String((prev && prev.stripe_subscription_id) || "");
+  if (!prevId) return false;
+  return incoming !== prevId;
+}
+
+function stampLastEvent(rec, eventCreated) {
+  var incoming = Number(eventCreated) || 0;
+  if (incoming) rec.last_event_created = incoming;
+  rec.updated_at = Date.now();
+}
+
+// Skip a checkout.session grant when the record is already cancelled,
+// refunded, or deleted, or when a newer event has already been applied.
+function shouldSkipCheckoutGrant(prev, eventCreated) {
+  if (!prev || !prev.status) return false;
+  if (prev.deleted) return true;
+  if (prev.status === "cancelled" || prev.status === "expired" || prev.status === "refunded" || prev.cancel_pending) {
+    return true;
+  }
+  return shouldIgnoreOlderEvent(prev, eventCreated, true);
+}
+
+// Apply a Stripe subscription event to the same KV record shape Lemon
+// Squeezy uses, so resolveUnlock / cancel-keeps-Pro / deletion all work
+// unchanged. Stripe spells it "canceled"; we store "cancelled".
+// Subscription updated/deleted events are the source of truth for status.
+async function applyStripeSubscription(env, sub, eventCreated, eventType) {
+  if (!env.KV || !sub) return;
+  var stripeSubId = String((sub && sub.id) || "");
+  var isDeletedEvent = eventType === "customer.subscription.deleted";
+  // Even when no sub: record exists yet, a deleted subscription id
+  // is tombstoned so a later checkout or subscription grant for
+  // this id is skipped.
+  if (isDeletedEvent && stripeSubId) {
+    await env.KV.put(
+      "stripe:deleted:" + stripeSubId,
+      JSON.stringify({ at: Date.now() }),
+      { expirationTtl: STRIPE_EVENT_TTL_SEC }
+    );
+  }
+  var hex = await hexFromStripeSubscription(env, sub, sub.metadata);
+  if (!hex) return;
+  var subKey = "sub:" + hex;
+  var prev = (await env.KV.get(subKey, "json")) || {};
+  if (prev.deleted) return;
+  var effectiveStatus = stripeStatusFromSubscription(sub);
+  var isCancel = isDeletedEvent || effectiveStatus === "cancelled" || effectiveStatus === "expired";
+  var wouldRestore = !isCancel;
+  // Do not create a grant from subscription.updated or .deleted
+  // unless a paid checkout already bound this subscription id.
+  if (!prev.status) {
+    var paidBound = (env.KV && stripeSubId) ? await env.KV.get("stripesub:" + stripeSubId) : null;
+    if (paidBound !== hex) return;
+  }
+  if (wouldRestore) {
+    if (stripeSubId && (await env.KV.get("stripe:deleted:" + stripeSubId))) return;
+    var resolvedSub = await resolveStripeSubscriptionItems(env, sub);
+    if (!resolvedSub.items) return;
+    sub = resolvedSub.sub || sub;
+    var plan = planFromStripeSubscription(env, sub);
+    if (!stripeSubscriptionItemsMatchCatalog(env, plan, sub)) {
+      try { console.log("stripe subscription items do not match catalog"); } catch (e) {}
+      return;
+    }
+  }
+  if (stripeRecordIsTerminal(prev) && !(await isPaidBoundNewSubscription(env, prev, sub, hex))) return;
+  if (shouldIgnoreOlderEvent(prev, eventCreated, wouldRestore)) return;
+  var rec = {
+    status: effectiveStatus,
+    ls_subscription_id: prev.ls_subscription_id || null,
+    stripe_subscription_id: String(sub.id || prev.stripe_subscription_id || "") || null,
+    email: clean((sub.customer_email || (prev.email || "")), 120) || prev.email || null,
+    storage_tier_gb: prev.storage_tier_gb || 100,
+    cancel_pending: !!prev.cancel_pending,
+    ends_at: stripeEndsAt(sub) || prev.ends_at || null,
+    delete_at: prev.delete_at || null,
+    source: prev.source || "stripe",
+    provider: "stripe",
+    updated_at: Date.now(),
+    subscription_deleted: isDeletedEvent ? true : false,
+    revoke_reason: null,
+    revoke_dispute_id: null,
+  };
+  stampLastEvent(rec, eventCreated);
+  var wasActive = !prev.cancel_pending && (prev.status === "active" || prev.status === "on_trial" || !prev.status);
+  if (isCancel && wasActive) {
+    var accessEndsAt = Math.max(Date.now(), Date.parse(rec.ends_at || "") || 0);
+    var deleteAt = addBusinessDays(accessEndsAt, 10);
+    rec.cancel_pending = true;
+    rec.delete_at = deleteAt;
+    await env.KV.put(subKey, JSON.stringify(rec));
+    try {
+      await scheduleDeletion(env, hex, rec.email, deleteAt, accessEndsAt);
+    } catch (e) {}
+  } else if (!isCancel) {
+    if (rec.cancel_pending) {
+      rec.cancel_pending = false;
+      rec.delete_at = null;
+      try { await cancelDeletion(env, hex); } catch (e) {}
+    }
+    await env.KV.put(subKey, JSON.stringify(rec));
+  } else {
+    await env.KV.put(subKey, JSON.stringify(rec));
+  }
+}
+
+// Collect price ids from an expanded line_items list. Returns null
+// when the list is missing so the caller can fetch it.
+function stripeSessionPriceIds(session) {
+  if (!session || !session.line_items || !Array.isArray(session.line_items.data)) return null;
+  var ids = [];
+  session.line_items.data.forEach(function (item) {
+    var price = item && item.price;
+    var id = typeof price === "string" ? price : (price && price.id) || "";
+    if (id) ids.push(String(id));
+  });
+  return ids;
+}
+
+// True when every line-item price id matches the env catalog price
+// for the given plan. Unknown or mismatched prices grant nothing.
+function stripePricesMatchPlan(env, plan, priceIds) {
+  if (!isStripeCheckoutPlan(plan) || !priceIds || !priceIds.length) return false;
+  var expected = planPriceId(env, plan);
+  if (!expected) return false;
+  for (var i = 0; i < priceIds.length; i++) {
+    if (priceIds[i] !== expected) return false;
+  }
+  return true;
+}
+
+function expectedPlanAmountCents(env, plan) {
+  var names = {
+    monthly: "STRIPE_PRICE_AMOUNT_MONTHLY",
+    yearly: ["STRIPE_PRICE_AMOUNT_YEARLY", "STRIPE_PRICE_AMOUNT_ANNUAL"],
+    lifetime: "STRIPE_PRICE_AMOUNT_LIFETIME",
+  };
+  var keys = [].concat(names[plan] || []);
+  for (var i = 0; i < keys.length; i++) {
+    var raw = String((env && env[keys[i]]) || "").trim();
+    if (!raw) continue;
+    var n = Number(raw);
+    if (isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+// In addition to a matching price id, a grant requires currency usd
+// and quantity 1. When STRIPE_PRICE_AMOUNT_* is set, the line
+// price.unit_amount must be present, must be an integer number
+// (not a string), and must equal that catalog amount in cents.
+// unit_amount is the catalog price, so it is not affected by tax
+// or a promo. amount_total (session or line) is not compared, so
+// a coupon may lower the total, or tax may raise it, and the
+// grant can still succeed when the catalog unit amount matches.
+// When those env vars are unset, only currency and quantity are
+// compared.
+function stripeLineItemsMatchCatalog(env, plan, items) {
+  if (!isStripeCheckoutPlan(plan) || !items || !items.length) return false;
+  var expectedPrice = planPriceId(env, plan);
+  if (!expectedPrice) return false;
+  var expectedAmount = expectedPlanAmountCents(env, plan);
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i] || {};
+    var price = item.price;
+    var priceId = typeof price === "string" ? price : (price && price.id) || "";
+    if (priceId !== expectedPrice) return false;
+    var currency = String(item.currency || (price && price.currency) || "").toLowerCase();
+    if (currency !== "usd") return false;
+    if (Number(item.quantity) !== 1) return false;
+    if (expectedAmount != null) {
+      if (!price || typeof price === "string") return false;
+      if (typeof price.unit_amount !== "number" || !Number.isInteger(price.unit_amount)) return false;
+      if (price.unit_amount !== expectedAmount) return false;
+    }
+  }
+  return true;
+}
+
+function stripeSubscriptionItemList(sub) {
+  if (!sub || !sub.items || !Array.isArray(sub.items.data)) return null;
+  return sub.items.data;
+}
+
+// Derive the plan from catalog price ids on the subscription
+// items. Those ids win when they disagree with metadata.plan, so
+// a plan change is not ignored because stale metadata still names
+// the old plan. Fall back to metadata.plan only when the items do
+// not identify a catalog plan.
+function planFromStripeItemPriceIds(env, items) {
+  var plans = ["monthly", "yearly", "lifetime"];
+  var found = "";
+  items = items || [];
+  for (var i = 0; i < items.length; i++) {
+    var price = items[i] && items[i].price;
+    var priceId = typeof price === "string" ? price : (price && price.id) || "";
+    var matched = "";
+    for (var p = 0; p < plans.length; p++) {
+      if (priceId && planPriceId(env, plans[p]) === priceId) {
+        matched = plans[p];
+        break;
+      }
+    }
+    if (!matched) return "";
+    if (found && found !== matched) return "";
+    found = matched;
+  }
+  return found;
+}
+
+function planFromStripeSubscription(env, sub) {
+  var fromItems = planFromStripeItemPriceIds(env, stripeSubscriptionItemList(sub));
+  if (fromItems) return fromItems;
+  return String((sub && sub.metadata && sub.metadata.plan) || "");
+}
+
+function stripeSubscriptionItemsMatchCatalog(env, plan, sub) {
+  return stripeLineItemsMatchCatalog(env, plan, stripeSubscriptionItemList(sub));
+}
+
+// When a subscription event has no items.data, fetch the subscription
+// so the catalog check can run. A transient fetch error is thrown so
+// the webhook returns 5xx without a dedupe write. A permanent 4xx (or
+// a successful fetch with no items) is a no-op: the update is not
+// applied and is not treated as a catalog mismatch.
+async function resolveStripeSubscriptionItems(env, sub) {
+  var items = stripeSubscriptionItemList(sub);
+  if (items) return { sub: sub, items: items };
+  var sid = sub && sub.id;
+  if (!sid || !assertStripeLookupId(sid, ["sub_"])) return { sub: sub, items: null };
+  var fetched = await fetchStripeResource(env, "/subscriptions/" + encodeURIComponent(sid));
+  if (!fetched) return { sub: sub, items: null };
+  return { sub: fetched, items: stripeSubscriptionItemList(fetched) };
+}
+
+function stripeSessionLineItems(session) {
+  if (!session || !session.line_items || !Array.isArray(session.line_items.data)) return null;
+  return session.line_items.data;
+}
+
+// A failed expand that looks transient (timeout, network error,
+// 429, or 5xx) must not be treated as a price mismatch. The
+// caller skips the dedupe write and returns 500 so Stripe retries.
+// A 4xx other than 429 (for example a 404 for a deleted session)
+// is a permanent miss: the caller logs a mismatch, returns 200,
+// and writes the dedupe key, same as a catalog mismatch. A
+// successful fetch, including one that returns no usable line
+// items, is also a genuine mismatch.
+function isStripeTransientFetchError(err) {
+  var status = Number(err && err.status);
+  if (status === 429) return true;
+  if (status >= 500 && status <= 599) return true;
+  if (status >= 400 && status <= 499) return false;
+  return true;
+}
+
+function isStripeTransientExpandError(err) {
+  return isStripeTransientFetchError(err);
+}
+
+async function resolveStripeSessionLineItems(env, session) {
+  var items = stripeSessionLineItems(session);
+  if (items) return { items: items, amountTotal: session.amount_total };
+  var sid = session && session.id;
+  if (!sid) return { items: [], amountTotal: session && session.amount_total };
+  var got = readStripeSecretKey(env);
+  if (got.hiddenChars || !got.key) {
+    var cfg = new Error("Checkout is not configured yet.");
+    cfg.status = 500;
+    cfg.transient = true;
+    throw cfg;
+  }
+  try {
+    if (!assertStripeLookupId(sid, ["cs_"])) {
+      return { items: [], amountTotal: session && session.amount_total };
+    }
+    var path = "/checkout/sessions/" + encodeURIComponent(sid) + "?expand[]=line_items";
+    var expanded = await fetchStripeResource(env, path);
+    if (!expanded) return { items: [], amountTotal: session && session.amount_total };
+    return {
+      items: stripeSessionLineItems(expanded) || [],
+      amountTotal: expanded.amount_total != null ? expanded.amount_total : (session && session.amount_total),
+    };
+  } catch (e) {
+    if (e && e.failClosed) throw e;
+    if (e && e.deadline) throw e;
+    try { console.log("stripe session expand failed"); } catch (ignore) {}
+    if (!isStripeTransientExpandError(e)) {
+      return { items: [], amountTotal: session && session.amount_total };
+    }
+    var err = new Error("Could not verify checkout price.");
+    err.status = 500;
+    err.transient = true;
+    throw err;
+  }
+}
+
+async function resolveStripeSessionPriceIds(env, session) {
+  var got = await resolveStripeSessionLineItems(env, session);
+  var ids = [];
+  (got.items || []).forEach(function (item) {
+    var price = item && item.price;
+    var id = typeof price === "string" ? price : (price && price.id) || "";
+    if (id) ids.push(String(id));
+  });
+  return ids;
+}
+
+// Grant Pro from a Checkout Session only when payment_status is exactly
+// "paid" or "no_payment_required", metadata.plan is a catalog plan, and
+// every line-item price id matches the env price for that plan. Lifetime
+// is granted only when metadata.plan is "lifetime", and a subscriber
+// record is never overwritten by a lifetime grant.
+// Write a paid Checkout grant to KV. Used by checkout.session.completed
+// and by a later won or warning_closed dispute that applies a deferred
+// grant. email may be null (deferred grants never store email).
+async function writeStripePaidGrant(env, opts) {
+  if (!env.KV || !opts || !opts.hex) return;
+  var hex = opts.hex;
+  var ids = opts.ids || {};
+  var email = opts.email || null;
+  var eventCreated = opts.eventCreated;
+  var mode = opts.mode;
+  var plan = opts.plan;
+  var subKey = "sub:" + hex;
+  var prev = (await env.KV.get(subKey, "json")) || {};
+  if (prev.deleted) return;
+  if (mode === "subscription") {
+    if (stripeRecordIsTerminal(prev)) {
+      if (!ids.subscription || ids.subscription === String(prev.stripe_subscription_id || "")) return;
+    } else if (shouldSkipCheckoutGrant(prev, eventCreated)) {
+      return;
+    }
+    await bindStripeSub(env, ids.subscription, hex);
+    await rememberStripeIds(env, hex, ids);
+    var rec = {
+      status: "active",
+      stripe_subscription_id: ids.subscription || prev.stripe_subscription_id || null,
+      stripe_session_id: ids.session || prev.stripe_session_id || null,
+      email: email || prev.email || null,
+      storage_tier_gb: prev.storage_tier_gb || 100,
+      cancel_pending: false,
+      ends_at: null,
+      delete_at: null,
+      source: "stripe",
+      provider: "stripe",
+      updated_at: Date.now(),
+      subscription_deleted: false,
+      revoke_reason: null,
+      revoke_dispute_id: null,
+      revoke_prior_status: null,
+    };
+    stampLastEvent(rec, eventCreated);
+    try { await cancelDeletion(env, hex); } catch (e) {}
+    await env.KV.put(subKey, JSON.stringify(rec));
+    return;
+  }
+  if (mode === "payment") {
+    if (plan !== "lifetime") return;
+    if (stripeRecordIsTerminal(prev)) {
+      if (ids.session && prev.stripe_session_id && ids.session === prev.stripe_session_id) return;
+    } else {
+      if (shouldSkipCheckoutGrant(prev, eventCreated)) return;
+      if (isSubscriberRecord(prev)) return;
+    }
+    await rememberStripeIds(env, hex, ids);
+    var lifeRec = {
+      status: "lifetime",
+      stripe_session_id: ids.session || "",
+      email: email || prev.email || null,
+      storage_tier_gb: Number(prev.storage_tier_gb) || 100,
+      source: "stripe",
+      provider: "stripe",
+      updated_at: Date.now(),
+      cancel_pending: false,
+      delete_at: null,
+      subscription_deleted: false,
+      revoke_reason: null,
+      revoke_dispute_id: null,
+      revoke_prior_status: null,
+    };
+    stampLastEvent(lifeRec, eventCreated);
+    try { await cancelDeletion(env, hex); } catch (e) {}
+    await env.KV.put(subKey, JSON.stringify(lifeRec));
+  }
+}
+
+async function applyStripeCheckoutSession(env, session, eventCreated) {
+  if (!env.KV || !session) return;
+  if (session.payment_status !== "paid" && session.payment_status !== "no_payment_required") {
+    return;
+  }
+  var meta = session.metadata || {};
+  var plan = String(meta.plan || "");
+  var resolved = await resolveStripeSessionLineItems(env, session);
+  var priceIds = [];
+  (resolved.items || []).forEach(function (item) {
+    var price = item && item.price;
+    var id = typeof price === "string" ? price : (price && price.id) || "";
+    if (id) priceIds.push(String(id));
+  });
+  if (!stripePricesMatchPlan(env, plan, priceIds) || !stripeLineItemsMatchCatalog(env, plan, resolved.items)) {
+    try { console.log("stripe checkout price does not match catalog"); } catch (e) {}
+    return;
+  }
+  var token = meta.unlock_token || session.client_reference_id || "";
+  var email = clean(
+    ((session.customer_details && session.customer_details.email) || session.customer_email || ""),
+    120
+  ) || null;
+  var ids = {
+    session: String(session.id || ""),
+    paymentIntent: stripeRefId(session.payment_intent),
+    customer: stripeRefId(session.customer),
+    invoice: stripeRefId(session.invoice),
+    subscription: typeof session.subscription === "string"
+      ? session.subscription
+      : (session.subscription && session.subscription.id) || "",
+    charge: stripeRefId(session.payment_intent && session.payment_intent.latest_charge) || stripeRefId(session.latest_charge) || stripeRefId(session.charge),
+  };
+  var resolvedRefs = await resolveStripePaymentRefs(env, session);
+  ids.paymentIntent = resolvedRefs.payment_intent || ids.paymentIntent;
+  ids.charge = resolvedRefs.charge || ids.charge;
+  ids.invoice = resolvedRefs.invoice || ids.invoice;
+  ids.subscription = resolvedRefs.subscription || ids.subscription;
+  ids.paidPaymentIntents = resolvedRefs.paid_payment_intents;
+  ids.paidCharges = resolvedRefs.paid_charges;
+  ids.paymentsLoaded = !!resolvedRefs.paymentsLoaded;
+  var claimed = stripeSubHex(token);
+  var existingBind = (env.KV && ids.subscription) ? await env.KV.get("stripesub:" + ids.subscription) : null;
+  if (existingBind && claimed && existingBind !== claimed) {
+    try { console.log("stripe unlock_token does not match stored mapping"); } catch (e) {}
+  }
+  var hex = (session.mode === "subscription") ? (existingBind || claimed) : claimed;
+  if (session.mode === "payment" && plan !== "lifetime") return;
+  if (!hex) return;
+
+  // A paid session can arrive before any Invoice Payment is marked
+  // paid. Return 5xx without granting or writing a dedupe key so
+  // Stripe retries until a paid payment is visible.
+  if (ids.paymentsLoaded) {
+    var paidPis = uniqueStripeRefIds(ids.paidPaymentIntents);
+    var paidCharges = uniqueStripeRefIds(ids.paidCharges);
+    if (!paidPis.length && !paidCharges.length) {
+      try { console.log("stripe invoice payments have no paid entry yet"); } catch (e) {}
+      throw stripeUnresolvedPaymentRetry();
+    }
+  }
+
+  if (ids.subscription && (await env.KV.get("stripe:deleted:" + ids.subscription))) {
+    try { console.log("stripe checkout skipped because the subscription was already deleted"); } catch (e) {}
+    return;
+  }
+  if (await sessionHasRefundTombstone(env, ids)) {
+    try { console.log("stripe checkout skipped because of a refund tombstone"); } catch (e) {}
+    return;
+  }
+  if (await sessionHasBlockingDispute(env, ids)) {
+    // Paid and catalog-ok, but an open dispute arrived first. Store a
+    // deferred grant keyed by payment_intent (and charge/invoice when
+    // present) so a later won or warning_closed close can grant. Signed
+    // ids only; no email or other PII. Refund tombstones do not take
+    // this path.
+    await writePendingStripeGrant(env, ids, {
+      plan: plan,
+      hex: hex,
+      mode: session.mode,
+      created: eventCreated,
+    });
+    try { console.log("stripe checkout deferred because of an open dispute"); } catch (e) {}
+    return;
+  }
+
+  if (session.mode === "subscription" || session.mode === "payment") {
+    await writeStripePaidGrant(env, {
+      hex: hex,
+      ids: ids,
+      mode: session.mode,
+      plan: plan,
+      email: email,
+      eventCreated: eventCreated,
+    });
+  }
+}
+
+// Pending state for out-of-order webhooks. An event that would be a
+// no-op only because its target identity does not exist yet must not
+// be forgotten after a 200 + stripe:evt: write. Full refunds write
+// stripe:refunded:<payment_intent|charge|invoice> (60-day TTL).
+// Disputes write stripe:dispute:<dispute_id> (status + created) and
+// stripe:disputed:<payment_intent|charge|invoice>. A paid checkout
+// skipped because a dispute is already open writes
+// stripe:grant:<payment_intent|charge|invoice> (signed ids only, no
+// email, 60-day TTL). A subscription.deleted with no record writes
+// stripe:deleted:<sub_id> (60-day TTL). A later checkout grant
+// consults those keys. If an event has no identity and no
+// attachable id, the webhook returns 5xx without a dedupe write so
+// Stripe retries.
+function stripeRefsFromObject(obj) {
+  var refs = emptyStripeRefs();
+  if (!obj) return refs;
+  // Basil Invoice objects no longer have payment_intent or charge
+  // fields. Read those from invoice.payments (any paid Invoice
+  // Payment) instead. Top-level leftovers on an invoice are ignored.
+  if (obj.object === "invoice" || (obj.payments && obj.payments.data)) {
+    if (obj.object === "invoice") refs.invoice = String(obj.id || "");
+    else refs.invoice = stripeRefId(obj.invoice) || refs.invoice;
+    refs.subscription = stripeInvoiceSubscription(obj);
+    mergeInvoicePaymentsIntoRefs(refs, obj);
+    return refs;
+  }
+  if (obj.object === "invoice_payment") {
+    mergeInvoicePaymentsIntoRefs(refs, [obj]);
+    return refs;
+  }
+  refs.payment_intent = stripeRefId(obj.payment_intent);
+  if (!refs.payment_intent && obj.object === "payment_intent") refs.payment_intent = String(obj.id || "");
+  refs.charge = stripeRefId(obj.charge) || stripeRefId(obj.latest_charge);
+  if (!refs.charge && obj.payment_intent && typeof obj.payment_intent === "object") {
+    refs.charge = stripeRefId(obj.payment_intent.latest_charge);
+  }
+  if (!refs.charge && obj.object === "charge") refs.charge = String(obj.id || "");
+  refs.invoice = stripeRefId(obj.invoice);
+  if (!refs.invoice && obj.object === "invoice") refs.invoice = String(obj.id || "");
+  refs.subscription = stripeRefId(obj.subscription);
+  if (!refs.subscription && obj.object === "subscription") refs.subscription = String(obj.id || "");
+  return refs;
+}
+
+function emptyStripeRefs() {
+  return {
+    payment_intent: "",
+    charge: "",
+    invoice: "",
+    subscription: "",
+    paid_payment_intents: [],
+    paid_charges: [],
+    paymentsLoaded: false,
+  };
+}
+
+// Basil removed top-level Invoice.subscription. Read the
+// subscription from parent.subscription_details.subscription when
+// parent.type is subscription_details. Fall back to the top-level
+// field only for tolerance of older payloads.
+function stripeInvoiceSubscription(obj) {
+  if (!obj || typeof obj !== "object") return "";
+  if (obj.parent && obj.parent.type === "subscription_details") {
+    var fromParent = stripeRefId(obj.parent.subscription_details && obj.parent.subscription_details.subscription);
+    if (fromParent) return fromParent;
+  }
+  return stripeRefId(obj.subscription);
+}
+
+// payment.charge is set only when payment.type is charge.
+// payment.payment_intent is set when type is payment_intent.
+// If a payment_intent object is expanded, latest_charge may
+// also fill the charge id.
+function stripeInvoicePaymentMethodRefs(payment) {
+  var pay = payment || {};
+  var typ = String(pay.type || "");
+  var pi = "";
+  var ch = "";
+  if (typ === "charge") {
+    ch = stripeRefId(pay.charge);
+  } else if (typ === "payment_intent") {
+    pi = stripeRefId(pay.payment_intent);
+    if (pay.payment_intent && typeof pay.payment_intent === "object") {
+      ch = stripeRefId(pay.payment_intent.latest_charge);
+    }
+  } else {
+    pi = stripeRefId(pay.payment_intent);
+    if (!pi) ch = stripeRefId(pay.charge);
+  }
+  return { payment_intent: pi, charge: ch };
+}
+
+// Collect Invoice Payment objects from an invoice, a list, or an
+// array. Basil exposes these on invoice.payments or on GET
+// /v1/invoice_payments.
+function invoicePaymentEntries(source) {
+  if (!source) return [];
+  if (Array.isArray(source)) return source;
+  if (source.object === "invoice_payment") return [source];
+  if (source.object === "list" && Array.isArray(source.data)) return source.data;
+  if (source.payments && Array.isArray(source.payments.data)) return source.payments.data;
+  return [];
+}
+
+function invoicePaymentsArePresent(source) {
+  if (!source) return false;
+  if (Array.isArray(source)) return true;
+  if (source.object === "invoice_payment") return true;
+  if (source.object === "list" && Array.isArray(source.data)) return true;
+  if (source.payments && Array.isArray(source.payments.data)) return true;
+  return false;
+}
+
+// Ids named on any Invoice Payment (paid or not). A PI or charge
+// listed here is consistent with that invoice, including invoices
+// that have several payments.
+function idsFromInvoicePayments(source) {
+  var entries = invoicePaymentEntries(source);
+  var pis = [];
+  var charges = [];
+  var invoices = [];
+  for (var i = 0; i < entries.length; i++) {
+    var p = entries[i];
+    if (!p || p.object !== "invoice_payment") continue;
+    var ids = stripeInvoicePaymentMethodRefs(p.payment);
+    var pi = ids.payment_intent;
+    var ch = ids.charge;
+    var inv = stripeRefId(p.invoice);
+    if (pi && pis.indexOf(pi) === -1) pis.push(pi);
+    if (ch && charges.indexOf(ch) === -1) charges.push(ch);
+    if (inv && invoices.indexOf(inv) === -1) invoices.push(inv);
+  }
+  return { payment_intents: pis, charges: charges, invoices: invoices };
+}
+
+function mergeInvoicePaymentsIntoRefs(refs, source) {
+  if (!refs || !invoicePaymentsArePresent(source)) return;
+  var entries = invoicePaymentEntries(source);
+  // An empty list from a payment_intent lookup means this PI is
+  // not on an invoice, not that an invoice loaded with no paid
+  // payments. Only mark the list loaded for an invoice object,
+  // invoice.payments, or a non-empty page of invoice payments.
+  var fromInvoice = !!(source && (source.object === "invoice" || source.payments));
+  if (!entries.length && !fromInvoice) return;
+  refs.paymentsLoaded = true;
+  var paidPis = [];
+  var paidCharges = [];
+  var invoiceIds = [];
+  var i;
+  for (i = 0; i < entries.length; i++) {
+    var p = entries[i];
+    if (!p || p.object !== "invoice_payment") continue;
+    var inv = stripeRefId(p.invoice);
+    if (inv && invoiceIds.indexOf(inv) === -1) invoiceIds.push(inv);
+    if (String(p.status || "") !== "paid") continue;
+    var paidIds = stripeInvoicePaymentMethodRefs(p.payment);
+    var pi = paidIds.payment_intent;
+    var ch = paidIds.charge;
+    if (pi && paidPis.indexOf(pi) === -1) paidPis.push(pi);
+    if (ch && paidCharges.indexOf(ch) === -1) paidCharges.push(ch);
+  }
+  for (i = 0; i < paidPis.length; i++) {
+    if (refs.paid_payment_intents.indexOf(paidPis[i]) === -1) refs.paid_payment_intents.push(paidPis[i]);
+  }
+  for (i = 0; i < paidCharges.length; i++) {
+    if (refs.paid_charges.indexOf(paidCharges[i]) === -1) refs.paid_charges.push(paidCharges[i]);
+  }
+  // Bind every paid PI and charge only when they all resolve to
+  // the same invoice. The first paid payment is the canonical
+  // payment_intent / charge used for invpi and lookups.
+  if (invoiceIds.length === 1) {
+    if (!refs.invoice) refs.invoice = invoiceIds[0];
+    if (!refs.payment_intent) refs.payment_intent = refs.paid_payment_intents[0] || "";
+    if (!refs.charge) refs.charge = refs.paid_charges[0] || "";
+  } else if (invoiceIds.length === 0) {
+    if (!refs.payment_intent) refs.payment_intent = refs.paid_payment_intents[0] || "";
+    if (!refs.charge) refs.charge = refs.paid_charges[0] || "";
+  } else if (invoiceIds.length > 1) {
+    refs.paid_payment_intents = [];
+    refs.paid_charges = [];
+  }
+}
+
+function stripePendingRefKeys(prefix, obj) {
+  var keys = [];
+  var refs = sanitizeStripeRefsForStorage(stripeRefsFromObject(obj));
+  if (refs.payment_intent) keys.push(prefix + refs.payment_intent);
+  if (refs.charge) keys.push(prefix + refs.charge);
+  if (refs.invoice) keys.push(prefix + refs.invoice);
+  if (refs.subscription) keys.push(prefix + refs.subscription);
+  return keys;
+}
+
+// Drop lookup ids that fail the allowlist so they are never
+// written into a tombstone, pending-grant, or dispute key.
+function sanitizeStripeRefsForStorage(refs) {
+  var out = copyStripeRefs(refs);
+  if (out.payment_intent && !assertStripeLookupId(out.payment_intent, ["pi_"])) out.payment_intent = "";
+  if (out.charge && !assertStripeLookupId(out.charge, ["ch_", "py_"])) out.charge = "";
+  if (out.invoice && !assertStripeLookupId(out.invoice, ["in_"])) out.invoice = "";
+  if (out.subscription && !assertStripeLookupId(out.subscription, ["sub_"])) out.subscription = "";
+  var paidPis = [];
+  var paidCharges = [];
+  var i;
+  for (i = 0; i < (out.paid_payment_intents || []).length; i++) {
+    if (assertStripeLookupId(out.paid_payment_intents[i], ["pi_"])) paidPis.push(out.paid_payment_intents[i]);
+  }
+  for (i = 0; i < (out.paid_charges || []).length; i++) {
+    if (assertStripeLookupId(out.paid_charges[i], ["ch_", "py_"])) paidCharges.push(out.paid_charges[i]);
+  }
+  out.paid_payment_intents = paidPis;
+  out.paid_charges = paidCharges;
+  return out;
+}
+
+function stripeGetCache(env) {
+  var req = env && env._stripeReq;
+  if (!req) return null;
+  if (!req.cache) req.cache = Object.create(null);
+  return req.cache;
+}
+
+function stripeFetchedLivemodeConflicts(env, fetched) {
+  var req = env && env._stripeReq;
+  if (!req || !fetched || typeof fetched.livemode !== "boolean") return false;
+  if (typeof req.livemode !== "boolean") return false;
+  return fetched.livemode !== req.livemode;
+}
+
+// Each Invoice Payment in a list (or on invoice.payments) must
+// match the event livemode. A mismatch fails closed.
+function assertStripeInvoicePaymentsLivemode(env, source) {
+  var entries = invoicePaymentEntries(source);
+  for (var i = 0; i < entries.length; i++) {
+    if (stripeFetchedLivemodeConflicts(env, entries[i])) {
+      try { console.log("stripe fetched livemode does not match the event"); } catch (ignore) {}
+      throw stripeFailClosed("stripe fetched livemode does not match the event");
+    }
+  }
+}
+
+function expectedStripeObjectType(path) {
+  var p = String(path || "");
+  var q = p.indexOf("?");
+  if (q >= 0) p = p.slice(0, q);
+  if (p.indexOf("/checkout/sessions/") === 0) return "checkout.session";
+  if (p.indexOf("/payment_intents/") === 0) return "payment_intent";
+  if (p.indexOf("/subscriptions/") === 0) return "subscription";
+  if (p.indexOf("/invoices/") === 0) return "invoice";
+  if (p.indexOf("/charges/") === 0) return "charge";
+  if (p.indexOf("/invoice_payments/") === 0) return "invoice_payment";
+  if (p === "/invoice_payments") return "list";
+  return "";
+}
+
+// Fetched objects must have the expected Stripe object type.
+// A wrong type fails closed so we do not grant, revoke, or
+// tombstone from a mismatched resource.
+function assertFetchedStripeObjectType(path, fetched) {
+  if (!fetched) return;
+  var expected = expectedStripeObjectType(path);
+  if (!expected) return;
+  if (String(fetched.object || "") !== expected) {
+    try { console.log("stripe fetched object type does not match"); } catch (ignore) {}
+    throw stripeFailClosed("stripe fetched object type does not match");
+  }
+  if (expected !== "list") return;
+  var data = Array.isArray(fetched.data) ? fetched.data : [];
+  for (var i = 0; i < data.length; i++) {
+    if (data[i] && String(data[i].object || "") !== "invoice_payment") {
+      try { console.log("stripe fetched object type does not match"); } catch (ignore) {}
+      throw stripeFailClosed("stripe fetched object type does not match");
+    }
+  }
+}
+
+// Fetch a Stripe resource for payment-ref resolution. GETs are
+// memoized per webhook event so the same resource is fetched at
+// most once. Transient failures (timeout, network, 429, or 5xx)
+// are rethrown as 500 so the webhook skips the dedupe write. A
+// 4xx other than 429 is a permanent miss for that GET: return
+// null and continue with the refs we have. A refund or dispute
+// that still has no payment_intent and no identity after that
+// miss returns 5xx without a dedupe write, so Stripe retries
+// the event (about 3 days). The invoice or charge id we already
+// had can still be tombstoned. A livemode mismatch or a wrong
+// object type on the fetched resource fails closed.
+async function fetchStripeResource(env, path) {
+  var cache = stripeGetCache(env);
+  if (cache && Object.prototype.hasOwnProperty.call(cache, path)) {
+    var hit = cache[path];
+    if (hit.error) throw hit.error;
+    return hit.data;
+  }
+  assertStripeWebhookBudget(env);
+  var got = readStripeSecretKey(env);
+  if (!got || !got.key || got.hiddenChars) {
+    var cfg = new Error("Could not resolve payment references.");
+    cfg.status = 500;
+    cfg.transient = true;
+    throw cfg;
+  }
+  try {
+    var data = await stripeRequest(got.key, "GET", path, undefined, undefined, env);
+    assertFetchedStripeObjectType(path, data);
+    assertStripeInvoicePaymentsLivemode(env, data);
+    if (stripeFetchedLivemodeConflicts(env, data)) {
+      try { console.log("stripe fetched livemode does not match the event"); } catch (ignore) {}
+      var closed = stripeFailClosed("stripe fetched livemode does not match the event");
+      if (cache) cache[path] = { error: closed };
+      throw closed;
+    }
+    if (cache) cache[path] = { data: data };
+    return data;
+  } catch (e) {
+    if (e && e.failClosed) {
+      if (cache && !Object.prototype.hasOwnProperty.call(cache, path)) cache[path] = { error: e };
+      throw e;
+    }
+    if (e && (e.deadline || e.transient) && e.status === 500 && e.message === "Could not process event. Try again.") throw e;
+    try { console.log("stripe resource lookup failed"); } catch (ignore) {}
+    if (!isStripeTransientFetchError(e)) {
+      if (cache) cache[path] = { data: null };
+      return null;
+    }
+    var err = new Error("Could not resolve payment references.");
+    err.status = 500;
+    err.transient = true;
+    throw err;
+  }
+}
+
+function applyStripeResolvedRefs(obj, refs) {
+  var out = {};
+  if (obj) {
+    Object.keys(obj).forEach(function (k) { out[k] = obj[k]; });
+  }
+  if (refs && refs.payment_intent) out.payment_intent = refs.payment_intent;
+  if (refs && refs.charge) out.charge = refs.charge;
+  if (refs && refs.invoice) out.invoice = refs.invoice;
+  if (refs && refs.subscription) out.subscription = refs.subscription;
+  return out;
+}
+
+function mergeStripeRefsFromSource(refs, source) {
+  if (!refs || !source || typeof source !== "object") return;
+  mergeInvoicePaymentsIntoRefs(refs, source);
+  if (source.object === "invoice" || invoicePaymentsArePresent(source)) {
+    if (!refs.invoice) refs.invoice = source.object === "invoice" ? String(source.id || "") : stripeRefId(source.invoice);
+    if (!refs.subscription) refs.subscription = stripeInvoiceSubscription(source);
+    return;
+  }
+  if (!refs.payment_intent) refs.payment_intent = stripeRefId(source.payment_intent);
+  if (!refs.charge) refs.charge = stripeRefId(source.charge) || stripeRefId(source.latest_charge);
+  if (!refs.invoice) refs.invoice = stripeRefId(source.invoice) || (source.object === "invoice" ? String(source.id || "") : "");
+  if (!refs.subscription) refs.subscription = stripeRefId(source.subscription);
+}
+
+function copyStripeRefs(refs) {
+  return {
+    payment_intent: (refs && refs.payment_intent) || "",
+    charge: (refs && refs.charge) || "",
+    invoice: (refs && refs.invoice) || "",
+    subscription: (refs && refs.subscription) || "",
+    paid_payment_intents: ((refs && refs.paid_payment_intents) || []).slice(),
+    paid_charges: ((refs && refs.paid_charges) || []).slice(),
+    paymentsLoaded: !!(refs && refs.paymentsLoaded),
+  };
+}
+
+// A fetched invoice may list several payments. Any PI or charge
+// named in invoice.payments is consistent with that invoice, so
+// that is not a conflict. Other field disagreements are a
+// conflict: fail closed (200 and dedupe) only when a conflicting
+// id is already bound to a different hex; otherwise return 5xx
+// without a dedupe write so Stripe retries.
+function stripeFetchedRefsDisagree(original, fetched) {
+  if (!original || !fetched) return false;
+  var got = stripeRefsFromObject(fetched);
+  var listed = idsFromInvoicePayments(fetched);
+  var fields = ["payment_intent", "charge", "invoice", "subscription"];
+  for (var i = 0; i < fields.length; i++) {
+    var key = fields[i];
+    if (!original[key] || !got[key] || original[key] === got[key]) continue;
+    if (key === "payment_intent" && listed.payment_intents.indexOf(original[key]) !== -1) continue;
+    if (key === "charge" && listed.charges.indexOf(original[key]) !== -1) continue;
+    return true;
+  }
+  return false;
+}
+
+async function stripeEventHomeHex(env, original) {
+  if (!env || !env.KV || !original) return null;
+  var home = null;
+  if (original.payment_intent) home = await env.KV.get("stripepi:" + original.payment_intent);
+  if (!home && original.charge) home = await env.KV.get("stripecharge:" + original.charge);
+  if (!home && original.invoice) home = await env.KV.get("stripeinv:" + original.invoice);
+  if (!home && original.subscription) home = await env.KV.get("stripesub:" + original.subscription);
+  return home || null;
+}
+
+// Fail closed when any fetched id, including a PI or charge on
+// invoice.payments, is already bound to a hex other than the
+// event's home hex. This still applies when the event's own
+// payment_intent is unbound: a fetched payment bound to someone
+// else must not grant, revoke, or tombstone that identity.
+async function stripeConflictingIdBoundToOtherHex(env, original, fetched) {
+  if (!env || !env.KV || !fetched) return false;
+  // Home is only the event's own payment_intent or charge. If that
+  // payment is already bound, foreign fetched refs are dropped
+  // later and the event still applies to that home hex. Fail
+  // closed only when those event ids are unbound and fetched refs
+  // already belong to someone else.
+  var home = null;
+  if (original && original.payment_intent) {
+    home = await env.KV.get("stripepi:" + original.payment_intent);
+  }
+  if (!home && original && original.charge) {
+    home = await env.KV.get("stripecharge:" + original.charge);
+  }
+  if (home) return false;
+  var fetchedRefs = stripeRefsFromObject(fetched);
+  var ids = [
+    [fetchedRefs.payment_intent, "stripepi:"],
+    [fetchedRefs.charge, "stripecharge:"],
+    [fetchedRefs.invoice, "stripeinv:"],
+    [fetchedRefs.subscription, "stripesub:"],
+  ];
+  var listed = idsFromInvoicePayments(fetched);
+  var i;
+  for (i = 0; i < listed.payment_intents.length; i++) ids.push([listed.payment_intents[i], "stripepi:"]);
+  for (i = 0; i < listed.charges.length; i++) ids.push([listed.charges[i], "stripecharge:"]);
+  for (i = 0; i < listed.invoices.length; i++) ids.push([listed.invoices[i], "stripeinv:"]);
+  var uniqueBound = [];
+  for (i = 0; i < ids.length; i++) {
+    var id = ids[i][0];
+    if (!id) continue;
+    var bound = await env.KV.get(ids[i][1] + id);
+    if (bound && uniqueBound.indexOf(bound) === -1) uniqueBound.push(bound);
+  }
+  if (uniqueBound.length === 0) return false;
+  if (uniqueBound.length > 1) return true;
+  // Bind-then: the event's own unbound PI or charge is a paid
+  // payment on an invoice already bound to this buyer, and every
+  // bound fetched id is that same hex.
+  var invoiceHex = null;
+  for (i = 0; i < listed.invoices.length; i++) {
+    var invBound = await env.KV.get("stripeinv:" + listed.invoices[i]);
+    if (invBound) {
+      invoiceHex = invBound;
+      break;
+    }
+  }
+  var eventPiInList = !!(original && original.payment_intent
+    && listed.payment_intents.indexOf(original.payment_intent) !== -1);
+  var eventChInList = !!(original && original.charge
+    && listed.charges.indexOf(original.charge) !== -1);
+  if ((eventPiInList || eventChInList) && invoiceHex && uniqueBound[0] === invoiceHex) {
+    return false;
+  }
+  // Charge lookup: the event names this charge, and the only
+  // bound fetched id is that charge's payment_intent. That is
+  // how a charge-only refund finds the buyer.
+  if (original && original.charge && fetchedRefs.charge === original.charge) {
+    var piHex = fetchedRefs.payment_intent
+      ? await env.KV.get("stripepi:" + fetchedRefs.payment_intent)
+      : null;
+    if (piHex && piHex === uniqueBound[0]) return false;
+  }
+  return true;
+}
+
+async function acceptFetchedStripeObject(env, original, fetched) {
+  if (!fetched) return;
+  if (await stripeConflictingIdBoundToOtherHex(env, original, fetched)) {
+    try { console.log("stripe fetched refs do not match the event"); } catch (e) {}
+    throw stripeFailClosed("stripe fetched refs do not match the event");
+  }
+  if (!stripeFetchedRefsDisagree(original, fetched)) return;
+  // If the event's own PI or charge is already bound, drop foreign
+  // fetched refs later and still apply the event to that home hex.
+  // Do not return 5xx for a field disagreement in that case.
+  var home = null;
+  if (original && original.payment_intent) {
+    home = await env.KV.get("stripepi:" + original.payment_intent);
+  }
+  if (!home && original && original.charge) {
+    home = await env.KV.get("stripecharge:" + original.charge);
+  }
+  if (home) return;
+  var retry = new Error("Could not process event. Try again.");
+  retry.status = 500;
+  retry.transient = true;
+  throw retry;
+}
+
+// After refs are merged, drop any id already bound to a different
+// hex than the event's original payment_intent or charge mapping.
+// Never revoke or tombstone that other identity.
+async function stripeEventRefsSpanIdentities(env, original) {
+  if (!env || !env.KV || !original) return false;
+  var hexes = [];
+  var fields = [
+    [original.payment_intent, "stripepi:"],
+    [original.charge, "stripecharge:"],
+    [original.invoice, "stripeinv:"],
+    [original.subscription, "stripesub:"],
+  ];
+  for (var i = 0; i < fields.length; i++) {
+    var id = fields[i][0];
+    if (!id) continue;
+    var bound = await env.KV.get(fields[i][1] + id);
+    if (bound && hexes.indexOf(bound) === -1) hexes.push(bound);
+  }
+  return hexes.length > 1;
+}
+
+async function dropCrossBoundStripeRefs(env, original, refs) {
+  if (!env || !env.KV || !refs) return refs;
+  var home = null;
+  if (original && original.payment_intent) {
+    home = await env.KV.get("stripepi:" + original.payment_intent);
+  }
+  if (!home && original && original.charge) {
+    home = await env.KV.get("stripecharge:" + original.charge);
+  }
+  var fields = [
+    ["payment_intent", "stripepi:"],
+    ["charge", "stripecharge:"],
+    ["invoice", "stripeinv:"],
+    ["subscription", "stripesub:"],
+  ];
+  for (var i = 0; i < fields.length; i++) {
+    var field = fields[i][0];
+    var id = refs[field];
+    if (!id) continue;
+    var bound = await env.KV.get(fields[i][1] + id);
+    if (!bound) continue;
+    if (home && bound !== home) {
+      try { console.log("stripe resolved ref is bound to a different identity"); } catch (e) {}
+      refs[field] = "";
+      continue;
+    }
+    // When the event's original PI/charge are unbound, keep those
+    // payment refs and any original invoice/sub. Drop a fetched
+    // invoice or subscription that is already bound, unless the
+    // event's own PI or charge is a paid payment on that invoice
+    // (bind-then: this payment already belongs to that buyer).
+    if (!home && (field === "invoice" || field === "subscription")) {
+      var originalId = original && original[field];
+      if (id !== originalId) {
+        var eventOnInvoice = false;
+        if (original && original.payment_intent && (refs.paid_payment_intents || []).indexOf(original.payment_intent) !== -1) {
+          eventOnInvoice = true;
+        }
+        if (original && original.charge && (refs.paid_charges || []).indexOf(original.charge) !== -1) {
+          eventOnInvoice = true;
+        }
+        if (!eventOnInvoice) {
+          try { console.log("stripe resolved ref is bound to a different identity"); } catch (e) {}
+          refs[field] = "";
+        }
+      }
+    }
+  }
+  return refs;
+}
+
+async function fetchStripeInvoiceRefs(env, invoiceId) {
+  if (!assertStripeLookupId(invoiceId, ["in_"])) return null;
+  return fetchStripeResource(env, "/invoices/" + encodeURIComponent(invoiceId) + "?expand[]=payments");
+}
+
+async function fetchStripeChargeRefs(env, chargeId) {
+  if (!assertStripeLookupId(chargeId, ["ch_", "py_"])) return null;
+  return fetchStripeResource(env, "/charges/" + encodeURIComponent(chargeId));
+}
+
+async function fetchStripePaymentIntentRefs(env, paymentIntent) {
+  if (!assertStripeLookupId(paymentIntent, ["pi_"])) return null;
+  return fetchStripeResource(env, "/payment_intents/" + encodeURIComponent(paymentIntent));
+}
+
+// List Invoice Payments with a fixed shape: limit=100, and either
+// invoice= or payment[type]=payment_intent and payment[payment_intent]=.
+// Brackets in those query keys are percent-encoded. The PI or
+// invoice id is allowlisted before it is placed in the query.
+// Pages use starting_after and count against the 9 second budget.
+function stripeInvoicePaymentsListPath(opts) {
+  var parts = ["limit=" + STRIPE_INVOICE_PAYMENTS_PAGE_LIMIT];
+  if (opts && opts.invoice) parts.push("invoice=" + encodeURIComponent(opts.invoice));
+  if (opts && opts.paymentIntent) {
+    parts.push("payment%5Btype%5D=payment_intent");
+    parts.push("payment%5Bpayment_intent%5D=" + encodeURIComponent(opts.paymentIntent));
+  }
+  if (opts && opts.startingAfter && assertStripeLookupId(opts.startingAfter, ["inpay_"])) {
+    parts.push("starting_after=" + encodeURIComponent(opts.startingAfter));
+  }
+  return "/invoice_payments?" + parts.join("&");
+}
+
+function invoicePaymentsListHasPaid(entries) {
+  var list = entries || [];
+  for (var i = 0; i < list.length; i++) {
+    if (list[i] && list[i].object === "invoice_payment" && String(list[i].status || "") === "paid") return true;
+  }
+  return false;
+}
+
+function invoicePaymentsMissNeeded(entries, needed) {
+  if (!needed) return false;
+  var listed = idsFromInvoicePayments(entries);
+  if (needed.payment_intent && listed.payment_intents.indexOf(needed.payment_intent) === -1) return true;
+  if (needed.charge && listed.charges.indexOf(needed.charge) === -1) return true;
+  return false;
+}
+
+function throwIfInvoicePaymentsTruncated(pages, needed) {
+  if (!pages || !pages.truncated) return;
+  var entries = pages.data || [];
+  if (invoicePaymentsMissNeeded(entries, needed) || !invoicePaymentsListHasPaid(entries)) {
+    throw stripeUnresolvedPaymentRetry();
+  }
+}
+
+// Page through invoice.payments or GET /v1/invoice_payments using
+// has_more and starting_after, up to 5 pages of 100. If the cap
+// or budget is hit with has_more still true and a needed PI is
+// still unresolved, or no paid payment is visible, return 5xx
+// without a dedupe write.
+function stripeInvoicePaymentCursorId(entries) {
+  if (!entries || !entries.length) return "";
+  var last = entries[entries.length - 1];
+  var id = last && last.id ? String(last.id) : "";
+  if (!id || !stripeLookupIdOk(id, ["inpay_"])) return "";
+  return id;
+}
+
+async function fetchStripeInvoicePaymentPages(env, opts, needed) {
+  var all = [];
+  var startingAfter = "";
+  var pages = 0;
+  var hasMore = false;
+  var truncated = false;
+  if (opts && opts.seed && invoicePaymentsArePresent(opts.seed)) {
+    var seedEntries = invoicePaymentEntries(opts.seed);
+    assertStripeInvoicePaymentsLivemode(env, seedEntries);
+    all = all.concat(seedEntries);
+    hasMore = !!(opts.seed.has_more || (opts.seed.payments && opts.seed.payments.has_more));
+    if (opts.seed.payments && typeof opts.seed.payments.has_more === "boolean") hasMore = !!opts.seed.payments.has_more;
+    startingAfter = stripeInvoicePaymentCursorId(seedEntries);
+    // A bad or empty last id cannot be used as starting_after.
+    // Stop paging and treat a still-open list as truncated.
+    if (hasMore && !startingAfter) {
+      truncated = true;
+      hasMore = false;
+    }
+    pages = 1;
+  } else {
+    hasMore = true;
+  }
+  while (hasMore) {
+    if (pages >= STRIPE_INVOICE_PAYMENTS_MAX_PAGES) {
+      return { object: "list", data: all, has_more: true, truncated: true };
+    }
+    var path = stripeInvoicePaymentsListPath({
+      invoice: opts && opts.invoice,
+      paymentIntent: opts && opts.paymentIntent,
+      startingAfter: startingAfter,
+    });
+    var page = await fetchStripeResource(env, path);
+    if (!page) break;
+    var entries = invoicePaymentEntries(page);
+    for (var i = 0; i < entries.length; i++) all.push(entries[i]);
+    pages += 1;
+    hasMore = !!page.has_more;
+    startingAfter = stripeInvoicePaymentCursorId(entries);
+    if (hasMore && !startingAfter) {
+      truncated = true;
+      hasMore = false;
+    }
+  }
+  return { object: "list", data: all, has_more: hasMore, truncated: truncated };
+}
+
+async function fetchStripeInvoiceWithPayments(env, invoiceId, original) {
+  var inv = await fetchStripeInvoiceRefs(env, invoiceId);
+  if (!inv) return null;
+  // The invoice expand seed may have has_more. Treat that seed as
+  // incomplete: page first, then compare the event against the
+  // merged pages. Checking the seed alone can disagree with a
+  // session PI that sits on a later page.
+  var pages = await fetchStripeInvoicePaymentPages(env, {
+    invoice: invoiceId,
+    seed: inv.payments || inv,
+    original: original,
+  }, original);
+  throwIfInvoicePaymentsTruncated(pages, original);
+  var out = {};
+  Object.keys(inv).forEach(function (k) { out[k] = inv[k]; });
+  out.payments = { object: "list", data: pages.data, has_more: !!pages.has_more };
+  await acceptFetchedStripeObject(env, original, out);
+  return out;
+}
+
+async function fetchStripeInvoicePaymentsByPaymentIntent(env, paymentIntent, original) {
+  if (!assertStripeLookupId(paymentIntent, ["pi_"])) return null;
+  var pages = await fetchStripeInvoicePaymentPages(env, {
+    paymentIntent: paymentIntent,
+    original: original,
+  }, original && original.payment_intent ? original : { payment_intent: paymentIntent });
+  throwIfInvoicePaymentsTruncated(pages, { payment_intent: paymentIntent });
+  await acceptFetchedStripeObject(env, original, pages);
+  return pages;
+}
+
+// When a PI lookup finds a paid payment on an invoice already
+// bound to this buyer, bind that PI and charge to the same hex
+// so a later refund or dispute can find the identity.
+async function bindStripePaymentsIfInvoiceOwned(env, refs) {
+  if (!env || !env.KV || !refs || !refs.invoice) return;
+  var hex = await env.KV.get("stripeinv:" + refs.invoice);
+  if (!hex && refs.subscription) hex = await env.KV.get("stripesub:" + refs.subscription);
+  if (!hex) return;
+  var pis = refs.paid_payment_intents || [];
+  var charges = refs.paid_charges || [];
+  var i;
+  for (i = 0; i < pis.length; i++) {
+    await bindStripePaymentRef(env, "stripepi:" + pis[i], hex);
+  }
+  for (i = 0; i < charges.length; i++) {
+    await bindStripePaymentRef(env, "stripecharge:" + charges[i], hex);
+  }
+}
+
+async function fillStripeChargesFromPaymentIntents(env, refs, original) {
+  if (!refs) return;
+  // Earlier charges on the PI still revoke through the PI
+  // mapping. latest_charge is not the only refundable charge.
+  var pis = refs.paid_payment_intents && refs.paid_payment_intents.length
+    ? refs.paid_payment_intents
+    : (refs.payment_intent ? [refs.payment_intent] : []);
+  if (!refs.paid_charges) refs.paid_charges = [];
+  var req = env && env._stripeReq;
+  var used = req && typeof req.latestChargeLookups === "number" ? req.latestChargeLookups : 0;
+  var i;
+  for (i = 0; i < pis.length; i++) {
+    if (refs.charge && refs.paid_charges.length >= pis.length) break;
+    var pi = pis[i];
+    if (!pi) continue;
+    if (used >= STRIPE_LATEST_CHARGE_PI_LOOKUP_MAX) break;
+    used += 1;
+    if (req) req.latestChargeLookups = used;
+    var fetchedPi = await fetchStripePaymentIntentRefs(env, pi);
+    if (!fetchedPi) continue;
+    var ch = stripeRefId(fetchedPi.latest_charge);
+    if (ch) {
+      var paymentHome = null;
+      if (original && original.payment_intent) {
+        paymentHome = await env.KV.get("stripepi:" + original.payment_intent);
+      }
+      if (!paymentHome && original && original.charge) {
+        paymentHome = await env.KV.get("stripecharge:" + original.charge);
+      }
+      var chargeHome = await env.KV.get("stripecharge:" + ch);
+      // latest_charge bound to another buyer, and the event's own
+      // PI or charge is unbound: fail closed.
+      if (chargeHome && !paymentHome) {
+        try { console.log("stripe fetched refs do not match the event"); } catch (e) {}
+        throw stripeFailClosed("stripe fetched refs do not match the event");
+      }
+      if (chargeHome && paymentHome && chargeHome !== paymentHome) {
+        try { console.log("stripe resolved ref is bound to a different identity"); } catch (e) {}
+        continue;
+      }
+      if (!refs.charge) refs.charge = ch;
+      if (refs.paid_charges.indexOf(ch) === -1) refs.paid_charges.push(ch);
+    }
+  }
+}
+
+// Canonical payment refs (payment_intent, charge, invoice,
+// subscription) for checkout sessions, disputes, and refunds.
+// On the pinned Basil API, Invoice no longer has payment_intent
+// or charge, and Charge and PaymentIntent no longer have invoice.
+// Invoice.subscription moved to parent.subscription_details.subscription
+// when parent.type is subscription_details. Invoice to PI or
+// charge: GET /v1/invoices/{id}?expand[]=payments and page
+// /v1/invoice_payments with limit=100 and starting_after.
+// payments.data[].payment is a payment_intent or a charge,
+// depending on payment.type. PI or charge to invoice: GET the
+// charge first when we only have a charge, then page
+// /v1/invoice_payments?payment[type]=payment_intent&payment[payment_intent]={pi}.
+// Webhook payloads use the same Basil shape. Paid payments on
+// the same invoice share the same hex. Do not fetch an invoice
+// solely to fill subscription: a one-time invoice has no
+// subscription. Transient fetch errors are thrown; a permanent
+// 4xx keeps the refs already collected. A fetched object that
+// disagrees with a ref already on the event fails closed only
+// when a conflicting id is already bound to a different hex
+// (including when the event PI is unbound); otherwise the
+// webhook returns 5xx without a dedupe write. Ids bound to a
+// different identity than the event's original PI or charge
+// are dropped.
+async function resolveStripePaymentRefs(env, obj) {
+  var refs = stripeRefsFromObject(obj);
+  var original = copyStripeRefs(refs);
+  if (await stripeEventRefsSpanIdentities(env, original)) {
+    try { console.log("stripe event refs are bound to more than one identity"); } catch (e) {}
+    throw stripeFailClosed("stripe event refs are bound to more than one identity");
+  }
+  mergeStripeRefsFromSource(refs, obj && typeof obj.invoice === "object" ? obj.invoice : null);
+  mergeStripeRefsFromSource(refs, obj && typeof obj.charge === "object" ? obj.charge : null);
+  if (obj && obj.object === "charge") mergeStripeRefsFromSource(refs, obj);
+
+  var fetchedInvoice = false;
+  var fetchedCharge = false;
+  var fetchedInvoicePayments = false;
+
+  if (!refs.payment_intent && refs.invoice && env && env.KV) {
+    var stored = await env.KV.get("stripe:invpi:" + refs.invoice);
+    if (stored) refs.payment_intent = stored;
+  }
+
+  // Fetch the invoice to fill payment_intent or charge from its
+  // payments list, not to look up a subscription on a one-time
+  // invoice. Page through remaining payments when has_more.
+  // Fetch the invoice when its payments list is not already on
+  // the event. Do not refetch just to fill a charge: use GET
+  // /v1/payment_intents/{pi} for latest_charge instead, so an
+  // invoice.paid payload is not mixed with a stored invoice
+  // whose canonical PI is a different paid payment.
+  if (refs.invoice && !refs.paymentsLoaded) {
+    var fetchedInv = await fetchStripeInvoiceWithPayments(env, refs.invoice, original);
+    fetchedInvoice = true;
+    mergeStripeRefsFromSource(refs, fetchedInv);
+  }
+
+  if (refs.charge && (!refs.payment_intent || !refs.invoice)) {
+    var fetchedCh = await fetchStripeChargeRefs(env, refs.charge);
+    fetchedCharge = true;
+    await acceptFetchedStripeObject(env, original, fetchedCh);
+    mergeStripeRefsFromSource(refs, fetchedCh);
+  }
+
+  if (refs.payment_intent && !refs.invoice) {
+    var fetchedPays = await fetchStripeInvoicePaymentsByPaymentIntent(env, refs.payment_intent, original);
+    fetchedInvoicePayments = true;
+    mergeStripeRefsFromSource(refs, fetchedPays);
+  }
+
+  if (!refs.payment_intent && refs.invoice && env && env.KV) {
+    var storedLater = await env.KV.get("stripe:invpi:" + refs.invoice);
+    if (storedLater) refs.payment_intent = storedLater;
+  }
+
+  if (refs.invoice && !refs.paymentsLoaded && !fetchedInvoice) {
+    var fetchedInvLater = await fetchStripeInvoiceWithPayments(env, refs.invoice, original);
+    mergeStripeRefsFromSource(refs, fetchedInvLater);
+  }
+
+  if (refs.charge && (!refs.payment_intent || !refs.invoice) && !fetchedCharge) {
+    var fetchedChLater = await fetchStripeChargeRefs(env, refs.charge);
+    await acceptFetchedStripeObject(env, original, fetchedChLater);
+    mergeStripeRefsFromSource(refs, fetchedChLater);
+  }
+
+  if (refs.payment_intent && !refs.invoice && !fetchedInvoicePayments) {
+    var fetchedPaysLater = await fetchStripeInvoicePaymentsByPaymentIntent(env, refs.payment_intent, original);
+    mergeStripeRefsFromSource(refs, fetchedPaysLater);
+  }
+
+  if ((refs.payment_intent || (refs.paid_payment_intents && refs.paid_payment_intents.length)) && !refs.charge) {
+    await fillStripeChargesFromPaymentIntents(env, refs, original);
+  }
+
+  await dropCrossBoundStripeRefs(env, original, refs);
+  await bindStripePaymentsIfInvoiceOwned(env, refs);
+  return refs;
+}
+
+async function resolveStripeRefundRefs(env, obj) {
+  return resolveStripePaymentRefs(env, obj);
+}
+
+// Write refund tombstones for the given refs. Callers that have
+// already resolved refs should pass them in so this does not
+// resolve (and fetch) a second time in the same webhook.
+async function writeStripeRefundTombstones(env, obj, resolvedRefs) {
+  if (!env.KV || !obj) return [];
+  var resolved = resolvedRefs || await resolveStripePaymentRefs(env, obj);
+  var probe = applyStripeResolvedRefs(obj, resolved);
+  var keys = stripePendingRefKeys("stripe:refunded:", probe);
+  for (var i = 0; i < keys.length; i++) {
+    await env.KV.put(keys[i], JSON.stringify({ at: Date.now() }), { expirationTtl: STRIPE_EVENT_TTL_SEC });
+  }
+  return keys;
+}
+
+// Store a deferred paid checkout so a later won or warning_closed
+// dispute can grant if the session was skipped because a dispute
+// was already open. Keyed by payment_intent, charge, and invoice.
+// Signed ids only; no email or other PII.
+async function writePendingStripeGrant(env, ids, grant) {
+  if (!env.KV || !grant || !grant.hex) return [];
+  var probe = {
+    payment_intent: ids && ids.paymentIntent,
+    charge: ids && ids.charge,
+    invoice: ids && ids.invoice,
+    subscription: ids && ids.subscription,
+  };
+  var keys = stripePendingRefKeys("stripe:grant:", probe);
+  var payload = JSON.stringify({
+    plan: String(grant.plan || ""),
+    hex: String(grant.hex),
+    mode: String(grant.mode || ""),
+    session: (ids && ids.session) || "",
+    subscription: (ids && ids.subscription) || "",
+    payment_intent: (ids && ids.paymentIntent) || "",
+    charge: (ids && ids.charge) || "",
+    invoice: (ids && ids.invoice) || "",
+    created: Number(grant.created) || 0,
+  });
+  for (var i = 0; i < keys.length; i++) {
+    await env.KV.put(keys[i], payload, { expirationTtl: STRIPE_EVENT_TTL_SEC });
+  }
+  return keys;
+}
+
+async function readPendingStripeGrant(env, obj) {
+  if (!env.KV || !obj) return null;
+  var keys = stripePendingRefKeys("stripe:grant:", obj);
+  for (var i = 0; i < keys.length; i++) {
+    var got = await env.KV.get(keys[i], "json");
+    if (got && got.hex) return got;
+  }
+  return null;
+}
+
+async function applyPendingStripeGrant(env, pending, eventCreated) {
+  if (!env.KV || !pending || !pending.hex) return;
+  var ids = {
+    session: pending.session || "",
+    paymentIntent: pending.payment_intent || "",
+    invoice: pending.invoice || "",
+    subscription: pending.subscription || "",
+    charge: pending.charge || "",
+    customer: "",
+  };
+  if (ids.subscription && (await env.KV.get("stripe:deleted:" + ids.subscription))) return;
+  if (await sessionHasRefundTombstone(env, ids)) return;
+  await writeStripePaidGrant(env, {
+    hex: pending.hex,
+    ids: ids,
+    mode: pending.mode,
+    plan: pending.plan,
+    email: null,
+    eventCreated: eventCreated,
+  });
+}
+
+async function writeStripeDisputeRefs(env, dispute, status, eventCreated) {
+  if (!env.KV || !dispute) return [];
+  var keys = stripePendingRefKeys("stripe:disputed:", dispute);
+  var payload = JSON.stringify({
+    status: String(status || ""),
+    created: Number(eventCreated) || 0,
+    dispute_id: String(dispute.id || ""),
+  });
+  for (var i = 0; i < keys.length; i++) {
+    await env.KV.put(keys[i], payload, { expirationTtl: STRIPE_EVENT_TTL_SEC });
+  }
+  return keys;
+}
+
+async function sessionHasRefundTombstone(env, ids) {
+  if (!env.KV || !ids) return false;
+  var probe = {
+    payment_intent: ids.paymentIntent,
+    charge: ids.charge,
+    invoice: ids.invoice,
+    subscription: ids.subscription,
+  };
+  var refundKeys = stripePendingRefKeys("stripe:refunded:", probe);
+  for (var i = 0; i < refundKeys.length; i++) {
+    if (await env.KV.get(refundKeys[i])) return true;
+  }
+  return false;
+}
+
+async function sessionHasBlockingDispute(env, ids) {
+  if (!env.KV || !ids) return false;
+  var probe = {
+    payment_intent: ids.paymentIntent,
+    charge: ids.charge,
+    invoice: ids.invoice,
+    subscription: ids.subscription,
+  };
+  var disputeKeys = stripePendingRefKeys("stripe:disputed:", probe);
+  for (var i = 0; i < disputeKeys.length; i++) {
+    var st = await env.KV.get(disputeKeys[i], "json");
+    if (st && !disputeStatusRestoresAccess(st.status)) return true;
+  }
+  return false;
+}
+
+async function sessionHasOpenDisputeOrRefund(env, ids) {
+  return (await sessionHasRefundTombstone(env, ids)) || (await sessionHasBlockingDispute(env, ids));
+}
+
+async function readStripeDisputeState(env, disputeId) {
+  if (!env.KV || !disputeId) return null;
+  return await env.KV.get("stripe:dispute:" + disputeId, "json");
+}
+
+async function writeStripeDisputeState(env, disputeId, status, eventCreated) {
+  if (!env.KV || !disputeId) return;
+  await env.KV.put(
+    "stripe:dispute:" + disputeId,
+    JSON.stringify({ status: String(status || ""), created: Number(eventCreated) || 0 }),
+    { expirationTtl: STRIPE_EVENT_TTL_SEC }
+  );
+}
+
+function disputeStatusIsClosed(status) {
+  var s = String(status || "");
+  return s === "won" || s === "lost" || s === "warning_closed";
+}
+
+// won and warning_closed restore access. Every other closed
+// status, including lost and any unknown value, takes the lost
+// path (record stays revoked and the deletion clock starts).
+function disputeStatusRestoresAccess(status) {
+  var s = String(status || "");
+  return s === "won" || s === "warning_closed";
+}
+
+// If a refund or dispute cannot be attached to an identity or a
+// payment/charge/invoice id, tell the caller to skip dedupe and
+// return 5xx so Stripe retries.
+function stripePendingNeedsRetry(obj, wroteKeys) {
+  return !(wroteKeys && wroteKeys.length);
+}
+
+// A full refund ends Pro for that purchase now, matching the refund
+// policy. An open dispute pauses Pro but does not start the
+// 10-business-day deletion clock; that clock starts only when the
+// dispute closes lost, or when a full refund arrives while the
+// record is still dispute-paused. A later won close must not undo
+// that refund. Partial refunds do not call this.
+async function applyStripeRevoke(env, obj, eventCreated, reason) {
+  if (!env.KV || !obj) return;
+  var hex = await hexFromStripeRevokeRefs(env, obj);
+  if (!hex) return;
+  var subKey = "sub:" + hex;
+  var prev = (await env.KV.get(subKey, "json")) || {};
+  if (!prev.status || prev.deleted) return;
+  if (prev.status === "refunded" && prev.revoke_reason !== "dispute") return;
+  if (shouldIgnoreOlderEvent(prev, eventCreated, false)) return;
+  var accessEndsAt = Date.now();
+  var deleteAt = addBusinessDays(accessEndsAt, 10);
+  // A full refund of a dispute-paused record retags revoke_reason
+  // to refund and starts the 10-business-day deletion clock, so a
+  // later won or warning_closed close cannot restore access.
+  if (prev.status === "refunded" && prev.revoke_reason === "dispute") {
+    if (reason !== "refund") return;
+    prev.revoke_reason = "refund";
+    prev.delete_at = deleteAt;
+    prev.cancel_pending = true;
+    prev.ends_at = prev.ends_at || new Date(accessEndsAt).toISOString();
+    stampLastEvent(prev, eventCreated);
+    await env.KV.put(subKey, JSON.stringify(prev));
+    try {
+      await scheduleDeletion(env, hex, prev.email, deleteAt, accessEndsAt);
+    } catch (e) {}
+    return;
+  }
+  var rec = {
+    status: "refunded",
+    ls_subscription_id: prev.ls_subscription_id || null,
+    stripe_subscription_id: prev.stripe_subscription_id || null,
+    stripe_session_id: prev.stripe_session_id || null,
+    email: prev.email || null,
+    storage_tier_gb: prev.storage_tier_gb || 100,
+    cancel_pending: true,
+    ends_at: new Date(accessEndsAt).toISOString(),
+    delete_at: deleteAt,
+    source: prev.source || "stripe",
+    provider: prev.provider || "stripe",
+    updated_at: Date.now(),
+    revoke_reason: reason || "refund",
+    revoke_dispute_id: reason === "dispute" ? String(obj.id || prev.revoke_dispute_id || "") || null : null,
+    revoke_prior_status: prev.status,
+  };
+  stampLastEvent(rec, eventCreated);
+  if (reason === "dispute") {
+    rec.delete_at = null;
+    rec.cancel_pending = false;
+    await env.KV.put(subKey, JSON.stringify(rec));
+    return;
+  }
+  await env.KV.put(subKey, JSON.stringify(rec));
+  try {
+    await scheduleDeletion(env, hex, rec.email, deleteAt, accessEndsAt);
+  } catch (e) {}
+}
+
+// Apply a dispute.created event. A created event older than a stored
+// closed event for the same dispute id is ignored, so an out-of-order
+// won close is not overwritten. Open disputes pause Pro but do not
+// start hard deletion.
+async function applyStripeDisputeCreated(env, dispute, eventCreated) {
+  if (!env.KV || !dispute) return { wrotePending: false };
+  var view = applyStripeResolvedRefs(dispute, await resolveStripePaymentRefs(env, dispute));
+  var disputeId = String(view.id || dispute.id || "");
+  var prevState = await readStripeDisputeState(env, disputeId);
+  if (prevState && disputeStatusIsClosed(prevState.status) && Number(prevState.created) >= Number(eventCreated)) {
+    return { wrotePending: true, ignored: true };
+  }
+  if (disputeId) await writeStripeDisputeState(env, disputeId, String(view.status || "open"), eventCreated);
+  var refs = await writeStripeDisputeRefs(env, view, String(view.status || "open"), eventCreated);
+  await applyStripeRevoke(env, view, eventCreated, "dispute");
+  var hex = await hexFromStripeRevokeRefs(env, view);
+  if (!hex) throw stripeUnresolvedPaymentRetry();
+  return { wrotePending: !!(refs.length || hex || disputeId) };
+}
+
+// A won or warning_closed dispute restores Pro when this record
+// was revoked by that same dispute, and only when no refund
+// tombstone exists for the resolved payment refs. If there is no
+// sub: record, apply a deferred checkout grant stored when a paid
+// session was skipped because the dispute was already open. A
+// lost close, or any other or unknown close status, starts the
+// 10-business-day deletion clock and leaves access ended.
+async function applyStripeDisputeClosed(env, dispute, eventCreated) {
+  if (!env.KV || !dispute) return { wrotePending: false };
+  var view = applyStripeResolvedRefs(dispute, await resolveStripePaymentRefs(env, dispute));
+  var disputeId = String(view.id || dispute.id || "");
+  var status = String(view.status || "");
+  var prevState = await readStripeDisputeState(env, disputeId);
+  if (prevState && Number(prevState.created) > Number(eventCreated)) {
+    return { wrotePending: true, ignored: true };
+  }
+  if (disputeId) await writeStripeDisputeState(env, disputeId, status, eventCreated);
+  var refs = await writeStripeDisputeRefs(env, view, status, eventCreated);
+  var hex = await hexFromStripeRevokeRefs(env, view);
+  var refundIds = {
+    paymentIntent: stripeRefId(view.payment_intent),
+    charge: stripeRefId(view.charge) || (view.object === "charge" ? String(view.id || "") : ""),
+    invoice: stripeRefId(view.invoice),
+    subscription: stripeRefId(view.subscription),
+  };
+  if (disputeStatusRestoresAccess(status)) {
+    var restored = false;
+    if (await sessionHasRefundTombstone(env, refundIds)) {
+      try { console.log("stripe dispute close did not restore because of a refund tombstone"); } catch (e) {}
+    } else {
+      if (hex) {
+        var subKey = "sub:" + hex;
+        var prev = (await env.KV.get(subKey, "json")) || {};
+        if (!prev.deleted && prev.revoke_reason === "dispute") {
+          if (!prev.revoke_dispute_id || !disputeId || prev.revoke_dispute_id === disputeId) {
+            if (!shouldIgnoreOlderEvent(prev, eventCreated, true)) {
+              var rec = {
+                status: prev.revoke_prior_status || (prev.stripe_subscription_id ? "active" : "lifetime"),
+                ls_subscription_id: prev.ls_subscription_id || null,
+                stripe_subscription_id: prev.stripe_subscription_id || null,
+                stripe_session_id: prev.stripe_session_id || null,
+                email: prev.email || null,
+                storage_tier_gb: prev.storage_tier_gb || 100,
+                cancel_pending: false,
+                ends_at: prev.revoke_prior_status === "lifetime" ? null : prev.ends_at || null,
+                delete_at: null,
+                source: prev.source || "stripe",
+                provider: prev.provider || "stripe",
+                updated_at: Date.now(),
+                revoke_reason: null,
+                revoke_dispute_id: null,
+                revoke_prior_status: null,
+              };
+              stampLastEvent(rec, eventCreated);
+              try { await cancelDeletion(env, hex); } catch (e) {}
+              await env.KV.put(subKey, JSON.stringify(rec));
+              restored = true;
+            }
+          }
+        }
+      }
+      if (!restored) {
+        var existing = hex ? ((await env.KV.get("sub:" + hex, "json")) || {}) : {};
+        if (!existing.status) {
+          var pending = await readPendingStripeGrant(env, view);
+          if (pending) await applyPendingStripeGrant(env, pending, eventCreated);
+        }
+      }
+    }
+  } else {
+    if (status !== "lost") {
+      try { console.log("stripe dispute closed with unhandled status", status || "(empty)"); } catch (e) {}
+    }
+    if (hex) {
+      var lostKey = "sub:" + hex;
+      var lostPrev = (await env.KV.get(lostKey, "json")) || {};
+      if (lostPrev.status && lostPrev.status !== "refunded" && !lostPrev.deleted) {
+        await applyStripeRevoke(env, view, eventCreated, "refund");
+        lostPrev = (await env.KV.get(lostKey, "json")) || lostPrev;
+      }
+      if (lostPrev.status === "refunded" && !lostPrev.deleted && !lostPrev.delete_at) {
+        if (!lostPrev.revoke_dispute_id || !disputeId || lostPrev.revoke_dispute_id === disputeId) {
+          var accessEndsAt = Date.now();
+          var deleteAt = addBusinessDays(accessEndsAt, 10);
+          lostPrev.delete_at = deleteAt;
+          lostPrev.cancel_pending = true;
+          lostPrev.ends_at = lostPrev.ends_at || new Date(accessEndsAt).toISOString();
+          stampLastEvent(lostPrev, eventCreated);
+          await env.KV.put(lostKey, JSON.stringify(lostPrev));
+          try {
+            await scheduleDeletion(env, hex, lostPrev.email, deleteAt, accessEndsAt);
+          } catch (e) {}
+        }
+      }
+    }
+  }
+  hex = await hexFromStripeRevokeRefs(env, view);
+  if (!hex) throw stripeUnresolvedPaymentRetry();
+  return { wrotePending: !!(refs.length || hex || disputeId) };
+}
+
+// Reject oversized webhook bodies before parsing. Stream with
+// getReader(), count bytes, and cancel as soon as the total exceeds
+// maxBytes, even if Content-Length is missing or lies.
+async function readLimitedBody(request, maxBytes) {
+  function tooBig() {
+    var err = new Error("Payload too large.");
+    err.status = 413;
+    return err;
+  }
+  var len = request.headers.get("Content-Length");
+  if (len !== null && len !== "" && /^\d+$/.test(String(len).trim()) && Number(len) > maxBytes) {
+    if (request.body && typeof request.body.cancel === "function") {
+      try { await request.body.cancel(); } catch (e) {}
+    }
+    throw tooBig();
+  }
+
+  var reader = request.body && typeof request.body.getReader === "function"
+    ? request.body.getReader()
+    : null;
+  var chunks = [];
+  var total = 0;
+  if (reader) {
+    while (true) {
+      var step = await reader.read();
+      if (step.done) break;
+      var value = step.value || new Uint8Array(0);
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel(); } catch (e) {}
+        throw tooBig();
+      }
+      chunks.push(value);
+    }
+  } else {
+    var buf = await request.arrayBuffer();
+    if (buf.byteLength > maxBytes) throw tooBig();
+    chunks.push(new Uint8Array(buf));
+    total = buf.byteLength;
+  }
+
+  var bytes = new Uint8Array(total);
+  var offset = 0;
+  chunks.forEach(function (c) {
+    bytes.set(c, offset);
+    offset += c.byteLength;
+  });
+  return bytes;
+}
+
+// Verify the Stripe signature (current secret, then the previous one
+// during rotation), reject live events unless Tyler has allowed them,
+// then update entitlements. No CORS headers are added by the caller.
+// Bad signatures return 400. Empty event ids are rejected. Dedupe keys
+// use the stripe:evt: prefix and expire after 60 days. A transient
+// failure during processing skips that write and returns 5xx so
+// Stripe retries.
+// Read-then-write race: two deliveries of the same event can both see a
+// miss and both apply. The KV put is last-write-wins, and entitlement
+// writes are meant to be idempotent. A compare-and-swap is not available
+// on this KV binding.
+async function handleStripeWebhook(request, env, cors) {
+  cors = cors || {};
+  if (!stripeWebhookSecretOk(env.STRIPE_WEBHOOK_SECRET)) {
+    return json({ error: "STRIPE_WEBHOOK_SECRET is missing or invalid." }, 503, cors);
+  }
+  if (stripeKeyMode(env) === "invalid") {
+    return json({ error: "Checkout is not configured yet." }, 503, cors);
+  }
+
+  try {
+    var rawBytes = await readLimitedBody(request, STRIPE_WEBHOOK_MAX_BYTES);
+  } catch (e) {
+    if (e && e.status === 413) return json({ error: "Payload too large." }, 413, cors);
+    throw e;
+  }
+  var raw = new TextDecoder("utf-8").decode(rawBytes);
+
+  var sig = request.headers.get("Stripe-Signature");
+  var secrets = [env.STRIPE_WEBHOOK_SECRET, env.STRIPE_WEBHOOK_SECRET_PREV]
+    .map(readStripeWebhookSecret)
+    .filter(function (got) { return !got.hiddenChars && got.secret.indexOf("whsec_") === 0; })
+    .map(function (got) { return got.secret; });
+  var signed = false;
+  for (var i = 0; i < secrets.length; i++) {
+    if (await verifyStripeSignature(rawBytes, sig, secrets[i])) {
+      signed = true;
+      break;
+    }
+  }
+  if (!signed) {
+    return json({ error: "Bad signature." }, 400, cors);
+  }
+
+  var event;
+  try {
+    event = JSON.parse(raw);
+  } catch (e) {
+    return json({ error: "Bad payload." }, 400, cors);
+  }
+  var eventId = String((event && event.id) || "").trim();
+  if (!eventId) {
+    return json({ error: "Missing event id." }, 400, cors);
+  }
+  var eventCreated = Number(event && event.created);
+  if (!isFinite(eventCreated) || eventCreated <= 0) {
+    return json({ error: "Missing event created." }, 400, cors);
+  }
+  if (!stripeLivemodeAllowed(env, event.livemode)) {
+    return json({ error: "Event mode is not allowed." }, 400, cors);
+  }
+  if (!env.KV) return json({ error: "KV is not configured." }, 500, cors);
+
+  var dedupeKey = "stripe:evt:" + eventId;
+  var seen = await env.KV.get(dedupeKey);
+  if (seen) return json({ received: true, duplicate: true }, 200, cors);
+
+  var type = String(event.type || "");
+  var obj = (event.data && event.data.object) || {};
+
+  var budgetMs = stripeWebhookBudgetMs(env);
+  try { env._stripeWebhookBudgetMs = budgetMs; } catch (ignore) {}
+  env = Object.assign({}, env, {
+    _stripeReq: {
+      cache: Object.create(null),
+      deadlineAt: Date.now() + budgetMs,
+      livemode: event.livemode,
+    },
+  });
+
+  // Transient failures during processing (expand timeout, 5xx, 429,
+  // or network errors) must not write the dedupe key, so Stripe can
+  // retry. A fail-closed mismatch is acknowledged and deduped with
+  // no grant, revoke, or tombstone. Only a completed apply,
+  // including a genuine price mismatch, returns 200 and records
+  // the event id.
+  try {
+    if (type === "checkout.session.completed" || type === "checkout.session.async_payment_succeeded") {
+      await applyStripeCheckoutSession(env, obj, eventCreated);
+    } else if (type === "checkout.session.async_payment_failed") {
+      // Neither grant nor revoke. An unpaid or still-pending session
+      // must not unlock Pro, and a failed async payment must not take
+      // away an already-active entitlement.
+    } else if (type === "customer.subscription.updated" || type === "customer.subscription.deleted") {
+      await applyStripeSubscription(env, obj, eventCreated, type);
+    } else if (type === "refund.created") {
+      try { console.log("stripe refund.created ignored"); } catch (e) {}
+    } else if (type === "charge.refunded") {
+      if (isFullStripeRefund(obj)) {
+        var refundRefs = await resolveStripePaymentRefs(env, obj);
+        var refundView = applyStripeResolvedRefs(obj, refundRefs);
+        var refundKeys = await writeStripeRefundTombstones(env, refundView, refundRefs);
+        await applyStripeRevoke(env, refundView, eventCreated, "refund");
+        var refundHex = await hexFromStripeRevokeRefs(env, refundView);
+        // If the refund's PI or charge (or the invoice/charge we
+        // already had) still resolves to no identity, do not ack
+        // the event. Return 5xx without a dedupe write so Stripe
+        // retries within its retry window (about 3 days), in case
+        // a mapping appears. The ids we already had are still
+        // tombstoned.
+        if (!refundHex) {
+          var refundRetry = new Error("Could not process event. Try again.");
+          refundRetry.status = 500;
+          refundRetry.transient = true;
+          throw refundRetry;
+        }
+      }
+    } else if (type === "charge.dispute.created") {
+      var createdOut = await applyStripeDisputeCreated(env, obj, eventCreated);
+      if (!createdOut || !createdOut.wrotePending) {
+        var createdRetry = new Error("Could not process event. Try again.");
+        createdRetry.status = 500;
+        createdRetry.transient = true;
+        throw createdRetry;
+      }
+    } else if (type === "charge.dispute.closed") {
+      var closedOut = await applyStripeDisputeClosed(env, obj, eventCreated);
+      if (!closedOut || !closedOut.wrotePending) {
+        var closedRetry = new Error("Could not process event. Try again.");
+        closedRetry.status = 500;
+        closedRetry.transient = true;
+        throw closedRetry;
+      }
+    } else if (type === "invoice.paid" || type === "invoice.payment_succeeded") {
+      var invRefs = await resolveStripePaymentRefs(env, obj);
+      var invView = applyStripeResolvedRefs(obj, invRefs);
+      var hex = await hexFromStripeRefs(env, invView);
+      if (hex) {
+        await rememberStripeIds(env, hex, {
+          paymentIntent: invRefs.payment_intent,
+          invoice: invRefs.invoice || String(obj.id || ""),
+          charge: invRefs.charge,
+          subscription: invRefs.subscription || stripeInvoiceSubscription(obj),
+          customer: stripeRefId(obj.customer),
+          paidPaymentIntents: invRefs.paid_payment_intents,
+          paidCharges: invRefs.paid_charges,
+          paymentsLoaded: !!invRefs.paymentsLoaded,
+        });
+      }
+    }
+    // All other event types are acknowledged and ignored.
+
+    await env.KV.put(
+      dedupeKey,
+      JSON.stringify({ at: Date.now() }),
+      { expirationTtl: STRIPE_EVENT_TTL_SEC }
+    );
+    return json({ received: true }, 200, cors);
+  } catch (e) {
+    if (e && e.failClosed) {
+      await env.KV.put(
+        dedupeKey,
+        JSON.stringify({ at: Date.now() }),
+        { expirationTtl: STRIPE_EVENT_TTL_SEC }
+      );
+      return json({ received: true }, 200, cors);
+    }
+    try { console.log("stripe webhook processing failed"); } catch (ignore) {}
+    var status = Number(e && e.status) || 500;
+    if (status < 500 || status > 599) status = 500;
+    return json({ error: "Could not process event. Try again." }, status, cors);
+  }
 }
 
 // ---- identity / unlock logic ----
@@ -858,10 +3660,11 @@ async function doGenerate(env, input, request) {
 
 // ---- paywall operations ----
 
-// Pricing (set by Tyler, Oct 2026; supersedes the 2026-09-29 $2.99/$34.99
-// tiers): ClickPrompt Pro is $4.99/month, $49.99/year, or $129 lifetime
-// one-time. All three are variants of product 1397885 in the Synaptiq HQ
-// store; each plan's variant ID comes from the env var in PLAN_VARIANT_ENV.
+// Pricing (confirmed by Tyler, Nov 27, 2026): ClickPrompt Pro is
+// $3.99/month, $29/year, or $59 lifetime one-time. Lemon Squeezy variant
+// prices are set in Tyler's LS dashboard, not in this code. All three
+// are variants of product 1397885 in the Synaptiq HQ store; each plan's
+// variant ID comes from the env var in PLAN_VARIANT_ENV.
 // Storage add-ons (existing subscribers only) raise the 100 GB base quota
 // to 250 GB / 500 GB / 1 TB.
 var PLAN_VARIANT_ENV = {
@@ -899,7 +3702,22 @@ function storageTierGb(env) {
   }
 }
 
-async function doCheckout(env, origin, plan, existingToken) {
+async function doCheckout(env, origin, plan, existingToken, attribution) {
+  // Optional first-touch UTM from the client (same shape the attribution
+  // branch will send). Ignored when missing or invalid.
+  attribution = sanitizeAttribution(attribution);
+  origin = clean(origin, 120) || "https://clickprompt.app";
+  if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
+
+  // Stripe path is off unless PAYMENT_PROVIDER=stripe is set on the Worker.
+  // The plan is checked against the exact allowlist before any cleaning,
+  // so a non-string or unexpected value cannot be coerced into a plan.
+  if (paymentProvider(env) === "stripe") {
+    return doStripeCheckout(env, origin, plan, existingToken, attribution);
+  }
+
+  plan = clean(plan, 20);
+
   if (
     !env.LEMONSQUEEZY_API_KEY ||
     !env.LEMONSQUEEZY_STORE_ID ||
@@ -907,17 +3725,15 @@ async function doCheckout(env, origin, plan, existingToken) {
   ) {
     throw ApiError(503, "Checkout is not configured yet.");
   }
-  origin = clean(origin, 120) || "https://clickprompt.app";
-  if (origin.indexOf("http") !== 0) origin = "https://clickprompt.app";
 
   // Plan -> variant. Monthly is the default ("annual" is accepted as an
   // alias for yearly). Storage add-ons
   // (storage250/500/1000) are for existing subscribers and resolve
   // through STORAGE_PLANS below.
-  plan = clean(plan, 20);
   var variantId;
   var token = "sub:" + randomHex(16);
   var custom = { unlock_token: token };
+  applyAttribution(custom, attribution);
   var storagePlan = STORAGE_PLANS[plan];
   if (storagePlan) {
     existingToken = clean(existingToken, 64);
@@ -1660,12 +4476,15 @@ async function handleGenerate(request, env, cors) {
 }
 
 async function handleCheckout(request, env, cors) {
-  // Creates a Lemon Squeezy checkout for the requested plan (monthly,
-  // lifetime, or a storage add-on) and returns the hosted URL plus the
-  // opaque unlock token. The frontend stores the token BEFORE redirecting;
-  // the subscription_created / order_created webhook matches it back via
-  // checkout custom_data. Storage add-ons pass the subscriber's existing
-  // token so the quota lands on their identity.
+  // Creates a hosted checkout for monthly, yearly, or lifetime and
+  // returns the URL plus the opaque unlock token. PAYMENT_PROVIDER
+  // selects Lemon Squeezy (default) or Stripe. The frontend stores
+  // the token BEFORE redirecting; the webhook matches it back via
+  // custom_data / metadata. Lemon Squeezy also accepts storage
+  // add-on plans, which pass the subscriber's existing token so the
+  // quota lands on their identity. The Stripe path does not offer
+  // storage add-ons. Optional body.attribution is stored on the
+  // checkout.
   var body = {};
   try {
     body = await request.json();
@@ -1673,7 +4492,7 @@ async function handleCheckout(request, env, cors) {
     body = {};
   }
   try {
-    return json(await doCheckout(env, body.origin, body.plan, body.token), 200, cors);
+    return json(await doCheckout(env, body.origin, body.plan, body.token, body.attribution), 200, cors);
   } catch (e) {
     return json({ error: e.message || "Could not start checkout." }, e.status || 500, cors);
   }
@@ -1960,7 +4779,7 @@ var MCP_INSTRUCTIONS =
   "point it must land, target length). Script generation is free: 3 scripts " +
   "per day per visitor, no account needed; subscribers get unlimited. " +
   "Saving scripts to a personal library (ClickPrompt Pro) costs " +
-  "$4.99/month, $49.99/year, or $129 lifetime via Lemon Squeezy, or is " +
+  "$3.99/month, $29/year, or $59 lifetime via Lemon Squeezy, or is " +
   "free for life with an access code the user already owns. A buyer can " +
   "also unlock with the license key from their purchase email. To unlock " +
   "saving: call start_checkout and show " +
@@ -2002,7 +4821,7 @@ var MCP_TOOLS = [
   {
     name: "start_checkout",
     description:
-      "Start a ClickPrompt Pro checkout ($4.99/month, $49.99/year, or $129 " +
+      "Start a ClickPrompt Pro checkout ($3.99/month, $29/year, or $59 " +
       "lifetime) to unlock script saving. Returns a hosted checkout URL to show the user plus an " +
       "unlock token. Keep the token and poll check_unlock_status with " +
       "it after the user pays. The user pays Lemon Squeezy (merchant " +
@@ -2019,7 +4838,7 @@ var MCP_TOOLS = [
           enum: ["monthly", "yearly", "lifetime"],
           default: "monthly",
           description:
-            "Plan to check out: monthly ($4.99/mo), yearly ($49.99/yr), or lifetime ($129 one-time).",
+            "Plan to check out: monthly ($3.99/mo), yearly ($29/yr), or lifetime ($59 one-time).",
         },
       },
     },
@@ -2245,6 +5064,17 @@ async function handleEvent(request, env, cors) {
   return json({ ok: true }, 200, cors);
 }
 
+// Named exports are for local unit tests only (node --test test/).
+export {
+  paymentProvider,
+  sanitizeAttribution,
+  assertStripeTestMode,
+  buildStripeCheckoutForm,
+  verifyStripeSignature,
+  stripeReturnOrigin,
+  planPriceId,
+};
+
 export default {
   async fetch(request, env) {
     var cors = {
@@ -2253,12 +5083,20 @@ export default {
       "Access-Control-Allow-Headers": "Content-Type",
     };
 
+    var url = new URL(request.url);
+    var path = url.pathname;
+
+    // Stripe webhooks are server-to-server. No CORS, and only POST.
+    if (path === "/api/stripe-webhook") {
+      if (request.method !== "POST") {
+        return new Response(null, { status: 405, headers: { Allow: "POST" } });
+      }
+      return handleStripeWebhook(request, env, {});
+    }
+
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: cors });
     }
-
-    var url = new URL(request.url);
-    var path = url.pathname;
 
     if (path === "/mcp") {
       return handleMcp(request, env, cors);
